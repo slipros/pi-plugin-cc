@@ -7,9 +7,8 @@ import test from "node:test";
 import {
   buildSystemPrompt,
   interpolate,
-  listBuiltInRoles,
-  resolvePromptValue,
-  resolveRole
+  listNamedPrompts,
+  resolvePromptValue
 } from "../plugins/pi/scripts/lib/prompts.mjs";
 
 const PLUGIN_ROOT = path.resolve(import.meta.dirname, "..", "plugins", "pi");
@@ -30,21 +29,53 @@ function writeFile(root, relative, content) {
   return target;
 }
 
-test("the built-in roles ship with the plugin", () => {
-  const roles = listBuiltInRoles(PLUGIN_ROOT);
-  assert.deepEqual(roles, ["adversarial", "explorer", "fixer", "reviewer"]);
+test("the built-in prompts ship with the plugin", () => {
+  withWorkspace((workspaceRoot) => {
+    const names = [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort();
+    for (const expected of ["adversarial", "explorer", "fixer", "reviewer"]) {
+      assert.ok(names.includes(expected), `${expected} should be available`);
+    }
+  });
 });
 
 test("inline text stays inline", () => {
-  const resolved = resolvePromptValue("be extremely terse", { workspaceRoot: "/tmp" });
-  assert.equal(resolved.text, "be extremely terse");
-  assert.equal(resolved.source, null);
+  withWorkspace((workspaceRoot) => {
+    const resolved = resolvePromptValue("be extremely terse", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
+    assert.equal(resolved.text, "be extremely terse");
+    assert.equal(resolved.source, null);
+    assert.equal(resolved.name, null);
+  });
+});
+
+test("a stored prompt is resolved by name", () => {
+  withWorkspace((workspaceRoot) => {
+    const resolved = resolvePromptValue("explorer", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
+    assert.match(resolved.text, /codebase investigator/i);
+    assert.equal(resolved.name, "explorer");
+  });
+});
+
+test("a project prompt shadows the built-in one of the same name", () => {
+  withWorkspace((workspaceRoot) => {
+    writeFile(workspaceRoot, ".claude/pi/prompts/reviewer.md", "project reviewer");
+    const resolved = resolvePromptValue("reviewer", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
+    assert.equal(resolved.text, "project reviewer");
+  });
+});
+
+test("an unknown name fails loudly and lists what exists", () => {
+  withWorkspace((workspaceRoot) => {
+    assert.throws(
+      () => resolvePromptValue("wizard", { workspaceRoot, pluginRoot: PLUGIN_ROOT }),
+      /No system prompt named "wizard".*reviewer/s
+    );
+  });
 });
 
 test("@path reads the file relative to the workspace", () => {
   withWorkspace((workspaceRoot) => {
     writeFile(workspaceRoot, "prompts/custom.md", "custom prompt body\n");
-    const resolved = resolvePromptValue("@prompts/custom.md", { workspaceRoot });
+    const resolved = resolvePromptValue("@prompts/custom.md", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
     assert.equal(resolved.text, "custom prompt body");
     assert.equal(resolved.source, path.join(workspaceRoot, "prompts/custom.md"));
   });
@@ -52,87 +83,51 @@ test("@path reads the file relative to the workspace", () => {
 
 test("@path on a missing file is an error, not silent text", () => {
   withWorkspace((workspaceRoot) => {
-    assert.throws(() => resolvePromptValue("@nope.md", { workspaceRoot }), /Cannot read/);
+    assert.throws(() => resolvePromptValue("@nope.md", { workspaceRoot, pluginRoot: PLUGIN_ROOT }), /Cannot read/);
   });
 });
 
-test("a bare .md value that does not exist is treated as prompt text", () => {
+test("a multi-word value is prompt text, never a name lookup", () => {
   withWorkspace((workspaceRoot) => {
-    const resolved = resolvePromptValue("review the .md docs", { workspaceRoot });
+    const resolved = resolvePromptValue("review the .md docs", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
     assert.equal(resolved.text, "review the .md docs");
   });
 });
 
-test("project roles shadow the built-in ones", () => {
-  withWorkspace((workspaceRoot) => {
-    writeFile(workspaceRoot, ".claude/pi/roles/reviewer.md", "project reviewer");
-    const resolved = resolveRole("reviewer", { pluginRoot: PLUGIN_ROOT, workspaceRoot, config: {} });
-    assert.equal(resolved.text, "project reviewer");
-  });
-});
-
-test("a built-in role resolves from the plugin directory", () => {
-  withWorkspace((workspaceRoot) => {
-    const resolved = resolveRole("explorer", { pluginRoot: PLUGIN_ROOT, workspaceRoot, config: {} });
-    assert.match(resolved.text, /codebase investigator/i);
-    assert.equal(resolved.name, "explorer");
-  });
-});
-
-test("an unknown role lists the available ones", () => {
-  withWorkspace((workspaceRoot) => {
-    assert.throws(
-      () => resolveRole("wizard", { pluginRoot: PLUGIN_ROOT, workspaceRoot, config: {} }),
-      /Built-in roles: adversarial, explorer, fixer, reviewer/
-    );
-  });
-});
-
-test("a role name with path separators is rejected", () => {
-  withWorkspace((workspaceRoot) => {
-    assert.throws(
-      () => resolveRole("../../etc/passwd", { pluginRoot: PLUGIN_ROOT, workspaceRoot, config: {} }),
-      /Invalid role name/
-    );
-  });
-});
-
-test("--system-prompt wins over --role", () => {
-  withWorkspace((workspaceRoot) => {
-    const built = buildSystemPrompt({
-      pluginRoot: PLUGIN_ROOT,
-      workspaceRoot,
-      config: {},
-      settings: { systemPrompt: "inline wins", role: "reviewer", appendSystemPrompt: [] }
-    });
-    assert.equal(built.systemPrompt, "inline wins");
-    assert.equal(built.role, null);
-  });
-});
-
-test("the project SYSTEM.md is used when no role or flag is given", () => {
+test("the project SYSTEM.md is used when nothing is configured", () => {
   withWorkspace((workspaceRoot) => {
     writeFile(workspaceRoot, ".claude/pi/SYSTEM.md", "workspace system prompt");
     const built = buildSystemPrompt({
       pluginRoot: PLUGIN_ROOT,
       workspaceRoot,
-      config: {},
       settings: { appendSystemPrompt: [] }
     });
     assert.equal(built.systemPrompt, "workspace system prompt");
   });
 });
 
-test("APPEND_SYSTEM.md is added on top of an explicit role", () => {
+test("an explicit prompt wins over the project SYSTEM.md", () => {
+  withWorkspace((workspaceRoot) => {
+    writeFile(workspaceRoot, ".claude/pi/SYSTEM.md", "workspace system prompt");
+    const built = buildSystemPrompt({
+      pluginRoot: PLUGIN_ROOT,
+      workspaceRoot,
+      settings: { systemPrompt: "inline wins", appendSystemPrompt: [] }
+    });
+    assert.equal(built.systemPrompt, "inline wins");
+  });
+});
+
+test("APPEND_SYSTEM.md stacks on top of a named prompt", () => {
   withWorkspace((workspaceRoot) => {
     writeFile(workspaceRoot, ".claude/pi/APPEND_SYSTEM.md", "always answer in Russian");
     const built = buildSystemPrompt({
       pluginRoot: PLUGIN_ROOT,
       workspaceRoot,
-      config: {},
-      settings: { role: "fixer", appendSystemPrompt: ["and cite files"] }
+      settings: { systemPrompt: "fixer", appendSystemPrompt: ["and cite files"] }
     });
     assert.match(built.systemPrompt, /experienced engineer/i);
+    assert.equal(built.name, "fixer");
     assert.deepEqual(built.appends, ["and cite files", "always answer in Russian"]);
   });
 });
@@ -142,7 +137,6 @@ test("nothing configured leaves pi with its own default prompt", () => {
     const built = buildSystemPrompt({
       pluginRoot: PLUGIN_ROOT,
       workspaceRoot,
-      config: {},
       settings: { appendSystemPrompt: [] }
     });
     assert.equal(built.systemPrompt, null);

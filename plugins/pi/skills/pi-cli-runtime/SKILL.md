@@ -1,6 +1,6 @@
 ---
 name: pi-cli-runtime
-description: How to run pi (the @earendil-works/pi-coding-agent CLI) non-interactively from Claude Code — model and provider selection, thinking levels, system prompts and roles, tool allowlists, sessions, and the JSON event stream. Use whenever you are about to invoke `pi` directly or through this plugin's companion script, or when a pi run fails and you need to read its output.
+description: How to run pi (the @earendil-works/pi-coding-agent CLI) non-interactively from Claude Code — model and provider selection, thinking levels, system prompts, tool allowlists and extensions, sessions, and the JSON/RPC event streams. Use whenever you are about to invoke `pi` directly or through this plugin's companion script, or when a pi run fails and you need to read its output.
 ---
 
 # Running pi from Claude Code
@@ -8,7 +8,7 @@ description: How to run pi (the @earendil-works/pi-coding-agent CLI) non-interac
 Prefer the companion script over raw `pi` calls: it tracks the job, captures the session id and renders a consistent report.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" delegate --model <id> --role fixer "task text"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" delegate --preset deep "task text"
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" review --base main
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" watch [job-id] [--follow] [--tail n]
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" steer [job-id] [--follow-up] "instruction"
@@ -37,7 +37,7 @@ echo "explain src/server.ts" | pi -p --mode json
 - `--system-prompt <text>` replaces pi's default coding-assistant prompt.
 - `--append-system-prompt <text|file>` adds to it and can be repeated.
 - Project files pi reads on its own: `.pi/SYSTEM.md` (replace), `.pi/APPEND_SYSTEM.md` (append), plus `AGENTS.md`/`CLAUDE.md` context files. `--no-context-files` disables the latter.
-- This plugin layers its own roles on top: `--role <name>` resolves `.claude/pi/roles/<name>.md`, then `~/.claude/pi/roles/<name>.md`, then the plugin's `prompts/roles/<name>.md`. Built-ins are `reviewer`, `adversarial`, `fixer`, `explorer`.
+- This plugin resolves `--system-prompt <name>` against `.claude/pi/prompts/<name>.md`, then `~/.claude/pi/prompts/<name>.md`, then the plugin's `prompts/system/<name>.md`. Built-ins are `reviewer`, `adversarial`, `fixer`, `explorer`. The same flag also accepts `@path/to/file.md` and inline text.
 
 ### Tools
 

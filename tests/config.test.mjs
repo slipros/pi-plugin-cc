@@ -7,12 +7,12 @@ const CONFIG = {
   ...BUILT_IN_CONFIG,
   defaults: { ...BUILT_IN_CONFIG.defaults, model: "default-model", thinking: "low" },
   presets: {
-    deep: { model: "preset-model", thinking: "high", role: "fixer" },
+    deep: { model: "preset-model", thinking: "high", systemPrompt: "fixer" },
     audit: { model: "audit-model", readOnly: true }
   },
   commands: {
     delegate: { preset: "deep" },
-    review: { role: "reviewer", readOnly: true }
+    review: { systemPrompt: "reviewer", readOnly: true }
   }
 };
 
@@ -21,14 +21,14 @@ test("command defaults pick up their configured preset", () => {
   assert.equal(settings.presetName, "deep");
   assert.equal(settings.model, "preset-model");
   assert.equal(settings.thinking, "high");
-  assert.equal(settings.role, "fixer");
+  assert.equal(settings.systemPrompt, "fixer");
 });
 
 test("explicit flags beat the preset and the defaults", () => {
   const settings = resolveRunSettings(CONFIG, "delegate", { model: "flag-model", thinking: "max" });
   assert.equal(settings.model, "flag-model");
   assert.equal(settings.thinking, "max");
-  assert.equal(settings.role, "fixer", "unspecified values still fall back to the preset");
+  assert.equal(settings.systemPrompt, "fixer", "unspecified values still fall back to the preset");
 });
 
 test("global defaults apply when nothing else sets a value", () => {
@@ -54,18 +54,16 @@ test("each preset carries its own system prompt", () => {
     ...CONFIG,
     presets: {
       dba: { model: "m1", systemPrompt: "You are a database specialist." },
-      docs: { model: "m2", role: "explorer" }
+      docs: { model: "m2", systemPrompt: "explorer" }
     },
     commands: { delegate: {} }
   };
 
-  const dba = resolveRunSettings(config, "delegate", { preset: "dba" });
-  assert.equal(dba.systemPrompt, "You are a database specialist.");
-  assert.equal(dba.role, null, "an explicit prompt leaves no role to resolve");
-
-  const docs = resolveRunSettings(config, "delegate", { preset: "docs" });
-  assert.equal(docs.role, "explorer");
-  assert.equal(docs.systemPrompt, null);
+  assert.equal(
+    resolveRunSettings(config, "delegate", { preset: "dba" }).systemPrompt,
+    "You are a database specialist."
+  );
+  assert.equal(resolveRunSettings(config, "delegate", { preset: "docs" }).systemPrompt, "explorer");
 });
 
 test("a preset system prompt may be a file reference", () => {
@@ -80,27 +78,26 @@ test("a preset system prompt may be a file reference", () => {
   );
 });
 
-test("--role on the command line replaces a preset's system prompt", () => {
+test("--system-prompt on the command line replaces a preset's prompt", () => {
   const config = {
     ...CONFIG,
     presets: { dba: { model: "m1", systemPrompt: "You are a database specialist." } },
     commands: { delegate: {} }
   };
-  const settings = resolveRunSettings(config, "delegate", { preset: "dba", role: "reviewer" });
-  assert.equal(settings.role, "reviewer");
-  assert.equal(settings.systemPrompt, null, "the preset prompt must not survive an explicit role");
+  const settings = resolveRunSettings(config, "delegate", { preset: "dba", systemPrompt: "reviewer" });
+  assert.equal(settings.systemPrompt, "reviewer");
   assert.equal(settings.model, "m1", "unrelated preset values still apply");
 });
 
 test("a preset prompt overrides the global default prompt", () => {
   const config = {
     ...CONFIG,
-    defaults: { ...CONFIG.defaults, role: "fixer" },
-    presets: { audit: { role: "adversarial" } },
+    defaults: { ...CONFIG.defaults, systemPrompt: "fixer" },
+    presets: { audit: { systemPrompt: "adversarial" } },
     commands: { delegate: {} }
   };
-  assert.equal(resolveRunSettings(config, "delegate", { preset: "audit" }).role, "adversarial");
-  assert.equal(resolveRunSettings(config, "delegate").role, "fixer");
+  assert.equal(resolveRunSettings(config, "delegate", { preset: "audit" }).systemPrompt, "adversarial");
+  assert.equal(resolveRunSettings(config, "delegate").systemPrompt, "fixer");
 });
 
 test("append-system-prompt values from every layer are concatenated", () => {

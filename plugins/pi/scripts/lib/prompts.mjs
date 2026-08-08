@@ -5,17 +5,23 @@ import path from "node:path";
 /**
  * System-prompt resolution for delegated pi agents.
  *
- * Precedence, highest first:
- *   1. --system-prompt <text|file>
- *   2. --role <name>            (built-in role file, project role, or config.roles entry)
- *   3. <workspace>/.claude/pi/SYSTEM.md
- *   4. nothing — pi keeps its own default coding-assistant prompt
+ * There is exactly one knob: `systemPrompt`. Its value can be
+ *   - inline text                       "answer in one sentence"
+ *   - a file                            "@./prompts/dba.md" or "./prompts/dba.md"
+ *   - the name of a stored prompt       "reviewer"
  *
- * --append-system-prompt values and <workspace>/.claude/pi/APPEND_SYSTEM.md are
- * additive and never replace the base prompt.
+ * Stored prompts are looked up in the project first, then the user's home,
+ * then the ones shipped with the plugin, so a project file named
+ * `reviewer.md` shadows the built-in reviewer.
+ *
+ * Precedence between layers (flags > preset > command > defaults) is resolved
+ * in config.mjs; this module only turns the winning value into text.
+ * `.claude/pi/SYSTEM.md` is the workspace fallback when nothing is set, and
+ * appends never replace the base prompt.
  */
 
-const ROLE_FILE_EXTENSIONS = [".md", ".txt"];
+const PROMPT_FILE_EXTENSIONS = [".md", ".txt"];
+const NAME_PATTERN = /^[a-zA-Z0-9._-]+$/;
 
 function expandHome(value) {
   if (value.startsWith("~/") || value === "~") {
@@ -30,39 +36,12 @@ function looksLikePath(value) {
     return false;
   }
   return (
-    trimmed.startsWith("@") ||
     trimmed.startsWith("./") ||
     trimmed.startsWith("../") ||
     trimmed.startsWith("/") ||
     trimmed.startsWith("~/") ||
-    ROLE_FILE_EXTENSIONS.some((extension) => trimmed.endsWith(extension))
+    PROMPT_FILE_EXTENSIONS.some((extension) => trimmed.endsWith(extension))
   );
-}
-
-/**
- * Interpret a CLI value as either inline prompt text or a file reference.
- * `@path` forces the file interpretation.
- */
-export function resolvePromptValue(value, { workspaceRoot, label = "prompt" }) {
-  const raw = String(value ?? "");
-  if (!raw.trim()) {
-    return { text: "", source: null };
-  }
-
-  const forced = raw.trim().startsWith("@");
-  const candidate = expandHome(forced ? raw.trim().slice(1) : raw.trim());
-
-  if (forced || looksLikePath(raw)) {
-    const absolute = path.isAbsolute(candidate) ? candidate : path.resolve(workspaceRoot, candidate);
-    if (fs.existsSync(absolute) && fs.statSync(absolute).isFile()) {
-      return { text: fs.readFileSync(absolute, "utf8").trim(), source: absolute };
-    }
-    if (forced) {
-      throw new Error(`Cannot read ${label} file "${candidate}".`);
-    }
-  }
-
-  return { text: raw.trim(), source: null };
 }
 
 function readFileIfExists(filePath) {
@@ -73,82 +52,112 @@ function readFileIfExists(filePath) {
   return null;
 }
 
-export function listBuiltInRoles(pluginRoot) {
-  const rolesDir = path.join(pluginRoot, "prompts", "roles");
-  if (!fs.existsSync(rolesDir)) {
-    return [];
-  }
-  return fs
-    .readdirSync(rolesDir)
-    .filter((name) => name.endsWith(".md"))
-    .map((name) => name.replace(/\.md$/, ""))
-    .sort();
+/** Directories searched for named prompts, most specific first. */
+export function promptSearchPath(pluginRoot, workspaceRoot) {
+  return [
+    path.join(workspaceRoot, ".claude", "pi", "prompts"),
+    path.join(os.homedir(), ".claude", "pi", "prompts"),
+    path.join(pluginRoot, "prompts", "system")
+  ];
 }
 
 /**
- * Locate the prompt file for a role name.
- * Project roles and config entries shadow the built-in ones.
+ * List the prompts available by name, project and user files shadowing the
+ * built-in ones.
  */
-export function resolveRole(roleName, { pluginRoot, workspaceRoot, config }) {
-  const name = String(roleName ?? "").trim();
-  if (!name) {
-    return null;
+export function listNamedPrompts(pluginRoot, workspaceRoot) {
+  const found = new Map();
+  for (const dir of promptSearchPath(pluginRoot, workspaceRoot)) {
+    if (!fs.existsSync(dir)) {
+      continue;
+    }
+    for (const entry of fs.readdirSync(dir)) {
+      if (!PROMPT_FILE_EXTENSIONS.some((extension) => entry.endsWith(extension))) {
+        continue;
+      }
+      const name = entry.replace(/\.(md|txt)$/, "");
+      if (!found.has(name)) {
+        found.set(name, path.join(dir, entry));
+      }
+    }
   }
-  if (!/^[a-zA-Z0-9._-]+$/.test(name)) {
-    throw new Error(`Invalid role name "${roleName}". Use letters, digits, dots, dashes or underscores.`);
+  return found;
+}
+
+function resolveNamedPrompt(name, { pluginRoot, workspaceRoot }) {
+  for (const dir of promptSearchPath(pluginRoot, workspaceRoot)) {
+    for (const extension of PROMPT_FILE_EXTENSIONS) {
+      const file = readFileIfExists(path.join(dir, `${name}${extension}`));
+      if (file) {
+        return file;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Turn one `systemPrompt` value into prompt text.
+ *
+ * @returns {{ text: string, source: string|null, name: string|null }}
+ */
+export function resolvePromptValue(value, { workspaceRoot, pluginRoot = null, label = "system prompt" }) {
+  const raw = String(value ?? "");
+  if (!raw.trim()) {
+    return { text: "", source: null, name: null };
   }
 
-  const configured = config?.roles?.[name];
-  if (configured) {
-    const resolved = resolvePromptValue(configured.startsWith("@") ? configured : `@${configured}`, {
-      workspaceRoot,
-      label: `role "${name}"`
-    });
-    return { name, ...resolved };
-  }
+  const trimmed = raw.trim();
+  const forcedFile = trimmed.startsWith("@");
+  const candidate = expandHome(forcedFile ? trimmed.slice(1) : trimmed);
 
-  const candidates = [
-    path.join(workspaceRoot, ".claude", "pi", "roles", `${name}.md`),
-    path.join(os.homedir(), ".claude", "pi", "roles", `${name}.md`),
-    path.join(pluginRoot, "prompts", "roles", `${name}.md`)
-  ];
-
-  for (const candidate of candidates) {
-    const file = readFileIfExists(candidate);
+  if (forcedFile || looksLikePath(trimmed)) {
+    const absolute = path.isAbsolute(candidate) ? candidate : path.resolve(workspaceRoot, candidate);
+    const file = readFileIfExists(absolute);
     if (file) {
-      return { name, ...file };
+      return { ...file, name: null };
+    }
+    if (forcedFile) {
+      throw new Error(`Cannot read ${label} file "${candidate}".`);
     }
   }
 
-  const available = listBuiltInRoles(pluginRoot);
-  throw new Error(
-    `Unknown role "${name}". Built-in roles: ${available.join(", ") || "none"}. ` +
-      `Add a custom one at .claude/pi/roles/${name}.md or via "roles" in .claude/pi/config.json.`
-  );
+  if (pluginRoot && NAME_PATTERN.test(trimmed)) {
+    const named = resolveNamedPrompt(trimmed, { pluginRoot, workspaceRoot });
+    if (named) {
+      return { ...named, name: trimmed };
+    }
+    const available = [...listNamedPrompts(pluginRoot, workspaceRoot).keys()].sort();
+    throw new Error(
+      `No system prompt named "${trimmed}". Available: ${available.join(", ") || "none"}. ` +
+        `Pass inline text, @path/to/file.md, or add .claude/pi/prompts/${trimmed}.md.`
+    );
+  }
+
+  return { text: trimmed, source: null, name: null };
 }
 
 /**
  * Build the final system-prompt configuration for a pi run.
  *
- * @returns {{ systemPrompt: string|null, appends: string[], sources: string[], role: string|null }}
+ * @returns {{ systemPrompt: string|null, appends: string[], sources: string[], name: string|null }}
  */
-export function buildSystemPrompt({ pluginRoot, workspaceRoot, config, settings }) {
+export function buildSystemPrompt({ pluginRoot, workspaceRoot, settings }) {
   const sources = [];
   let systemPrompt = null;
-  let role = null;
+  let name = null;
 
   if (settings.systemPrompt) {
-    const resolved = resolvePromptValue(settings.systemPrompt, {
-      workspaceRoot,
-      label: "system prompt"
-    });
+    const resolved = resolvePromptValue(settings.systemPrompt, { workspaceRoot, pluginRoot });
     systemPrompt = resolved.text;
-    sources.push(resolved.source ? `system prompt: ${resolved.source}` : "system prompt: inline text");
-  } else if (settings.role) {
-    const resolved = resolveRole(settings.role, { pluginRoot, workspaceRoot, config });
-    systemPrompt = resolved.text;
-    role = resolved.name;
-    sources.push(`role "${resolved.name}": ${resolved.source ?? "config"}`);
+    name = resolved.name;
+    sources.push(
+      resolved.name
+        ? `system prompt "${resolved.name}": ${resolved.source}`
+        : resolved.source
+          ? `system prompt: ${resolved.source}`
+          : "system prompt: inline text"
+    );
   } else {
     const projectSystem = readFileIfExists(path.join(workspaceRoot, ".claude", "pi", "SYSTEM.md"));
     if (projectSystem) {
@@ -159,7 +168,11 @@ export function buildSystemPrompt({ pluginRoot, workspaceRoot, config, settings 
 
   const appends = [];
   for (const value of settings.appendSystemPrompt ?? []) {
-    const resolved = resolvePromptValue(value, { workspaceRoot, label: "appended system prompt" });
+    const resolved = resolvePromptValue(value, {
+      workspaceRoot,
+      pluginRoot,
+      label: "appended system prompt"
+    });
     if (resolved.text) {
       appends.push(resolved.text);
       sources.push(resolved.source ? `append: ${resolved.source}` : "append: inline text");
@@ -172,7 +185,7 @@ export function buildSystemPrompt({ pluginRoot, workspaceRoot, config, settings 
     sources.push(`append: ${projectAppend.source}`);
   }
 
-  return { systemPrompt, appends, sources, role };
+  return { systemPrompt, appends, sources, name };
 }
 
 export function loadTaskTemplate(pluginRoot, name) {

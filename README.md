@@ -2,17 +2,17 @@
 
 Delegate tasks and code reviews from Claude Code to [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) — on any model pi can reach, with a system prompt you choose per run.
 
-Built in the shape of the official [Codex plugin](https://github.com/openai/codex-plugin-cc), with two things that plugin has no equivalent for: **explicit model selection** (pi speaks to hundreds of models across providers) and **per-run system prompts** (roles).
+Built in the shape of the official [Codex plugin](https://github.com/openai/codex-plugin-cc), with two things that plugin has no equivalent for: **explicit model selection** (pi speaks to hundreds of models across providers) and **presets** — complete agent profiles (model, thinking level, system prompt, tools, extensions) you define once and use by name.
 
 ## What you get
 
 | Command | Purpose |
 | --- | --- |
-| `/pi:delegate` | Hand a task to a pi agent. Picks model, role, tool permissions and session. |
+| `/pi:delegate` | Hand a task to a pi agent: preset or model, system prompt, tool permissions, session. |
 | `/pi:review` | Read-only code review of the working tree or a branch diff. |
 | `/pi:watch` | Watch what the agent is doing: turns, tool calls, answers. |
 | `/pi:steer` | Redirect a running agent mid-flight. |
-| `/pi:models` | List available models, presets and roles. |
+| `/pi:models` | List available models, presets and system prompts. |
 | `/pi:status` | Running and recent pi jobs for this workspace. |
 | `/pi:result` | Stored output of a finished job. |
 | `/pi:cancel` | Stop a running job (soft abort first). |
@@ -56,34 +56,32 @@ Every run command takes the same selection flags:
 - `--preset <name>` applies a named bundle from your config (see below).
 - With no flags at all, pi uses its own configured default model.
 
-`/pi:models [search]` prints the catalogue with context windows and thinking support, followed by your presets and roles.
+`/pi:models [search]` prints the catalogue with context windows and thinking support, followed by your presets and stored prompts.
 
 ## Choosing a system prompt
 
-The agent pi runs is shaped by a **role** — a system prompt file. Four ship with the plugin:
+One flag, three kinds of value:
 
-| Role | For |
+```bash
+/pi:delegate --system-prompt explorer                 how does session resumption work here?
+/pi:delegate --system-prompt @.claude/pi/prompts/dba.md   explain this query plan
+/pi:delegate --system-prompt "Answer in one sentence"     what does this module do?
+```
+
+- **A name** — looked up in `.claude/pi/prompts/<name>.md`, then `~/.claude/pi/prompts/<name>.md`, then the prompts shipped with the plugin. A project file shadows a built-in of the same name.
+- **`@path`** (or any path ending in `.md`/`.txt`) — a file.
+- **Anything else** — the prompt text itself.
+
+Four prompts ship with the plugin:
+
+| Name | For |
 | --- | --- |
 | `reviewer` | Structured code review: verdict, findings by severity, notes. |
 | `adversarial` | Challenges the design, not the syntax: assumptions, failure modes, rollback. |
 | `fixer` | Makes a change: smallest correct edit, verifies it, reports what it could not verify. |
-| `explorer` | Investigates and explains existing code with `file:line` citations. Read-only. |
+| `explorer` | Investigates and explains existing code with `file:line` citations. |
 
-```bash
-/pi:delegate --role explorer   how does session resumption work in this repo?
-/pi:delegate --role fixer      make the flaky timeout test deterministic
-/pi:review   --role adversarial --base main
-```
-
-Overrides, highest priority first:
-
-1. `--system-prompt <text|@file>` — replaces the prompt entirely
-2. `--role <name>` — a role file
-3. `.claude/pi/SYSTEM.md` in the repository — the workspace default
-
-`--append-system-prompt <text|@file>` (repeatable) and `.claude/pi/APPEND_SYSTEM.md` add to whichever base was chosen instead of replacing it.
-
-Custom roles are just files. `.claude/pi/roles/<name>.md` in the repo, or `~/.claude/pi/roles/<name>.md` for all your projects, both shadow the built-ins of the same name.
+When nothing is set, `.claude/pi/SYSTEM.md` in the repository is used, and failing that pi keeps its own prompt. `--append-system-prompt <text|@file>` (repeatable) and `.claude/pi/APPEND_SYSTEM.md` add to whichever base was chosen instead of replacing it.
 
 ## Configuration
 
@@ -98,28 +96,28 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
   },
   "presets": {
     "fast":  { "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
-    "deep":  { "model": "opencode-go/kimi-k3", "thinking": "high", "role": "fixer" },
-    "audit": { "model": "opencode-go/glm-5.2", "role": "adversarial", "readOnly": true },
+    "deep":  { "model": "opencode-go/kimi-k3", "thinking": "high", "systemPrompt": "fixer" },
+    "audit": { "model": "opencode-go/glm-5.2", "systemPrompt": "adversarial", "readOnly": true },
     "dba":   {
       "model": "opencode-go/kimi-k3",
+      "thinking": "high",
       "systemPrompt": "@.claude/pi/prompts/dba.md",
       "appendSystemPrompt": ["Answer in Russian."],
-      "tools": "read,grep,find,ls,bash"
+      "tools": "read,grep,find,ls,bash",
+      "extensions": ["npm:pi-mcp-adapter"],
+      "timeoutMs": 3600000
     }
   },
   "commands": {
     "delegate": { "preset": "deep" },
     "review":   { "preset": "audit" }
-  },
-  "roles": {
-    "go-reviewer": ".claude/pi/roles/go-reviewer.md"
   }
 }
 ```
 
-**A preset carries its own system prompt.** Each one can set `role` (a named prompt file) or `systemPrompt` (inline text, or `@path` to a file), plus its own model, thinking level, tools and `appendSystemPrompt` additions — so `--preset dba` swaps the whole agent persona, not just the model.
+**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Define them once and run `--preset dba`.
 
-Precedence for the prompt is resolved per layer, highest first: command-line (`--system-prompt` / `--role`) → preset → per-command defaults → global defaults → `.claude/pi/SYSTEM.md`. Within one layer `systemPrompt` beats `role`, and a `--role` on the command line replaces a preset's `systemPrompt` entirely rather than silently losing to it. `appendSystemPrompt` values stack across all layers instead of replacing each other.
+Values resolve layer by layer, highest first: command-line flags → preset → per-command defaults → global defaults. The system prompt is chosen as a unit, so `--system-prompt` on the command line replaces a preset's prompt outright; `appendSystemPrompt`, `extensions` and `skills` stack across layers instead of replacing each other.
 
 ## Choosing the agent's tools
 
@@ -185,8 +183,8 @@ pi --session <session-id>
                                               │
                      ┌────────────────────────┼────────────────────────┐
                      ▼                        ▼                        ▼
-              config + presets          role/system prompt        job state on disk
-              model catalogue           (prompts/roles/*.md)      jobs/<id>.{json,log,
+              config + presets          system prompt             job state on disk
+              model catalogue           (prompts/system/*.md)     jobs/<id>.{json,log,
                      │                                             events.jsonl,inbox.jsonl}
                      └────────────────────────┬────────────────────────┘
                                               ▼

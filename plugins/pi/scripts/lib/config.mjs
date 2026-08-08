@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 
 /**
- * Plugin configuration: model presets, per-command defaults and custom roles.
+ * Plugin configuration.
+ *
+ * A preset is a complete agent profile: model, thinking level, system prompt,
+ * tools, extensions, skills and limits. Everything a run needs lives in one
+ * place, and command-line flags override individual fields.
  *
  * Layering, lowest priority first:
  *   1. built-in defaults below
@@ -20,15 +24,14 @@ const BUILT_IN = {
     model: null,
     provider: null,
     thinking: null,
-    role: null,
+    systemPrompt: null,
     timeoutMs: 1_800_000
   },
   presets: {},
   commands: {
     delegate: {},
-    review: { role: "reviewer", readOnly: true }
-  },
-  roles: {}
+    review: { systemPrompt: "reviewer", readOnly: true }
+  }
 };
 
 export function userConfigPath() {
@@ -70,7 +73,6 @@ function mergeLayer(base, layer) {
         ])
       )
     },
-    roles: { ...base.roles, ...(isPlainObject(layer.roles) ? layer.roles : {}) }
   };
 }
 
@@ -133,14 +135,11 @@ export function resolveRunSettings(config, command, overrides = {}) {
 
   /**
    * The system prompt is resolved per layer, not per key: a preset carries its
-   * own prompt (as `systemPrompt` text/file or a `role`), and a command-line
-   * --role must replace that prompt wholesale rather than losing to the
-   * preset's `systemPrompt`. Within one layer, `systemPrompt` wins over `role`.
+   * own prompt, so `--system-prompt` on the command line replaces it whole
+   * instead of merging with it.
    */
   const promptSource =
-    [overrides, preset, commandDefaults, config.defaults ?? {}].find(
-      (layer) => layer?.systemPrompt || layer?.role
-    ) ?? {};
+    [overrides, preset, commandDefaults, config.defaults ?? {}].find((layer) => layer?.systemPrompt) ?? {};
 
   // Later layers win, so the lists run from lowest to highest priority.
   const layers = [config.defaults ?? {}, commandDefaults, preset, overrides];
@@ -156,7 +155,6 @@ export function resolveRunSettings(config, command, overrides = {}) {
     model: pick("model"),
     provider: pick("provider"),
     thinking: pick("thinking"),
-    role: promptSource.systemPrompt ? null : (promptSource.role ?? null),
     systemPrompt: promptSource.systemPrompt ?? null,
     // Appends stack across every layer instead of replacing each other.
     appendSystemPrompt: mergeLists("appendSystemPrompt"),

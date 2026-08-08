@@ -63,7 +63,7 @@ export function renderSetupReport(report) {
     }
   }
   lines.push(`- Presets: ${report.presets.length ? report.presets.join(", ") : "none configured"}`);
-  lines.push(`- Roles: ${report.roles.join(", ")}`);
+  lines.push(`- System prompts: ${report.prompts.join(", ")}`);
   lines.push(`- Job state directory: \`${report.stateDir}\``);
 
   if (!modelCount) {
@@ -81,7 +81,7 @@ export function renderSetupReport(report) {
   return joinLines(lines);
 }
 
-export function renderModelsReport({ models, presets, roles, defaults, search }) {
+export function renderModelsReport({ models, presets, prompts, defaults, search }) {
   const lines = ["# pi models", ""];
 
   if (!models.length) {
@@ -114,7 +114,7 @@ export function renderModelsReport({ models, presets, roles, defaults, search })
         preset.model ? `model \`${preset.model}\`` : null,
         preset.provider ? `provider \`${preset.provider}\`` : null,
         preset.thinking ? `thinking \`${preset.thinking}\`` : null,
-        preset.role ? `role \`${preset.role}\`` : null,
+        preset.systemPrompt ? `prompt \`${preset.systemPrompt}\`` : null,
         preset.readOnly ? "read-only" : null
       ]
         .filter(Boolean)
@@ -126,16 +126,16 @@ export function renderModelsReport({ models, presets, roles, defaults, search })
   }
 
   lines.push("");
-  lines.push("## Roles");
+  lines.push("## System prompts");
   lines.push("");
-  lines.push(roles.length ? roles.map((role) => `- \`${role}\``).join("\n") : "- none");
+  lines.push(prompts.length ? prompts.map((name) => `- \`${name}\``).join("\n") : "- none");
 
   lines.push("");
   lines.push("## Defaults");
   lines.push("");
   lines.push(`- model: ${defaults.model ? `\`${defaults.model}\`` : "pi decides"}`);
   lines.push(`- thinking: ${defaults.thinking ? `\`${defaults.thinking}\`` : "pi decides"}`);
-  lines.push(`- role: ${defaults.role ? `\`${defaults.role}\`` : "none"}`);
+  lines.push(`- system prompt: ${defaults.systemPrompt ? `\`${defaults.systemPrompt}\`` : "pi default"}`);
 
   lines.push("");
   lines.push("Use `--model <id>`, `--provider <name>`, `--thinking <level>` or `--preset <name>` on `/pi:delegate` and `/pi:review`.");
@@ -149,8 +149,7 @@ function renderRunHeader(title, { job, settings, execution }) {
     `- Model: ${execution?.model ? `\`${execution.model}\`` : settings.model ? `\`${settings.model}\`` : "pi default"}`,
     settings.thinking ? `- Thinking: \`${settings.thinking}\`` : null,
     settings.presetName ? `- Preset: \`${settings.presetName}\`` : null,
-    settings.roleLabel ? `- Role: ${settings.roleLabel}` : null,
-    settings.promptLabel ? `- Custom ${settings.promptLabel}` : null,
+    settings.promptLabel ? `- ${settings.promptLabel.replace(/^system prompt/, "System prompt")}` : null,
     settings.readOnly ? "- Tools: read-only (`read`, `grep`, `find`, `ls`)" : null,
     execution?.sessionId ? `- pi session: \`${execution.sessionId}\` (resume with \`pi --session ${execution.sessionId}\`)` : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,
@@ -183,7 +182,7 @@ export function renderBackgroundStart({ job, settings }) {
     "",
     `- Kind: ${job.kind}`,
     `- Model: ${settings.model ? `\`${settings.model}\`` : "pi default"}`,
-    settings.roleLabel ? `- Role: ${settings.roleLabel}` : null,
+    settings.promptName ? `- System prompt: \`${settings.promptName}\`` : null,
     "",
     "Check progress with `/pi:status`, read the answer with `/pi:result`, stop it with `/pi:cancel`."
   ]);

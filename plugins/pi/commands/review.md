@@ -1,6 +1,6 @@
 ---
 description: Run a read-only pi code review of the current git changes
-argument-hint: '[--background|--wait] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--role reviewer|adversarial] [focus text]'
+argument-hint: '[--background|--wait] [--base <ref>] [--scope auto|working-tree|branch] [--preset <name>] [--system-prompt reviewer|adversarial] [focus text]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Bash(git:*), Read, Glob, Grep, AskUserQuestion
 ---
@@ -23,8 +23,8 @@ Review target:
 
 Model and prompt:
 
-- The review runs read-only (`read`, `grep`, `find`, `ls`) with the `reviewer` role. `--role adversarial` switches to the design-challenging review.
-- `--model`, `--provider`, `--thinking` and `--preset` select the model, exactly as in `/pi:delegate`.
+- The review runs read-only (`read`, `grep`, `find`, `ls`) with the `reviewer` system prompt. `--system-prompt adversarial` switches to the design-challenging review.
+- `--preset`, `--model`, `--provider` and `--thinking` select the profile and model, exactly as in `/pi:delegate`.
 
 Execution mode rules:
 

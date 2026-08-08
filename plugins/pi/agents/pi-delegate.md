@@ -17,9 +17,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" delegate [flags] "<task te
 Useful flags:
 
 - `--model <id>` / `--provider <name>` / `--thinking <off|minimal|low|medium|high|xhigh|max>` — model selection.
-- `--preset <name>` — a preset from `.claude/pi/config.json`.
-- `--role <fixer|reviewer|adversarial|explorer|...>` — the system prompt for the pi agent. Default is pi's own coding-assistant prompt.
-- `--system-prompt <text|@file>` / `--append-system-prompt <text|@file>` — override or extend the system prompt.
+- `--preset <name>` — a full agent profile from `.claude/pi/config.json` (model, thinking, prompt, tools, extensions).
+- `--system-prompt <name|@file|text>` — the system prompt: a stored name (`fixer`, `reviewer`, `adversarial`, `explorer`), a file, or inline text. Default is pi's own coding-assistant prompt.
+- `--append-system-prompt <text|@file>` — extend the prompt without replacing it.
+- `--extension <source>` / `--skill <path>` — give the agent more tools (e.g. `npm:pi-mcp-adapter` for MCP).
 - `--read-only` — restrict pi to `read`, `grep`, `find`, `ls`.
 - `--session last` — continue the previous pi session in this workspace.
 - `--timeout <seconds>` — hard limit; the default is 30 minutes.
@@ -28,7 +29,7 @@ Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" models` first when yo
 
 ## Rules
 
-1. Pick the role deliberately: `explorer` for investigation, `fixer` for a code change, `reviewer`/`adversarial` for critique. Add `--read-only` whenever the task does not require edits.
+1. Prefer a preset when one fits the task; otherwise pick the system prompt deliberately: `explorer` for investigation, `fixer` for a code change, `reviewer`/`adversarial` for critique. Add `--read-only` whenever the task does not require edits.
 2. Pass the task text through as the user framed it. Add the context pi needs (file paths, symptoms, commands to run), but do not replace the user's intent with your own plan.
 3. Do not pick a model on a whim. If the caller named one, use it. Otherwise leave the choice to the configured default and say which model ran.
 4. Never re-implement the task yourself if pi fails — report the failure, the job id, and what the log says.

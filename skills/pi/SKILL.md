@@ -22,14 +22,14 @@ node "<skill-dir>/scripts/pi-companion.mjs" <команда> [флаги] [те�
 | `status [job-id] [--all]` | Список задач и их состояние |
 | `result [job-id]` | Итог завершённой задачи |
 | `cancel [job-id]` | Остановить задачу |
-| `models [поиск]` | Каталог моделей, пресеты, роли |
+| `models [поиск]` | Каталог моделей, пресеты, системные промты |
 | `setup` | Проверка установки pi и конфигурации |
 
 ## Правила работы
 
 1. **Не делай работу за pi.** Вывод команды возвращай пользователю как есть, без пересказа. Не исправляй то, что нашло ревью, и не доделывай задачу за агента, пока пользователь об этом не попросил.
 2. **Долгие задачи — в фон.** `delegate --background` + `Bash(run_in_background: true)`. Форграунд оправдан только для узкого вопроса. Сомневаешься — спроси один раз через `AskUserQuestion` («Run in background» / «Wait for results»).
-3. **Роль и права выбирай осознанно**: `explorer` для исследования, `fixer` для правки кода, `reviewer`/`adversarial` для критики. Если задача не требует правок — добавляй `--read-only`.
+3. **Пресет — основной способ запуска.** Если под задачу есть пресет — бери его. Иначе выбирай промт осознанно: `explorer` для исследования, `fixer` для правки кода, `reviewer`/`adversarial` для критики. Если правки не нужны — `--read-only`.
 4. **Модель**: если пользователь назвал — используй её. Если нет — не выдумывай, оставь дефолт и укажи в ответе, какая модель отработала.
 5. **После write-прогона** покажи `git status --short` и `git diff --stat`. Коммиты не делай.
 6. Если pi упал — сообщи job-id, ошибку и что в логе. Не переписывай задачу молча.
@@ -39,26 +39,29 @@ node "<skill-dir>/scripts/pi-companion.mjs" <команда> [флаги] [те�
 ```bash
 delegate --model opencode-go/kimi-k3 --thinking high  "почини падающий тест авторизации"
 delegate --provider anthropic --model claude-sonnet-5 "переделай логику ретраев"
-delegate --preset fast "прогони линтер и объясни ошибки"
+delegate --preset fast "прогони линтер и объясни ошибки"   # весь профиль одним флагом
 ```
 
 - `--model` принимает `provider/id`, короткое имя, glob (`anthropic/*`) и нечёткое совпадение; несуществующее имя даёт предупреждение, но всё равно уходит в pi.
 - `--thinking off|minimal|low|medium|high|xhigh|max`.
-- `--preset <имя>` — набор из `.claude/pi/config.json`.
+- `--preset <имя>` — готовый профиль агента из `.claude/pi/config.json`: модель, thinking, системный промт, инструменты, расширения.
 - `models [поиск]` показывает каталог с контекстом и поддержкой thinking.
 
 ## Системный промт агента
 
-Порядок приоритета: `--system-prompt` → `--role` → `.claude/pi/SYSTEM.md` проекта.
+Один флаг `--system-prompt` принимает три вида значений:
 
 ```bash
-delegate --role explorer   "как устроено возобновление сессий?"
-delegate --role fixer      "сделай флейки-тест детерминированным"
+delegate --system-prompt explorer                "как устроено возобновление сессий?"
 delegate --system-prompt @.claude/pi/prompts/dba.md "разбери план запроса"
-delegate --append-system-prompt "Отвечай по-русски" --role reviewer "…"
+delegate --system-prompt "Отвечай одним предложением" "что делает этот модуль?"
 ```
 
-Встроенные роли: `reviewer`, `adversarial`, `fixer`, `explorer`. Свои — файлы `.claude/pi/roles/<имя>.md` в репозитории или `~/.claude/pi/roles/<имя>.md`; одноимённый файл перекрывает встроенную роль. `--append-system-prompt` (можно повторять) и `.claude/pi/APPEND_SYSTEM.md` дополняют промт, а не заменяют его.
+- **Имя** сохранённого промта — ищется в `.claude/pi/prompts/<имя>.md` проекта, затем `~/.claude/pi/prompts/<имя>.md`, затем встроенные в плагине. Встроенные: `reviewer`, `adversarial`, `fixer`, `explorer`; одноимённый файл в проекте их перекрывает.
+- **`@путь`** или путь с расширением — файл.
+- **Всё остальное** — текст промта как есть.
+
+Если промт не задан, берётся `.claude/pi/SYSTEM.md` проекта, а если и его нет — собственный промт pi. `--append-system-prompt` (можно повторять) и `.claude/pi/APPEND_SYSTEM.md` дополняют промт, а не заменяют.
 
 ## Инструменты агента
 
@@ -131,7 +134,7 @@ delegate --fresh "…"                 # принудительно новая �
   "defaults": { "model": "openrouter/deepseek/deepseek-v4-flash-0731", "thinking": "high" },
   "presets": {
     "fast":  { "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
-    "audit": { "model": "opencode-go/kimi-k3", "role": "adversarial", "readOnly": true },
+    "audit": { "model": "opencode-go/kimi-k3", "systemPrompt": "adversarial", "readOnly": true },
     "dba":   {
       "model": "opencode-go/kimi-k3",
       "systemPrompt": "@.claude/pi/prompts/dba.md",
@@ -139,13 +142,12 @@ delegate --fresh "…"                 # принудительно новая �
       "tools": "read,grep,find,ls,bash"
     }
   },
-  "commands": { "review": { "preset": "audit" } },
-  "roles": { "go-reviewer": ".claude/pi/roles/go-reviewer.md" }
+  "commands": { "review": { "preset": "audit" } }
 }
 ```
 
-У каждого пресета может быть свой системный промт: `role` (имя файла-роли) или `systemPrompt` (текст либо `@путь`), плюс своя модель, thinking, набор инструментов и `appendSystemPrompt`. То есть `--preset dba` меняет не только модель, а всю личность агента.
+**Пресет — это целый агент, а не только модель.** В нём можно задать любое поле запуска: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Задал один раз — дальше запускаешь `--preset dba`.
 
-Приоритет промта разрешается послойно, сверху вниз: флаги (`--system-prompt` / `--role`) → пресет → дефолты команды → общие дефолты → `.claude/pi/SYSTEM.md`. Внутри слоя `systemPrompt` важнее `role`; флаг `--role` полностью заменяет пресетный `systemPrompt`. Значения `appendSystemPrompt` со всех слоёв складываются.
+Значения разрешаются послойно, сверху вниз: флаги → пресет → дефолты команды → общие дефолты. Системный промт выбирается целиком, поэтому `--system-prompt` в командной строке полностью заменяет пресетный. Списки `appendSystemPrompt`, `extensions` и `skills` со всех слоёв складываются.
 
 Если что-то не работает — начни с `setup`: он покажет, найден ли бинарь pi, есть ли доступные модели, какие конфиги подхвачены и где лежит состояние задач.

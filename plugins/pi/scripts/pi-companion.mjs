@@ -32,7 +32,7 @@ import {
 import { listModels, normalizeThinking, resolveModelSelection } from "./lib/models.mjs";
 import { getPiAvailability, PI_BINARY, runPiTurn } from "./lib/pi.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
-import { buildSystemPrompt, interpolate, listBuiltInRoles, loadTaskTemplate } from "./lib/prompts.mjs";
+import { buildSystemPrompt, interpolate, listNamedPrompts, loadTaskTemplate } from "./lib/prompts.mjs";
 import { inboxPath, pushControlMessage } from "./lib/inbox.mjs";
 import { parseJsonLine } from "./lib/jsonl.mjs";
 import { runPiRpcTurn } from "./lib/rpc.mjs";
@@ -78,7 +78,6 @@ const RUN_FLAGS = {
     "provider",
     "thinking",
     "preset",
-    "role",
     "system-prompt",
     "tools",
     "exclude-tools",
@@ -119,8 +118,7 @@ function usage() {
     "  --provider <name>       provider name",
     "  --thinking <level>      off|minimal|low|medium|high|xhigh|max",
     "  --preset <name>         preset from .claude/pi/config.json",
-    "  --role <name>           system-prompt role (built-in or project)",
-    "  --system-prompt <v>     inline text, or @path / *.md file",
+    "  --system-prompt <v>     stored prompt name (reviewer, fixer, …), @path/to.md, or inline text",
     "  --append-system-prompt  additive prompt text or file (repeatable)",
     "  --read-only             restrict pi to read, grep, find, ls",
     "  --write                 allow edit/write/bash even when the preset is read-only",
@@ -198,7 +196,6 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
     provider: flags.provider ?? null,
     thinking: normalizeThinking(flags.thinking),
     preset: flags.preset ?? null,
-    role: flags.role ?? null,
     systemPrompt: flags["system-prompt"] ?? null,
     appendSystemPrompt: flags["append-system-prompt"] ?? [],
     tools: flags.tools ?? null,
@@ -240,10 +237,8 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
     provider: selection.provider,
     systemPromptText: prompt.systemPrompt,
     appends: prompt.appends,
-    roleLabel: prompt.role ? `\`${prompt.role}\`` : null,
-    promptLabel: prompt.role
-      ? null
-      : (prompt.sources.find((source) => source.startsWith("system prompt")) ?? null),
+    promptName: prompt.name,
+    promptLabel: prompt.sources.find((source) => source.startsWith("system prompt")) ?? null,
     promptSources: prompt.sources,
     warnings
   };
@@ -276,7 +271,7 @@ async function executeRun({
     inboxFile,
     engine: settings.engine,
     model: settings.model,
-    role: settings.role,
+    systemPromptName: settings.promptName,
     preset: settings.presetName,
     readOnly: settings.readOnly,
     background: Boolean(flags.background),
@@ -363,7 +358,7 @@ async function commandSetup(argv, workspaceRoot) {
     configSources: sources,
     configErrors: errors,
     presets: Object.keys(config.presets ?? {}),
-    roles: [...new Set([...listBuiltInRoles(PLUGIN_ROOT), ...Object.keys(config.roles ?? {})])].sort(),
+    prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
     stateDir: resolveStateDir(workspaceRoot),
     userConfigPath: userConfigPath()
   };
@@ -381,7 +376,7 @@ async function commandModels(argv, workspaceRoot) {
   const payload = {
     models,
     presets: config.presets ?? {},
-    roles: [...new Set([...listBuiltInRoles(PLUGIN_ROOT), ...Object.keys(config.roles ?? {})])].sort(),
+    prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
     defaults: config.defaults ?? {},
     search
   };

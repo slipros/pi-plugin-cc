@@ -1,6 +1,6 @@
 ---
 description: Hand a task to a pi agent, with a chosen model and system prompt
-argument-hint: '[--background|--wait] [--model <id>] [--preset <name>] [--role <name>] [--thinking <level>] [--read-only] [--session last] <task>'
+argument-hint: '[--background|--wait] [--preset <name>] [--model <id>] [--system-prompt <name|@file|text>] [--thinking <level>] [--read-only] [--session last] <task>'
 disable-model-invocation: false
 allowed-tools: Bash(node:*), Bash(git:*), Read, Glob, Grep, AskUserQuestion
 ---
@@ -14,8 +14,8 @@ Argument handling:
 
 - Preserve the user's arguments exactly. Do not rewrite the task text, do not strip flags, do not add flags the user did not ask for.
 - The task text is everything that is not a flag. If it is empty, ask the user what to delegate instead of inventing a task.
-- Model selection: `--model <id>`, `--provider <name>`, `--thinking <level>`, or `--preset <name>`. If the user names a model that is not in the catalogue, the script warns and still passes it to pi — relay that warning.
-- System prompt: `--role <name>` picks a built-in role (`fixer`, `reviewer`, `adversarial`, `explorer`) or a project role from `.claude/pi/roles/`. `--system-prompt <text|@file>` replaces the prompt outright and `--append-system-prompt <text|@file>` adds to it. Default for delegation is pi's own coding-assistant prompt unless the config says otherwise.
+- Profile: `--preset <name>` applies a full agent profile (model, thinking, system prompt, tools, extensions) from the config; individual flags `--model`, `--provider`, `--thinking` override single fields. If the user names a model that is not in the catalogue, the script warns and still passes it to pi — relay that warning.
+- System prompt: `--system-prompt <value>` takes a stored prompt name (`fixer`, `reviewer`, `adversarial`, `explorer`, or a project file in `.claude/pi/prompts/`), an `@path/to/file.md`, or inline text. `--append-system-prompt <text|@file>` adds to it. Without it, pi keeps its own coding-assistant prompt unless the config says otherwise.
 - By default the pi agent can edit files and run commands. Pass `--read-only` when the user only wants investigation.
 - `--session last` continues the most recent pi session in this workspace; `--fresh` forces a new one.
 

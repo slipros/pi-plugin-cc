@@ -1,11 +1,11 @@
 ---
-description: List the models pi can use, plus configured presets and roles
+description: List the models pi can use, plus configured presets and system prompts
 argument-hint: '[search]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read
 ---
 
-Show the pi model catalogue for this workspace.
+Show the pi model catalogue, presets and stored system prompts for this workspace.
 
 Raw slash-command arguments:
 `$ARGUMENTS`

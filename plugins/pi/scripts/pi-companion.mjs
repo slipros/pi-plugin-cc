@@ -102,6 +102,7 @@ function usage() {
     "  --write                 allow edit/write/bash even when the preset is read-only",
     "  --tools / --exclude-tools <list>",
     "  --session <id>          continue an existing pi session ('last' = latest job)",
+    "  --fresh                 ignore --session and start a new pi session",
     "  --timeout <seconds>     hard limit for the run",
     "  --stdin                 append piped stdin to the prompt",
     "  --json                  machine-readable output"
@@ -198,7 +199,10 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
     provider: selection.provider,
     systemPromptText: prompt.systemPrompt,
     appends: prompt.appends,
-    roleLabel: prompt.role ? `\`${prompt.role}\`` : prompt.sources.find((source) => source.startsWith("system prompt")) ?? null,
+    roleLabel: prompt.role ? `\`${prompt.role}\`` : null,
+    promptLabel: prompt.role
+      ? null
+      : (prompt.sources.find((source) => source.startsWith("system prompt")) ?? null),
     promptSources: prompt.sources,
     warnings
   };
@@ -271,7 +275,11 @@ async function executeRun({
       sessionId,
       sessionName: title.slice(0, 80),
       timeoutMs: settings.timeoutMs,
-      onProgress
+      onProgress,
+      onSpawn: (piPid) => {
+        // Recorded so /pi:cancel can signal pi itself, not just this wrapper.
+        upsertJob(workspaceRoot, { id: jobId, piPid });
+      }
     });
 
     const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
@@ -422,7 +430,10 @@ async function commandCancel(argv, workspaceRoot) {
 
   let cancelled = false;
   if (job.status === "running" && job.pid) {
-    cancelled = await terminateProcessTree(job.pid);
+    // pi runs in its own process group; the companion wrapper does not.
+    const piStopped = job.piPid ? await terminateProcessTree(job.piPid, { group: true }) : false;
+    const wrapperStopped = await terminateProcessTree(job.pid, { group: false });
+    cancelled = piStopped || wrapperStopped;
     if (cancelled) {
       const record = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() };
       upsertJob(workspaceRoot, record);

@@ -30,10 +30,13 @@ function processAlive(pid) {
 }
 
 /**
- * Terminate a job process and any children it spawned.
- * Sends SIGTERM to the process group first, then escalates to SIGKILL.
+ * Terminate a process and, when it leads its own process group, everything it
+ * spawned. Sends SIGTERM first, then escalates to SIGKILL.
+ *
+ * `group` must only be true for processes started with `detached: true`;
+ * otherwise the negative pid would signal the caller's own process group.
  */
-export async function terminateProcessTree(pid, { graceMs = 3000 } = {}) {
+export async function terminateProcessTree(pid, { graceMs = 3000, group = false } = {}) {
   if (!Number.isInteger(pid) || pid <= 0 || !processAlive(pid)) {
     return false;
   }
@@ -47,8 +50,9 @@ export async function terminateProcessTree(pid, { graceMs = 3000 } = {}) {
     }
   };
 
-  // Negative pid targets the process group created with detached spawn.
-  signal(-pid, "SIGTERM") || signal(pid, "SIGTERM");
+  if (!group || !signal(-pid, "SIGTERM")) {
+    signal(pid, "SIGTERM");
+  }
 
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
@@ -58,6 +62,8 @@ export async function terminateProcessTree(pid, { graceMs = 3000 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  signal(-pid, "SIGKILL") || signal(pid, "SIGKILL");
+  if (!group || !signal(-pid, "SIGKILL")) {
+    signal(pid, "SIGKILL");
+  }
   return !processAlive(pid);
 }

@@ -31,7 +31,8 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
 }
 
 export function appendLogLine(logFile, message) {
-  const text = String(message ?? "").trim();
+  // One event per line keeps the progress preview readable.
+  const text = String(message ?? "").replace(/\s*\n\s*/g, " ").trim();
   if (!logFile || !text) {
     return;
   }

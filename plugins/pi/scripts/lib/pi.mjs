@@ -139,6 +139,22 @@ export function buildPiArgs({
  * Parse one line of pi's JSON event stream into progress/result state.
  * Kept pure so the stream handling is unit testable.
  */
+/**
+ * Render argv for logs without dumping whole system prompts into them.
+ */
+export function redactArgs(args) {
+  const redacted = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    redacted.push(arg);
+    if (arg === "--system-prompt" || arg === "--append-system-prompt") {
+      const value = args[++index] ?? "";
+      redacted.push(`<${String(value).length} chars>`);
+    }
+  }
+  return redacted.join(" ");
+}
+
 export function applyPiEvent(state, event) {
   if (!event || typeof event !== "object") {
     return null;
@@ -230,6 +246,7 @@ export async function runPiTurn({
   prompt,
   timeoutMs = 1_800_000,
   onProgress = null,
+  onSpawn = null,
   env = process.env,
   ...options
 } = {}) {
@@ -245,13 +262,18 @@ export async function runPiTurn({
     }
   };
 
-  report({ phase: "starting", message: `Running ${PI_BINARY} ${args.join(" ")}` });
+  report({ phase: "starting", message: `Running ${PI_BINARY} ${redactArgs(args)}` });
 
+  // detached puts pi in its own process group, so cancelling a job can take
+  // down the tools it spawned without touching the caller's shell.
   const child = spawn(PI_BINARY, args, {
     cwd,
     env,
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32"
   });
+
+  onSpawn?.(child.pid ?? null);
 
   let stderr = "";
   let stdoutRest = "";
@@ -261,7 +283,11 @@ export async function runPiTurn({
     timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
-          child.kill("SIGKILL");
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch {
+            child.kill("SIGKILL");
+          }
         }, timeoutMs)
       : null;
 
@@ -337,6 +363,6 @@ export async function runPiTurn({
     stderr: stderr.trim(),
     errors,
     timedOut,
-    command: `${PI_BINARY} ${args.join(" ")}`
+    command: `${PI_BINARY} ${redactArgs(args)}`
   };
 }

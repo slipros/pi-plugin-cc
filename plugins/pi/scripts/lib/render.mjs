@@ -150,6 +150,7 @@ function renderRunHeader(title, { job, settings, execution }) {
     settings.thinking ? `- Thinking: \`${settings.thinking}\`` : null,
     settings.presetName ? `- Preset: \`${settings.presetName}\`` : null,
     settings.roleLabel ? `- Role: ${settings.roleLabel}` : null,
+    settings.promptLabel ? `- Custom ${settings.promptLabel}` : null,
     settings.readOnly ? "- Tools: read-only (`read`, `grep`, `find`, `ls`)" : null,
     execution?.sessionId ? `- pi session: \`${execution.sessionId}\` (resume with \`pi --session ${execution.sessionId}\`)` : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,

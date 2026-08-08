@@ -1,0 +1,21 @@
+{
+  "name": "pi-tools",
+  "owner": {
+    "name": "slipros"
+  },
+  "metadata": {
+    "description": "pi plugins for Claude Code: delegate tasks and code reviews to any model pi can reach.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "pi",
+      "description": "Use pi from Claude Code to review code or delegate tasks, with per-run model and system-prompt selection.",
+      "version": "0.1.0",
+      "author": {
+        "name": "slipros"
+      },
+      "source": "./plugins/pi"
+    }
+  ]
+}

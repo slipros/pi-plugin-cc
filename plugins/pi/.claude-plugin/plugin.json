@@ -1,0 +1,10 @@
+{
+  "name": "pi",
+  "version": "0.1.0",
+  "description": "Delegate work and code reviews to pi agents from Claude Code, with per-run model and system-prompt selection.",
+  "author": {
+    "name": "slipros"
+  },
+  "homepage": "https://github.com/slipros/pi-plugin-cc",
+  "keywords": ["pi", "delegation", "code-review", "multi-model"]
+}

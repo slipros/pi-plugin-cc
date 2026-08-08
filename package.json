@@ -1,0 +1,11 @@
+{
+  "name": "pi-plugin-cc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "pi plugin for Claude Code",
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "license": "MIT"
+}

@@ -49,6 +49,60 @@ test("a preset can turn read-only on for a delegation", () => {
   assert.equal(settings.model, "audit-model");
 });
 
+test("each preset carries its own system prompt", () => {
+  const config = {
+    ...CONFIG,
+    presets: {
+      dba: { model: "m1", systemPrompt: "You are a database specialist." },
+      docs: { model: "m2", role: "explorer" }
+    },
+    commands: { delegate: {} }
+  };
+
+  const dba = resolveRunSettings(config, "delegate", { preset: "dba" });
+  assert.equal(dba.systemPrompt, "You are a database specialist.");
+  assert.equal(dba.role, null, "an explicit prompt leaves no role to resolve");
+
+  const docs = resolveRunSettings(config, "delegate", { preset: "docs" });
+  assert.equal(docs.role, "explorer");
+  assert.equal(docs.systemPrompt, null);
+});
+
+test("a preset system prompt may be a file reference", () => {
+  const config = {
+    ...CONFIG,
+    presets: { dba: { systemPrompt: "@.claude/pi/prompts/dba.md" } },
+    commands: { delegate: {} }
+  };
+  assert.equal(
+    resolveRunSettings(config, "delegate", { preset: "dba" }).systemPrompt,
+    "@.claude/pi/prompts/dba.md"
+  );
+});
+
+test("--role on the command line replaces a preset's system prompt", () => {
+  const config = {
+    ...CONFIG,
+    presets: { dba: { model: "m1", systemPrompt: "You are a database specialist." } },
+    commands: { delegate: {} }
+  };
+  const settings = resolveRunSettings(config, "delegate", { preset: "dba", role: "reviewer" });
+  assert.equal(settings.role, "reviewer");
+  assert.equal(settings.systemPrompt, null, "the preset prompt must not survive an explicit role");
+  assert.equal(settings.model, "m1", "unrelated preset values still apply");
+});
+
+test("a preset prompt overrides the global default prompt", () => {
+  const config = {
+    ...CONFIG,
+    defaults: { ...CONFIG.defaults, role: "fixer" },
+    presets: { audit: { role: "adversarial" } },
+    commands: { delegate: {} }
+  };
+  assert.equal(resolveRunSettings(config, "delegate", { preset: "audit" }).role, "adversarial");
+  assert.equal(resolveRunSettings(config, "delegate").role, "fixer");
+});
+
 test("append-system-prompt values from every layer are concatenated", () => {
   const config = {
     ...CONFIG,

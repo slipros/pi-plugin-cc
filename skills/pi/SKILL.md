@@ -128,14 +128,24 @@ delegate --fresh "…"                 # принудительно новая �
 
 ```json
 {
-  "defaults": { "model": "opencode-go/glm-5.2", "thinking": "medium" },
+  "defaults": { "model": "openrouter/deepseek/deepseek-v4-flash-0731", "thinking": "high" },
   "presets": {
     "fast":  { "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
-    "audit": { "model": "opencode-go/kimi-k3", "role": "adversarial", "readOnly": true }
+    "audit": { "model": "opencode-go/kimi-k3", "role": "adversarial", "readOnly": true },
+    "dba":   {
+      "model": "opencode-go/kimi-k3",
+      "systemPrompt": "@.claude/pi/prompts/dba.md",
+      "appendSystemPrompt": ["Отвечай по-русски."],
+      "tools": "read,grep,find,ls,bash"
+    }
   },
   "commands": { "review": { "preset": "audit" } },
   "roles": { "go-reviewer": ".claude/pi/roles/go-reviewer.md" }
 }
 ```
+
+У каждого пресета может быть свой системный промт: `role` (имя файла-роли) или `systemPrompt` (текст либо `@путь`), плюс своя модель, thinking, набор инструментов и `appendSystemPrompt`. То есть `--preset dba` меняет не только модель, а всю личность агента.
+
+Приоритет промта разрешается послойно, сверху вниз: флаги (`--system-prompt` / `--role`) → пресет → дефолты команды → общие дефолты → `.claude/pi/SYSTEM.md`. Внутри слоя `systemPrompt` важнее `role`; флаг `--role` полностью заменяет пресетный `systemPrompt`. Значения `appendSystemPrompt` со всех слоёв складываются.
 
 Если что-то не работает — начни с `setup`: он покажет, найден ли бинарь pi, есть ли доступные модели, какие конфиги подхвачены и где лежит состояние задач.

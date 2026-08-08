@@ -131,6 +131,17 @@ export function resolveRunSettings(config, command, overrides = {}) {
     return null;
   };
 
+  /**
+   * The system prompt is resolved per layer, not per key: a preset carries its
+   * own prompt (as `systemPrompt` text/file or a `role`), and a command-line
+   * --role must replace that prompt wholesale rather than losing to the
+   * preset's `systemPrompt`. Within one layer, `systemPrompt` wins over `role`.
+   */
+  const promptSource =
+    [overrides, preset, commandDefaults, config.defaults ?? {}].find(
+      (layer) => layer?.systemPrompt || layer?.role
+    ) ?? {};
+
   // Later layers win, so the lists run from lowest to highest priority.
   const layers = [config.defaults ?? {}, commandDefaults, preset, overrides];
   const flagOf = (key) =>
@@ -145,13 +156,10 @@ export function resolveRunSettings(config, command, overrides = {}) {
     model: pick("model"),
     provider: pick("provider"),
     thinking: pick("thinking"),
-    role: pick("role"),
-    systemPrompt: pick("systemPrompt"),
-    appendSystemPrompt: [
-      ...(Array.isArray(commandDefaults.appendSystemPrompt) ? commandDefaults.appendSystemPrompt : []),
-      ...(Array.isArray(preset.appendSystemPrompt) ? preset.appendSystemPrompt : []),
-      ...(Array.isArray(overrides.appendSystemPrompt) ? overrides.appendSystemPrompt : [])
-    ],
+    role: promptSource.systemPrompt ? null : (promptSource.role ?? null),
+    systemPrompt: promptSource.systemPrompt ?? null,
+    // Appends stack across every layer instead of replacing each other.
+    appendSystemPrompt: mergeLists("appendSystemPrompt"),
     tools: pick("tools"),
     excludeTools: pick("excludeTools"),
     readOnly,

@@ -98,8 +98,14 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
   },
   "presets": {
     "fast":  { "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
-    "deep":  { "model": "opencode-go/kimi-k3", "thinking": "high" },
-    "audit": { "model": "opencode-go/glm-5.2", "role": "adversarial", "readOnly": true }
+    "deep":  { "model": "opencode-go/kimi-k3", "thinking": "high", "role": "fixer" },
+    "audit": { "model": "opencode-go/glm-5.2", "role": "adversarial", "readOnly": true },
+    "dba":   {
+      "model": "opencode-go/kimi-k3",
+      "systemPrompt": "@.claude/pi/prompts/dba.md",
+      "appendSystemPrompt": ["Answer in Russian."],
+      "tools": "read,grep,find,ls,bash"
+    }
   },
   "commands": {
     "delegate": { "preset": "deep" },
@@ -110,6 +116,10 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
   }
 }
 ```
+
+**A preset carries its own system prompt.** Each one can set `role` (a named prompt file) or `systemPrompt` (inline text, or `@path` to a file), plus its own model, thinking level, tools and `appendSystemPrompt` additions — so `--preset dba` swaps the whole agent persona, not just the model.
+
+Precedence for the prompt is resolved per layer, highest first: command-line (`--system-prompt` / `--role`) → preset → per-command defaults → global defaults → `.claude/pi/SYSTEM.md`. Within one layer `systemPrompt` beats `role`, and a `--role` on the command line replaces a preset's `systemPrompt` entirely rather than silently losing to it. `appendSystemPrompt` values stack across all layers instead of replacing each other.
 
 ## Choosing the agent's tools
 

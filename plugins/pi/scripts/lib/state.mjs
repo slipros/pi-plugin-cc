@@ -59,6 +59,11 @@ export function resolveJobLogFile(workspaceRoot, jobId) {
   return path.join(resolveJobsDir(workspaceRoot), `${jobId}.log`);
 }
 
+/** Raw pi event stream for a job, replayed by `watch`. */
+export function eventsPath(workspaceRoot, jobId) {
+  return path.join(resolveJobsDir(workspaceRoot), `${jobId}.events.jsonl`);
+}
+
 export function loadState(workspaceRoot) {
   const stateFile = resolveStateFile(workspaceRoot);
   if (!fs.existsSync(stateFile)) {

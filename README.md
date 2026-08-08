@@ -10,13 +10,21 @@ Built in the shape of the official [Codex plugin](https://github.com/openai/code
 | --- | --- |
 | `/pi:delegate` | Hand a task to a pi agent. Picks model, role, tool permissions and session. |
 | `/pi:review` | Read-only code review of the working tree or a branch diff. |
+| `/pi:watch` | Watch what the agent is doing: turns, tool calls, answers. |
+| `/pi:steer` | Redirect a running agent mid-flight. |
 | `/pi:models` | List available models, presets and roles. |
 | `/pi:status` | Running and recent pi jobs for this workspace. |
 | `/pi:result` | Stored output of a finished job. |
-| `/pi:cancel` | Stop a running job. |
+| `/pi:cancel` | Stop a running job (soft abort first). |
 | `/pi:setup` | Check that pi is installed, authenticated and configured. |
 
-Plus the `pi:pi-delegate` subagent (so Claude can delegate without a slash command) and the `pi-cli-runtime` skill (so Claude knows how pi's flags, sessions and JSON stream behave).
+Plus the `pi:pi-delegate` subagent (so Claude can delegate without a slash command) and the `pi-cli-runtime` skill (so Claude knows how pi's flags, sessions and event stream behave).
+
+The same functionality is also packaged as a **standalone skill** in [`skills/pi`](skills/pi) — handy for iterating without reinstalling a plugin:
+
+```bash
+ln -s "$PWD/skills/pi" ~/.claude/skills/pi
+```
 
 ## Requirements
 
@@ -103,15 +111,43 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
 }
 ```
 
-## Tool permissions
+## Choosing the agent's tools
 
-pi has **no sandbox** — its `bash`, `edit` and `write` tools run with your permissions.
+Built-in pi tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
 
-- `/pi:review` is always read-only: `read`, `grep`, `find`, `ls`.
-- `/pi:delegate` allows writes by default. Pass `--read-only` for investigation-only runs, or set `"readOnly": true` in a preset.
-- `--tools <list>` and `--exclude-tools <list>` give exact control.
+```bash
+/pi:delegate --read-only            investigate why the build fails   # read, grep, find, ls
+/pi:delegate --tools read,grep,bash reproduce the bug, change nothing
+/pi:delegate --exclude-tools bash   fix the types, do not run commands
+/pi:delegate --no-tools             think out loud about the architecture
+```
 
-A delegated run that edited files leaves those edits in your working tree. Review them with `git diff` before committing — the plugin never commits anything.
+Anything beyond the built-ins comes from pi extensions — including MCP servers, via the `pi-mcp-adapter` extension that reads your project's `.mcp.json`:
+
+```bash
+/pi:delegate --extension npm:pi-mcp-adapter   query the database over MCP
+/pi:delegate --extension ./tools/my-ext.ts --skill ./skills/db  …
+/pi:delegate --no-extensions                  clean run, no third-party tools
+```
+
+pi has **no sandbox** — `bash`, `edit` and `write` run with your permissions. `/pi:review` is always read-only; `/pi:delegate` allows writes by default. A delegated run that edited files leaves those edits in your working tree: review them with `git diff` before committing, the plugin never commits anything.
+
+## Watching and steering a running agent
+
+Delegated runs are not black boxes. Every job records pi's full event stream, and the run stays reachable while it works.
+
+```bash
+/pi:watch                 # what is the agent doing right now
+/pi:watch --tail 20       # just the tail
+/pi:watch <job> --follow  # live stream until the job ends
+
+/pi:steer  hold on — stop reading files and start editing
+/pi:steer  --follow-up  when you are done, add tests
+```
+
+A steering message is delivered after the agent's current turn finishes its tool calls and **before the next model call**, so it redirects work in progress instead of interrupting a tool mid-run. `--follow-up` waits until the agent is otherwise done. If the job already settled, the message is sent as a new prompt in the same pi session.
+
+This works because jobs run against a live `pi --mode rpc` session (`--engine json` switches back to a one-shot run, which is faster to start but cannot be steered). `/pi:cancel` uses the same channel: it asks pi to `abort` first — keeping the session and any partial output — and only escalates to signals if that does not land.
 
 ## Background jobs
 
@@ -140,15 +176,20 @@ pi --session <session-id>
                      ┌────────────────────────┼────────────────────────┐
                      ▼                        ▼                        ▼
               config + presets          role/system prompt        job state on disk
-              model catalogue           (prompts/roles/*.md)      (status/result/cancel)
+              model catalogue           (prompts/roles/*.md)      jobs/<id>.{json,log,
+                     │                                             events.jsonl,inbox.jsonl}
                      └────────────────────────┬────────────────────────┘
                                               ▼
-                          pi --print --mode json --model … --system-prompt …
-                                              │
-                              JSON event stream → progress, usage, answer
+                         pi --mode rpc --model … --system-prompt … --tools …
+                            │                                    ▲
+              events (JSONL) │                                    │ steer / follow_up / abort
+                            ▼                                    │
+              progress · transcript · usage · answer      inbox ◀─┴── /pi:steer, /pi:cancel
 ```
 
-The companion script spawns one non-interactive `pi` process per job and parses its JSON event stream: tool calls become progress lines, the last assistant message becomes the answer, and token usage and cost land in the report.
+One `pi --mode rpc` process per job, with a two-way JSONL channel over stdin/stdout. Outbound: events become progress lines, a replayable transcript (`/pi:watch`), token usage and the final answer. Inbound: `/pi:steer` and `/pi:cancel` append to the job's inbox file, and the process owning the run forwards them into the live session as `steer`, `follow_up` or `abort`.
+
+The inbox is a plain append-only JSONL file rather than a socket: it survives restarts, behaves identically on every platform, and you can read it with `cat` when something looks wrong.
 
 ## Development
 

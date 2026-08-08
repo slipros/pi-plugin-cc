@@ -17,10 +17,13 @@ import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { loadConfig, resolveRunSettings, userConfigPath } from "./lib/config.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import {
+  appendLogLine,
   buildStatusSnapshot,
   createJobLogFile,
   createJobRecord,
   createProgressReporter,
+  enrichJob,
+  readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
   runTrackedJob,
@@ -30,7 +33,12 @@ import { listModels, normalizeThinking, resolveModelSelection } from "./lib/mode
 import { getPiAvailability, PI_BINARY, runPiTurn } from "./lib/pi.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { buildSystemPrompt, interpolate, listBuiltInRoles, loadTaskTemplate } from "./lib/prompts.mjs";
+import { inboxPath, pushControlMessage } from "./lib/inbox.mjs";
+import { parseJsonLine } from "./lib/jsonl.mjs";
+import { runPiRpcTurn } from "./lib/rpc.mjs";
+import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
+  eventsPath,
   generateJobId,
   listJobs,
   nowIso,
@@ -52,7 +60,19 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 const RUN_FLAGS = {
-  booleans: ["background", "wait", "read-only", "write", "json", "fresh", "stdin"],
+  booleans: [
+    "background",
+    "wait",
+    "read-only",
+    "write",
+    "json",
+    "fresh",
+    "stdin",
+    "no-tools",
+    "no-builtin-tools",
+    "no-extensions",
+    "no-skills"
+  ],
   strings: [
     "model",
     "provider",
@@ -66,16 +86,18 @@ const RUN_FLAGS = {
     "timeout",
     "name",
     "base",
-    "scope"
+    "scope",
+    "engine"
   ],
-  collect: ["append-system-prompt"],
+  collect: ["append-system-prompt", "extension", "skill"],
   aliases: {
     m: "model",
     p: "provider",
     t: "thinking",
     "readonly": "read-only",
     "append-system": "append-system-prompt",
-    resume: "session"
+    resume: "session",
+    e: "extension"
   }
 };
 
@@ -89,6 +111,8 @@ function usage() {
     "  pi-companion.mjs status [job-id] [--all] [--json]",
     "  pi-companion.mjs result [job-id] [--json]",
     "  pi-companion.mjs cancel [job-id] [--json]",
+    "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
+    "  pi-companion.mjs watch [job-id] [--follow] [--tail <n>] [--json]",
     "",
     "Run flags:",
     "  --model <id>            model id or pattern (provider/model[:thinking])",
@@ -100,12 +124,22 @@ function usage() {
     "  --append-system-prompt  additive prompt text or file (repeatable)",
     "  --read-only             restrict pi to read, grep, find, ls",
     "  --write                 allow edit/write/bash even when the preset is read-only",
-    "  --tools / --exclude-tools <list>",
     "  --session <id>          continue an existing pi session ('last' = latest job)",
     "  --fresh                 ignore --session and start a new pi session",
     "  --timeout <seconds>     hard limit for the run",
     "  --stdin                 append piped stdin to the prompt",
-    "  --json                  machine-readable output"
+    "  --json                  machine-readable output",
+    "",
+    "Tool flags (what the pi agent is allowed to use):",
+    "  --tools <list>          allowlist: read,bash,edit,write,grep,find,ls + extension tools",
+    "  --exclude-tools <list>  denylist",
+    "  --no-builtin-tools      keep only extension/custom tools",
+    "  --no-tools              no tools at all",
+    "  --extension <source>    load a pi extension (path, npm:pkg, git url); repeatable",
+    "  --skill <path>          load a pi skill; repeatable",
+    "  --no-extensions         ignore discovered extensions",
+    "  --no-skills             ignore discovered skills",
+    "  --engine rpc|json       rpc (default) keeps the run steerable"
   ].join("\n");
 }
 
@@ -169,6 +203,13 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
     appendSystemPrompt: flags["append-system-prompt"] ?? [],
     tools: flags.tools ?? null,
     excludeTools: flags["exclude-tools"] ?? null,
+    extensions: flags.extension ?? [],
+    skills: flags.skill ?? [],
+    ...(flags["no-tools"] ? { noTools: true } : {}),
+    ...(flags["no-builtin-tools"] ? { noBuiltinTools: true } : {}),
+    ...(flags["no-extensions"] ? { noExtensions: true } : {}),
+    ...(flags["no-skills"] ? { noSkills: true } : {}),
+    ...(flags.engine ? { engine: flags.engine } : {}),
     ...(flags["read-only"] ? { readOnly: true } : {}),
     ...(flags.write ? { readOnly: false } : {}),
     ...(flags.timeout ? { timeoutMs: Number(flags.timeout) * 1000 } : {})
@@ -223,12 +264,17 @@ async function executeRun({
 }) {
   const jobId = generateJobId(kind);
   const logFile = createJobLogFile(workspaceRoot, jobId, title);
+  const eventsFile = eventsPath(workspaceRoot, jobId);
+  const inboxFile = inboxPath(workspaceRoot, jobId);
   const job = createJobRecord({
     id: jobId,
     kind,
     title,
     workspaceRoot,
     logFile,
+    eventsFile,
+    inboxFile,
+    engine: settings.engine,
     model: settings.model,
     role: settings.role,
     preset: settings.presetName,
@@ -261,7 +307,8 @@ async function executeRun({
 
   const startedAt = Date.now();
   const execution = await runTrackedJob({ ...job, logFile }, async () => {
-    const result = await runPiTurn({
+    const runner = settings.engine === "json" ? runPiTurn : runPiRpcTurn;
+    const result = await runner({
       cwd: workspaceRoot,
       prompt,
       model: settings.model,
@@ -272,9 +319,17 @@ async function executeRun({
       tools: settings.tools,
       excludeTools: settings.excludeTools,
       readOnly: settings.readOnly,
+      noTools: settings.noTools,
+      noBuiltinTools: settings.noBuiltinTools,
+      extensions: settings.extensions,
+      skills: settings.skills,
+      noExtensions: settings.noExtensions,
+      noSkills: settings.noSkills,
       sessionId,
       sessionName: title.slice(0, 80),
       timeoutMs: settings.timeoutMs,
+      eventsFile,
+      inboxFile,
       onProgress,
       onSpawn: (piPid) => {
         // Recorded so /pi:cancel can signal pi itself, not just this wrapper.
@@ -424,21 +479,189 @@ async function commandResult(argv, workspaceRoot) {
   return 0;
 }
 
+/**
+ * Send a message into a running job.
+ *
+ * While pi is working the message is delivered as steering (after the current
+ * assistant turn finishes its tool calls, before the next LLM call); a job that
+ * has already settled is re-opened with the message as a new prompt.
+ */
+async function commandSteer(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, {
+    booleans: ["json", "follow-up"],
+    strings: ["job"]
+  });
+
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
+  const explicitId = flags.job ?? (positional[0] && jobs.some((job) => job.id === positional[0]) ? positional.shift() : null);
+  const message = positional.join(" ").trim();
+
+  if (!message) {
+    throw new Error('Nothing to send. Usage: steer [job-id] "your instruction".');
+  }
+
+  const target = explicitId
+    ? jobs.find((job) => job.id === explicitId || job.id.endsWith(explicitId))
+    : jobs.find((job) => job.status === "running");
+
+  if (!target) {
+    throw new Error(
+      explicitId ? `No pi job matches "${explicitId}".` : "No running pi job to steer."
+    );
+  }
+  if (target.status !== "running") {
+    throw new Error(
+      `Job ${target.id} is ${target.status}, so it cannot be steered. Start a new run with --session ${target.sessionId ?? "last"} instead.`
+    );
+  }
+  if (target.engine === "json") {
+    throw new Error(
+      `Job ${target.id} runs on the one-shot json engine and has no control channel. Re-run it with --engine rpc (the default) to steer it.`
+    );
+  }
+
+  const kind = flags["follow-up"] ? "follow_up" : "steer";
+  const entry = pushControlMessage(workspaceRoot, target.id, { kind, message });
+  appendLogLine(target.logFile, `Queued ${kind} from Claude Code: ${message}`);
+
+  const payload = { job: target.id, ...entry };
+  const rendered = joinReport([
+    `Sent ${kind === "steer" ? "steering message" : "follow-up"} to \`${target.id}\`.`,
+    "",
+    `> ${message}`,
+    "",
+    kind === "steer"
+      ? "pi picks it up after the current assistant turn finishes its tool calls."
+      : "pi picks it up once it finishes the current work.",
+    "Watch it land with `watch --follow`."
+  ]);
+
+  output(rendered, payload, Boolean(flags.json));
+  return 0;
+}
+
+function joinReport(lines) {
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * Replay (and optionally follow) a job's event stream as a readable transcript.
+ */
+async function commandWatch(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, {
+    booleans: ["json", "follow"],
+    strings: ["tail"]
+  });
+
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
+  if (!jobs.length) {
+    throw new Error("No pi jobs recorded for this workspace yet.");
+  }
+
+  const reference = positional[0] ?? null;
+  const target = reference
+    ? jobs.find((job) => job.id === reference || job.id.endsWith(reference))
+    : (jobs.find((job) => job.status === "running") ?? jobs[0]);
+
+  if (!target) {
+    throw new Error(`No pi job matches "${reference}".`);
+  }
+
+  const file = target.eventsFile ?? eventsPath(workspaceRoot, target.id);
+  const tailLimit = flags.tail ? Math.max(1, Number(flags.tail)) : null;
+
+  const readEvents = (fromLine) => {
+    if (!fs.existsSync(file)) {
+      return { events: [], nextLine: fromLine };
+    }
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    return {
+      events: lines.slice(fromLine).map(parseJsonLine).filter(Boolean),
+      nextLine: lines.length
+    };
+  };
+
+  const initial = readEvents(0);
+  if (flags.json) {
+    output("", { job: target, events: initial.events }, true);
+    return 0;
+  }
+
+  const state = {};
+  let lines = initial.events.flatMap((event) => renderTranscriptEvent(event, state));
+  if (tailLimit) {
+    lines = lines.slice(-tailLimit);
+  }
+
+  process.stdout.write(
+    `# pi transcript — \`${target.id}\` (${target.status})\n${target.title ? `\n${target.title}\n` : ""}\n`
+  );
+  process.stdout.write(lines.length ? `${lines.join("\n")}\n` : "_No events recorded yet._\n");
+
+  if (!flags.follow) {
+    if (target.status === "running") {
+      process.stdout.write("\n_Job is still running. Re-run watch, or add --follow to stream it live._\n");
+    }
+    return 0;
+  }
+
+  // Follow mode: stream until the job stops running and the file is drained.
+  let cursor = initial.nextLine;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const next = readEvents(cursor);
+    cursor = next.nextLine;
+    for (const event of next.events) {
+      const rendered = renderTranscriptEvent(event, state);
+      if (rendered.length) {
+        process.stdout.write(`${rendered.join("\n")}\n`);
+      }
+    }
+    const current = enrichJob(listJobs(workspaceRoot).find((job) => job.id === target.id) ?? target);
+    if (current.status !== "running" && !next.events.length) {
+      process.stdout.write(`\n■ job ${current.status}\n`);
+      return 0;
+    }
+  }
+}
+
 async function commandCancel(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, { booleans: ["json"] });
   const job = resolveCancelableJob(workspaceRoot, positional[0] ?? null);
 
   let cancelled = false;
   if (job.status === "running" && job.pid) {
-    // pi runs in its own process group; the companion wrapper does not.
-    const piStopped = job.piPid ? await terminateProcessTree(job.piPid, { group: true }) : false;
-    const wrapperStopped = await terminateProcessTree(job.pid, { group: false });
-    cancelled = piStopped || wrapperStopped;
-    if (cancelled) {
-      const record = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() };
-      upsertJob(workspaceRoot, record);
-      writeJobFile(workspaceRoot, job.id, { ...job, ...record });
+    // Ask pi to stop through the control channel first: an abort keeps the
+    // session intact and lets the run record its partial work.
+    if (job.engine !== "json") {
+      pushControlMessage(workspaceRoot, job.id, { kind: "abort" });
+      appendLogLine(job.logFile, "Abort requested from Claude Code.");
+      for (let waited = 0; waited < 4000; waited += 250) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const current = listJobs(workspaceRoot).find((entry) => entry.id === job.id);
+        if (current && current.status !== "running") {
+          cancelled = true;
+          break;
+        }
+      }
     }
+
+    if (!cancelled) {
+      // pi runs in its own process group; the companion wrapper does not.
+      const piStopped = job.piPid ? await terminateProcessTree(job.piPid, { group: true }) : false;
+      const wrapperStopped = await terminateProcessTree(job.pid, { group: false });
+      cancelled = piStopped || wrapperStopped;
+    }
+
+    const record = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() };
+    upsertJob(workspaceRoot, record);
+    // Keep whatever the run already stored (partial output, session id) and
+    // only overlay the cancellation.
+    writeJobFile(workspaceRoot, job.id, {
+      ...job,
+      ...(readStoredJob(workspaceRoot, job.id) ?? {}),
+      ...record
+    });
   }
 
   output(renderCancelReport(job, cancelled), { job, cancelled }, Boolean(flags.json));
@@ -452,7 +675,9 @@ const COMMANDS = {
   review: commandReview,
   status: commandStatus,
   result: commandResult,
-  cancel: commandCancel
+  cancel: commandCancel,
+  steer: commandSteer,
+  watch: commandWatch
 };
 
 async function main() {

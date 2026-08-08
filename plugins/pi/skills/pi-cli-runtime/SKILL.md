@@ -10,6 +10,8 @@ Prefer the companion script over raw `pi` calls: it tracks the job, captures the
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" delegate --model <id> --role fixer "task text"
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" review --base main
+node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" watch [job-id] [--follow] [--tail n]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" steer [job-id] [--follow-up] "instruction"
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" status|result|cancel [job-id]
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" models [search]
 ```
@@ -42,8 +44,26 @@ echo "explain src/server.ts" | pi -p --mode json
 Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
 
 - `--tools read,grep,find,ls` is the read-only set used by reviews.
-- `--exclude-tools bash` denies specific tools; `--no-tools` disables everything.
+- `--exclude-tools bash` denies specific tools; `--no-builtin-tools` keeps only extension tools; `--no-tools` disables everything.
+- `--extension <path|npm:pkg|git-url>` (repeatable) is how pi gains tools beyond the built-ins; `--skill <path>` loads a pi skill. `--no-extensions` / `--no-skills` ignore whatever was discovered.
+- MCP servers reach pi through the `pi-mcp-adapter` extension, which reads `.mcp.json` / `~/.config/mcp/mcp.json` and exposes servers behind one proxy tool instead of dumping every tool definition into context.
 - pi has **no sandbox**: `bash`, `edit` and `write` act with the permissions of the process. Only enable them when the task genuinely needs to change the repository.
+
+### RPC mode: steering a live run
+
+`pi --mode rpc` keeps a two-way JSONL channel on stdin/stdout, which is what makes a run steerable. Commands the plugin sends:
+
+| Command | Effect |
+| --- | --- |
+| `{"type":"prompt","message":"…"}` | Start the work (or re-open a settled session). |
+| `{"type":"steer","message":"…"}` | Delivered after the current assistant turn finishes its tool calls, before the next model call. |
+| `{"type":"follow_up","message":"…"}` | Delivered once the agent has nothing left to do. |
+| `{"type":"abort"}` | Stop the current operation without killing the session. |
+| `{"type":"get_state"}` | Returns `sessionId`, model, streaming state. |
+
+Framing is strict JSONL: split on `\n` only. Node's `readline` is **not** protocol-compliant here because it also splits on U+2028/U+2029, which are legal inside JSON strings.
+
+Extra events in this mode: `queue_update` (pending steering/follow-up), `agent_settled` (the session really is done — `agent_end` alone may still be followed by a retry or a queued message).
 
 ### Sessions
 

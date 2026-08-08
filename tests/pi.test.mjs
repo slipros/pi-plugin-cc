@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { applyPiEvent, buildPiArgs, READ_ONLY_TOOLS } from "../plugins/pi/scripts/lib/pi.mjs";
+import {
+  applyPiEvent,
+  buildPiArgs,
+  createTurnState,
+  READ_ONLY_TOOLS
+} from "../plugins/pi/scripts/lib/pi.mjs";
 
 test("a bare run only asks for non-interactive json output", () => {
   assert.deepEqual(buildPiArgs(), ["--print", "--mode", "json"]);
@@ -44,24 +49,45 @@ test("an explicit tool list overrides the read-only default", () => {
   assert.deepEqual(args.slice(3), ["--tools", "read,bash"]);
 });
 
+test("rpc mode swaps the one-shot flags for a live channel", () => {
+  assert.deepEqual(buildPiArgs({ mode: "rpc" }), ["--mode", "rpc"]);
+  assert.deepEqual(buildPiArgs({ mode: "rpc", model: "glm-5.2" }), ["--mode", "rpc", "--model", "glm-5.2"]);
+});
+
+test("extensions and skills are passed through, repeatably", () => {
+  const args = buildPiArgs({
+    extensions: ["npm:pi-mcp-adapter", "./local-ext.ts"],
+    skills: ["./skills/db"],
+    noExtensions: true
+  });
+  assert.deepEqual(args.slice(3), [
+    "--no-extensions",
+    "--extension",
+    "npm:pi-mcp-adapter",
+    "--extension",
+    "./local-ext.ts",
+    "--skill",
+    "./skills/db"
+  ]);
+});
+
+test("--no-tools overrides every other tool flag", () => {
+  const args = buildPiArgs({ noTools: true, readOnly: true, tools: "read", excludeTools: "bash" });
+  assert.deepEqual(args.slice(3), ["--no-tools"]);
+});
+
+test("--no-builtin-tools keeps extension tools alongside an allowlist", () => {
+  const args = buildPiArgs({ noBuiltinTools: true, tools: "mcp" });
+  assert.deepEqual(args.slice(3), ["--no-builtin-tools", "--tools", "mcp"]);
+});
+
 test("a session id resumes, and --no-session wins over it", () => {
   assert.deepEqual(buildPiArgs({ sessionId: "abc" }).slice(3), ["--session", "abc"]);
   assert.deepEqual(buildPiArgs({ sessionId: "abc", noSession: true }).slice(3), ["--no-session"]);
 });
 
 function drain(events) {
-  const state = {
-    sessionId: null,
-    turns: 0,
-    toolCalls: [],
-    toolErrors: 0,
-    assistantTexts: [],
-    usage: {},
-    model: null,
-    stopReason: null,
-    errors: [],
-    settled: false
-  };
+  const state = createTurnState();
   const progress = [];
   for (const event of events) {
     const update = applyPiEvent(state, event);
@@ -98,8 +124,25 @@ test("the event stream yields the session id, tool calls and the final answer", 
   assert.deepEqual(state.assistantTexts, ["final answer"]);
   assert.equal(state.model, "opencode-go/glm-5.2");
   assert.equal(state.stopReason, "stop");
-  assert.equal(state.settled, true);
-  assert.deepEqual(progress.at(-1), { phase: "finishing", message: "pi finished its work." });
+  assert.deepEqual(progress.at(-1), { phase: "finishing", message: "pi finished a run." });
+});
+
+test("only agent_settled ends the job — agent_end may be followed by a retry", () => {
+  const afterEnd = drain([{ type: "agent_end", willRetry: true }]);
+  assert.equal(afterEnd.state.settled, false);
+  assert.deepEqual(afterEnd.progress, [{ phase: "finishing", message: "pi will retry." }]);
+
+  const afterSettle = drain([{ type: "agent_end", willRetry: false }, { type: "agent_settled" }]);
+  assert.equal(afterSettle.state.settled, true);
+});
+
+test("queue updates are tracked and reported only when non-empty", () => {
+  const { state, progress } = drain([
+    { type: "queue_update", steering: ["focus on auth"], followUp: [] },
+    { type: "queue_update", steering: [], followUp: [] }
+  ]);
+  assert.deepEqual(state.queue, { steering: [], followUp: [] }, "the last update wins");
+  assert.deepEqual(progress, [{ phase: "working", message: "Queued: 1 steering, 0 follow-up." }]);
 });
 
 test("usage accumulates across assistant messages", () => {

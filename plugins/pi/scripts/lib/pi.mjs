@@ -91,11 +91,20 @@ export function buildPiArgs({
   tools = null,
   excludeTools = null,
   readOnly = false,
+  noTools = false,
+  noBuiltinTools = false,
+  extensions = [],
+  skills = [],
+  noExtensions = false,
+  noSkills = false,
   sessionId = null,
   sessionName = null,
-  noSession = false
+  noSession = false,
+  mode = "json"
 } = {}) {
-  const args = ["--print", "--mode", "json"];
+  // json mode is a one-shot turn on stdin; rpc keeps a two-way channel open so
+  // the run can be steered while it works.
+  const args = mode === "rpc" ? ["--mode", "rpc"] : ["--print", "--mode", "json"];
 
   if (provider) {
     args.push("--provider", provider);
@@ -116,11 +125,37 @@ export function buildPiArgs({
   }
 
   const toolAllowList = tools ?? (readOnly ? READ_ONLY_TOOLS.join(",") : null);
-  if (toolAllowList) {
-    args.push("--tools", Array.isArray(toolAllowList) ? toolAllowList.join(",") : toolAllowList);
+  if (noTools) {
+    args.push("--no-tools");
+  } else {
+    if (noBuiltinTools) {
+      args.push("--no-builtin-tools");
+    }
+    if (toolAllowList) {
+      args.push("--tools", Array.isArray(toolAllowList) ? toolAllowList.join(",") : toolAllowList);
+    }
+    if (excludeTools) {
+      args.push("--exclude-tools", Array.isArray(excludeTools) ? excludeTools.join(",") : excludeTools);
+    }
   }
-  if (excludeTools) {
-    args.push("--exclude-tools", Array.isArray(excludeTools) ? excludeTools.join(",") : excludeTools);
+
+  // Extensions are how pi gains tools beyond the built-ins — including MCP
+  // servers, via the pi-mcp-adapter extension.
+  if (noExtensions) {
+    args.push("--no-extensions");
+  }
+  for (const extension of extensions) {
+    if (extension) {
+      args.push("--extension", extension);
+    }
+  }
+  if (noSkills) {
+    args.push("--no-skills");
+  }
+  for (const skill of skills) {
+    if (skill) {
+      args.push("--skill", skill);
+    }
   }
 
   if (noSession) {
@@ -204,8 +239,25 @@ export function applyPiEvent(state, event) {
       return null;
     }
     case "agent_end": {
+      // One low-level run finished; retries, compaction or queued messages may
+      // still continue the session, so this is not the end of the job.
+      return { phase: "finishing", message: event.willRetry ? "pi will retry." : "pi finished a run." };
+    }
+    case "agent_settled": {
       state.settled = true;
-      return { phase: "finishing", message: "pi finished its work." };
+      return { phase: "finishing", message: "pi settled." };
+    }
+    case "queue_update": {
+      const steering = Array.isArray(event.steering) ? event.steering : [];
+      const followUp = Array.isArray(event.followUp) ? event.followUp : [];
+      state.queue = { steering, followUp };
+      if (!steering.length && !followUp.length) {
+        return null;
+      }
+      return {
+        phase: "working",
+        message: `Queued: ${steering.length} steering, ${followUp.length} follow-up.`
+      };
     }
     case "error": {
       const text = String(event.message ?? event.error ?? "pi reported an error.");
@@ -217,7 +269,7 @@ export function applyPiEvent(state, event) {
   }
 }
 
-function createTurnState() {
+export function createTurnState() {
   return {
     sessionId: null,
     turns: 0,
@@ -228,6 +280,7 @@ function createTurnState() {
     model: null,
     stopReason: null,
     errors: [],
+    queue: { steering: [], followUp: [] },
     settled: false
   };
 }

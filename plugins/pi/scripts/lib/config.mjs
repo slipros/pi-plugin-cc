@@ -131,11 +131,14 @@ export function resolveRunSettings(config, command, overrides = {}) {
     return null;
   };
 
-  // Later layers win, so the list runs from lowest to highest priority.
-  const readOnly = [commandDefaults, preset, overrides].reduce(
-    (acc, layer) => (typeof layer?.readOnly === "boolean" ? layer.readOnly : acc),
-    false
-  );
+  // Later layers win, so the lists run from lowest to highest priority.
+  const layers = [config.defaults ?? {}, commandDefaults, preset, overrides];
+  const flagOf = (key) =>
+    layers.reduce((acc, layer) => (typeof layer?.[key] === "boolean" ? layer[key] : acc), false);
+  const mergeLists = (key) =>
+    layers.flatMap((layer) => (Array.isArray(layer?.[key]) ? layer[key] : []));
+
+  const readOnly = flagOf("readOnly");
 
   return {
     presetName,
@@ -152,6 +155,15 @@ export function resolveRunSettings(config, command, overrides = {}) {
     tools: pick("tools"),
     excludeTools: pick("excludeTools"),
     readOnly,
+    noTools: flagOf("noTools"),
+    noBuiltinTools: flagOf("noBuiltinTools"),
+    noExtensions: flagOf("noExtensions"),
+    noSkills: flagOf("noSkills"),
+    // Extra capabilities are additive across layers: a project can hand pi more
+    // tools without a preset having to know about them.
+    extensions: mergeLists("extensions"),
+    skills: mergeLists("skills"),
+    engine: pick("engine") ?? "rpc",
     timeoutMs: Number(pick("timeoutMs") ?? BUILT_IN.defaults.timeoutMs)
   };
 }

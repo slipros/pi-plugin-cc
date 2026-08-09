@@ -10,6 +10,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
@@ -38,12 +39,14 @@ import { parseJsonLine } from "./lib/jsonl.mjs";
 import { runPiRpcTurn } from "./lib/rpc.mjs";
 import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
+  attachMounts,
   buildSandboxImage,
   describeSandbox,
   isSandboxed,
   listSandboxContainers,
   normalizeSandbox,
   removeSandboxContainer,
+  listSandboxImages,
   sandboxDockerfile,
   sandboxPreflight,
   sandboxRunWarnings,
@@ -51,10 +54,12 @@ import {
   DEFAULT_SANDBOX_IMAGE
 } from "./lib/sandbox.mjs";
 import {
+  ensureStateDir,
   eventsPath,
   generateJobId,
   listJobs,
   nowIso,
+  resolveDetachedLogFile,
   resolveStateDir,
   upsertJob,
   writeJobFile
@@ -69,9 +74,14 @@ import {
   renderStatusReport,
   renderStoredJobResult
 } from "./lib/render.mjs";
-import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { resolveRunRoot, resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+
+// Set on the detached copy of this process, so it runs the job instead of
+// handing it off again, and both halves agree on the job id.
+const DETACHED_ENV = "PI_PLUGIN_DETACHED";
+const DETACHED_JOB_ENV = "PI_PLUGIN_JOB_ID";
 
 const RUN_FLAGS = {
   booleans: [
@@ -101,9 +111,10 @@ const RUN_FLAGS = {
     "base",
     "scope",
     "engine",
-    "sandbox"
+    "sandbox",
+    "cwd"
   ],
-  collect: ["append-system-prompt", "extension", "skill"],
+  collect: ["append-system-prompt", "extension", "skill", "mount"],
   aliases: {
     m: "model",
     p: "provider",
@@ -111,7 +122,8 @@ const RUN_FLAGS = {
     "readonly": "read-only",
     "append-system": "append-system-prompt",
     resume: "session",
-    e: "extension"
+    e: "extension",
+    v: "mount"
   }
 };
 
@@ -127,7 +139,8 @@ function usage() {
     "  pi-companion.mjs cancel [job-id] [--json]",
     "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
     "  pi-companion.mjs watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]",
-    "  pi-companion.mjs sandbox [status|build|clean] [--image <tag>] [--pi-version <v>]",
+    "  pi-companion.mjs sandbox [status|build [name|--all]|clean] [--image <tag>]",
+    "                            [--dockerfile <name|path>] [--pi-version <v>]",
     "",
     "Run flags:",
     "  --model <id>            model id or pattern (provider/model[:thinking])",
@@ -142,6 +155,9 @@ function usage() {
     "  --fresh                 ignore --session and start a new pi session",
     "  --timeout <seconds>     hard limit for the run",
     "  --stdin                 append piped stdin to the prompt",
+    "  --cwd <path>            directory the agent works in (mounted at /workspace,",
+    "                          and the tree `review` diffs). Job records stay with",
+    "                          the caller, so status/watch keep finding the job.",
     "  --json                  machine-readable output",
     "",
     "Tool flags (what the pi agent is allowed to use):",
@@ -160,7 +176,16 @@ function usage() {
     "                          in the config (a named toolchain: mounted binaries,",
     "                          PATH, gate extensions). The whole pi process runs in",
     "                          the container; build the image first with",
-    "                          `pi-companion.mjs sandbox build`."
+    "                          `pi-companion.mjs sandbox build`.",
+    "  --mount <h:c[:ro]>      add a host directory to that sandbox, on top of",
+    "                          whatever the profile mounts; repeatable. A relative",
+    "                          host path resolves against the workspace.",
+    "",
+    "Images: a profile may name its own `image` and `dockerfile`. Dockerfiles are",
+    "looked up as <name>.Dockerfile in <workspace>/.claude/pi/sandbox, then",
+    "~/.claude/pi/sandbox, then the plugin's own — so a user copy survives plugin",
+    "updates. `sandbox build <name>` builds one, `--all` builds every one the",
+    "config knows about."
   ].join("\n");
 }
 
@@ -213,7 +238,7 @@ function resolveSessionReference(workspaceRoot, reference) {
 /**
  * Turn parsed flags + config into the concrete settings of one run.
  */
-function buildRunSettings({ command, flags, workspaceRoot, config }) {
+function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRoot, config }) {
   const overrides = {
     model: flags.model ?? null,
     provider: flags.provider ?? null,
@@ -225,6 +250,7 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
     excludeTools: flags["exclude-tools"] ?? null,
     extensions: flags.extension ?? [],
     skills: flags.skill ?? [],
+    mounts: flags.mount ?? [],
     ...(flags["no-tools"] ? { noTools: true } : {}),
     ...(flags["no-builtin-tools"] ? { noBuiltinTools: true } : {}),
     ...(flags["no-extensions"] ? { noExtensions: true } : {}),
@@ -240,8 +266,25 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
 
   const warnings = [];
-  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles);
+  if (runRoot !== workspaceRoot) {
+    // The agent edits a tree the caller is not sitting in, and without a
+    // container it does so with the caller's own permissions.
+    warnings.push(
+      `The agent runs in ${runRoot}, outside this workspace. Its edits land there, not in ${workspaceRoot}.`
+    );
+  }
+  let sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles);
+  if (settings.mounts.length && !isSandboxed(sandbox)) {
+    // Without a container there is nothing to mount into: pi already sees the
+    // whole filesystem, so silently dropping them would hide a real mistake.
+    throw new Error(
+      `--mount needs a sandbox: ${settings.mounts.join(", ")} has nowhere to go. ` +
+        "Add `--sandbox docker` or a preset with one."
+    );
+  }
   if (isSandboxed(sandbox)) {
+    sandbox = attachMounts(sandbox, settings.mounts);
+
     // Gates the profile brings come first: an extension that blocks a tool call
     // should get the event before the ones the run asked for.
     settings.extensions = [...sandbox.extensions, ...settings.extensions];
@@ -255,8 +298,10 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
     }
     warnings.push(
       ...preflight.warnings,
+      // The container sees the run root at /workspace, so host paths are judged
+      // against that tree, not against the one holding the job records.
       ...sandboxRunWarnings(sandbox, {
-        workspaceRoot,
+        workspaceRoot: runRoot,
         extensions: settings.extensions,
         skills: settings.skills
       })
@@ -280,6 +325,7 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
 
   return {
     ...settings,
+    runRoot,
     sandbox,
     sandboxLabel: describeSandbox(sandbox),
     model: selection.model,
@@ -294,6 +340,59 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
 }
 
 /**
+ * Hand a background run to a detached copy of this script.
+ *
+ * `--background` used to mean "print the job id first and keep going", so the
+ * caller's shell stayed occupied for the whole run — a Claude Code turn had to
+ * hold a background task open for an hour, and anything that killed that task
+ * (a stray `timeout`, a cancelled turn) killed the agent with it.
+ *
+ * The child re-runs the same command with the same arguments; only the job id
+ * is handed down, so both processes agree on which job this is. Detaching
+ * happens after settings are resolved, so a bad preset or a missing sandbox
+ * image still fails in front of the caller instead of in a log nobody reads.
+ *
+ * @returns {boolean} true when the run was handed off and this process is done
+ */
+function detachBackgroundRun({ kind, workspaceRoot, jobId, title, settings }) {
+  const detachedLog = resolveDetachedLogFile(workspaceRoot, jobId);
+  ensureStateDir(workspaceRoot);
+  const handle = fs.openSync(detachedLog, "a");
+
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+    cwd: process.cwd(),
+    detached: true,
+    stdio: ["ignore", handle, handle],
+    env: { ...process.env, [DETACHED_ENV]: "1", [DETACHED_JOB_ENV]: jobId }
+  });
+  child.unref();
+  fs.closeSync(handle);
+
+  // A record exists before the child writes its own, so `status` can answer
+  // even in the seconds between the handoff and the first tracked update.
+  const job = createJobRecord({
+    id: jobId,
+    kind,
+    title,
+    workspaceRoot,
+    runRoot: settings.runRoot ?? workspaceRoot,
+    model: settings.model,
+    preset: settings.presetName,
+    sandbox: settings.sandboxLabel,
+    background: true,
+    detached: true,
+    pid: child.pid,
+    status: "pending",
+    createdAt: nowIso()
+  });
+  writeJobFile(workspaceRoot, jobId, job);
+  upsertJob(workspaceRoot, job);
+
+  process.stdout.write(renderBackgroundStart({ job, settings, detachedLog }));
+  return true;
+}
+
+/**
  * Shared execution path for delegate and review.
  */
 async function executeRun({
@@ -302,11 +401,12 @@ async function executeRun({
   prompt,
   settings,
   workspaceRoot,
+  runRoot = workspaceRoot,
   flags,
+  jobId,
   resultTitle,
   sessionId = null
 }) {
-  const jobId = generateJobId(kind);
   const logFile = createJobLogFile(workspaceRoot, jobId, title);
   const eventsFile = eventsPath(workspaceRoot, jobId);
   const inboxFile = inboxPath(workspaceRoot, jobId);
@@ -315,6 +415,8 @@ async function executeRun({
     kind,
     title,
     workspaceRoot,
+    // Where the agent actually works; equal to workspaceRoot unless --cwd moved it.
+    runRoot,
     logFile,
     eventsFile,
     inboxFile,
@@ -346,15 +448,11 @@ async function executeRun({
     onProgress({ message: `System prompt ${source}` });
   }
 
-  if (flags.background) {
-    process.stdout.write(renderBackgroundStart({ job, settings }));
-  }
-
   const startedAt = Date.now();
   const execution = await runTrackedJob({ ...job, logFile }, async () => {
     const runner = settings.engine === "json" ? runPiTurn : runPiRpcTurn;
     const result = await runner({
-      cwd: workspaceRoot,
+      cwd: runRoot,
       prompt,
       model: settings.model,
       provider: settings.provider,
@@ -456,16 +554,25 @@ async function commandDelegate(argv, workspaceRoot) {
   }
 
   const { config } = loadConfig(workspaceRoot);
-  const settings = buildRunSettings({ command: "delegate", flags, workspaceRoot, config });
+  const runRoot = resolveRunRoot(flags.cwd);
+  const settings = buildRunSettings({ command: "delegate", flags, workspaceRoot, runRoot, config });
   const sessionId = flags.fresh ? null : resolveSessionReference(workspaceRoot, flags.session);
 
   const title = prompt.split("\n")[0].slice(0, 120);
+  const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("delegate");
+  if (flags.background && process.env[DETACHED_ENV] !== "1") {
+    detachBackgroundRun({ kind: "delegate", workspaceRoot, jobId, title, settings });
+    return 0;
+  }
+
   const { job, execution } = await executeRun({
     kind: "delegate",
+    jobId,
     title,
     prompt,
     settings,
     workspaceRoot,
+    runRoot,
     flags,
     resultTitle: "pi delegated task",
     sessionId
@@ -477,19 +584,22 @@ async function commandDelegate(argv, workspaceRoot) {
 
 async function commandReview(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
-  ensureGitRepository(workspaceRoot);
+  // The diff under review belongs to the tree the agent will read, so every git
+  // question is asked of the run root.
+  const runRoot = resolveRunRoot(flags.cwd);
+  ensureGitRepository(runRoot);
 
-  const target = resolveReviewTarget(workspaceRoot, {
+  const target = resolveReviewTarget(runRoot, {
     scope: flags.scope ?? "auto",
     base: flags.base ?? null
   });
-  const context = collectReviewContext(workspaceRoot, target);
+  const context = collectReviewContext(runRoot, target);
   if (!context.text.trim()) {
     throw new Error("Nothing to review: the resolved diff is empty.");
   }
 
   const { config } = loadConfig(workspaceRoot);
-  const settings = buildRunSettings({ command: "review", flags, workspaceRoot, config });
+  const settings = buildRunSettings({ command: "review", flags, workspaceRoot, runRoot, config });
 
   const focus = positional.join(" ").trim();
   const prompt = interpolate(loadTaskTemplate(PLUGIN_ROOT, "review"), {
@@ -504,12 +614,20 @@ async function commandReview(argv, workspaceRoot) {
   });
 
   const title = `Review ${target.description}${focus ? ` — ${focus.slice(0, 60)}` : ""}`;
+  const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("review");
+  if (flags.background && process.env[DETACHED_ENV] !== "1") {
+    detachBackgroundRun({ kind: "review", workspaceRoot, jobId, title, settings });
+    return 0;
+  }
+
   const { job, execution } = await executeRun({
     kind: "review",
+    jobId,
     title,
     prompt,
     settings,
     workspaceRoot,
+    runRoot,
     flags,
     resultTitle: `pi review — ${target.description}`
   });
@@ -726,8 +844,8 @@ async function commandWatch(argv, workspaceRoot) {
  */
 async function commandSandbox(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, {
-    booleans: ["json", "no-cache"],
-    strings: ["image", "pi-version"]
+    booleans: ["json", "no-cache", "all"],
+    strings: ["image", "pi-version", "dockerfile"]
   });
 
   const action = positional[0] ?? "status";
@@ -736,20 +854,61 @@ async function commandSandbox(argv, workspaceRoot) {
   const image = flags.image ?? (isSandboxed(configured) ? configured.image : DEFAULT_SANDBOX_IMAGE);
 
   if (action === "build") {
+    // Which images to build: every one the config knows about with --all, the
+    // one a named profile uses when a name is given, the base otherwise.
+    const known = listSandboxImages(config);
+    const requested = positional[1] ?? null;
+    let targets;
+    if (flags.all) {
+      targets = known;
+    } else if (requested) {
+      const match = known.find((entry) => entry.name === requested || entry.profiles.includes(requested));
+      if (!match) {
+        throw new Error(
+          `Unknown sandbox image "${requested}". Known: ${known.map((entry) => entry.name).join(", ")}.`
+        );
+      }
+      targets = [match];
+    } else {
+      targets = [
+        {
+          name: "base",
+          image,
+          dockerfile: flags.dockerfile ?? "base",
+          profiles: []
+        }
+      ];
+    }
+
     const piVersion = flags["pi-version"] ?? getPiAvailability(workspaceRoot).version ?? null;
-    process.stderr.write(
-      `Building \`${image}\` from ${sandboxDockerfile()}${piVersion ? ` with pi ${piVersion}` : ""}.\n`
-    );
-    const build = buildSandboxImage({ image, piVersion, noCache: Boolean(flags["no-cache"]) });
-    const payload = { action, image, piVersion, status: build.status, command: build.command };
+    const results = [];
+    for (const target of targets) {
+      process.stderr.write(
+        `Building \`${target.image}\` from ${sandboxDockerfile(target.dockerfile, { workspaceRoot })}` +
+          `${piVersion ? ` with pi ${piVersion}` : ""}.\n`
+      );
+      const build = buildSandboxImage({
+        image: target.image,
+        dockerfile: target.dockerfile,
+        workspaceRoot,
+        piVersion,
+        noCache: Boolean(flags["no-cache"])
+      });
+      results.push({ ...target, status: build.status, dockerfilePath: build.dockerfile, command: build.command });
+      if (build.status !== 0) {
+        break;
+      }
+    }
+
+    const failed = results.find((entry) => entry.status !== 0);
     output(
-      build.status === 0
-        ? `Built sandbox image \`${image}\`${piVersion ? ` with pi ${piVersion}` : ""}.\n`
-        : `Failed to build \`${image}\` (docker exited ${build.status}).\n`,
-      payload,
+      failed
+        ? `Failed to build \`${failed.image}\` (docker exited ${failed.status}).\n`
+        : `Built ${results.map((entry) => `\`${entry.image}\``).join(", ")}${piVersion ? ` with pi ${piVersion}` : ""}.\n`,
+      { action, piVersion, images: results },
       Boolean(flags.json)
     );
-    return build.status === 0 ? 0 : 1;
+    return failed ? 1 : 0;
   }
 
   if (action === "clean") {
@@ -771,7 +930,10 @@ async function commandSandbox(argv, workspaceRoot) {
   }
 
   const report = {
-    ...sandboxStatus(isSandboxed(configured) ? configured : { image }),
+    ...sandboxStatus(isSandboxed(configured) ? configured : { image }, {
+      images: listSandboxImages(config),
+      workspaceRoot
+    }),
     image,
     configured: describeSandbox(configured)
   };

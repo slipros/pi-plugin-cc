@@ -5,6 +5,7 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { concatAdditive } from "./config.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
 
 /**
@@ -80,7 +81,7 @@ function unknownProfile(name, profiles) {
  *
  * @returns {{mode: "none"} | object}
  */
-export function normalizeSandbox(value, profiles = {}) {
+export function normalizeSandbox(value, profiles = {}, seen = new Set()) {
   if (value == null || value === false || value === "") {
     return { mode: "none" };
   }
@@ -97,7 +98,10 @@ export function normalizeSandbox(value, profiles = {}) {
       return { ...SANDBOX_DEFAULTS };
     }
     if (profiles?.[name]) {
-      return normalizeSandbox({ ...profiles[name], profile: undefined }, profiles);
+      if (seen.has(name)) {
+        throw new Error(`Sandbox profile "${name}" extends itself: ${[...seen, name].join(" → ")}.`);
+      }
+      return normalizeSandbox(profiles[name], profiles, new Set([...seen, name]));
     }
     throw unknownProfile(name, profiles);
   }
@@ -114,29 +118,65 @@ export function normalizeSandbox(value, profiles = {}) {
   }
 
   // A profile is the base; the object's own fields override it field by field.
+  // The base is resolved through the same function, so a profile may itself
+  // start from another one — `go-mem` is `go` plus the memory CLI.
   let base = SANDBOX_DEFAULTS;
   if (value.profile) {
-    const profile = profiles?.[value.profile];
-    if (!profile) {
+    if (!profiles?.[value.profile]) {
       throw unknownProfile(value.profile, profiles);
     }
-    base = { ...SANDBOX_DEFAULTS, ...profile };
+    base = normalizeSandbox(String(value.profile), profiles, seen);
   }
 
   const merged = { ...base, ...value, mode: "docker" };
   delete merged.profile;
-  return {
-    ...merged,
-    env: asList(merged.env),
-    mounts: asList(merged.mounts),
-    args: asList(merged.args),
-    extensions: asList(merged.extensions),
-    skills: asList(merged.skills)
-  };
+  // Equipment adds to the profile instead of replacing it, exactly as config
+  // layers do: `{"profile": "go", "env": ["PI_HOOKS=…"]}` means "the go
+  // toolchain plus this variable", not "the go toolchain minus its PATH".
+  for (const key of ["env", "mounts", "args", "extensions", "skills"]) {
+    merged[key] = concatAdditive(key, asList(base[key]), asList(value[key]));
+  }
+  return merged;
 }
 
 export function isSandboxed(sandbox) {
   return Boolean(sandbox) && sandbox.mode && sandbox.mode !== "none";
+}
+
+/**
+ * `host:container[:options]`, the docker `-v` syntax. The host side may be a
+ * path or a named volume; the container side has to be an absolute path, and
+ * getting that wrong is worth a clear message here rather than a docker error
+ * after the job record already exists.
+ */
+export function parseMount(value) {
+  const text = String(value ?? "").trim();
+  const [source, target, ...options] = text.split(":");
+  if (!source || !target) {
+    throw new Error(`Invalid mount "${text}". Use host:container[:ro], e.g. ~/data:/data:ro.`);
+  }
+  if (!target.startsWith("/")) {
+    throw new Error(`Invalid mount "${text}": "${target}" has to be an absolute path inside the container.`);
+  }
+  return { source, target, options };
+}
+
+/**
+ * Add mounts to a sandbox on top of whatever its profile already carries.
+ *
+ * A later mount on the same container path replaces the inherited one, so a
+ * run can redirect a profile's directory as well as add to it.
+ */
+export function attachMounts(sandbox, extra = []) {
+  const mounts = asList(extra);
+  if (!mounts.length) {
+    return sandbox;
+  }
+  const merged = new Map();
+  for (const mount of [...(sandbox.mounts ?? []), ...mounts]) {
+    merged.set(parseMount(mount).target, mount);
+  }
+  return { ...sandbox, mounts: [...merged.values()] };
 }
 
 /** Container names are derived from the job id, which is already docker-safe. */
@@ -148,6 +188,19 @@ export function containerNameForJob(jobId) {
 /** `~/go/bin:/gobin:ro` — only the host side of a mount can be a home path. */
 function expandHome(value, homeDir) {
   return String(value).replace(/^~(?=\/|$)/, homeDir);
+}
+
+/**
+ * Docker reads a relative host path as a named volume, so `./shared:/shared`
+ * would silently create an empty volume instead of mounting the directory.
+ * Resolve those against the workspace; leave named volumes alone.
+ */
+function resolveMountSource(mount, homeDir, cwd) {
+  const separator = String(mount).indexOf(":");
+  const source = expandHome(String(mount).slice(0, separator), homeDir);
+  const rest = String(mount).slice(separator);
+  const relative = source.startsWith("./") || source.startsWith("../") || source === "." || source === "..";
+  return `${relative ? path.resolve(cwd, source) : source}${rest}`;
 }
 
 function resolveAgentMount(sandbox, homeDir) {
@@ -224,7 +277,7 @@ export function buildDockerRunArgs({
   }
 
   for (const mount of sandbox.mounts ?? []) {
-    args.push("-v", expandHome(mount, homeDir));
+    args.push("-v", resolveMountSource(mount, homeDir, cwd));
   }
   args.push(...(sandbox.args ?? []));
 
@@ -317,9 +370,18 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
     warnings.push("Sandbox mounts the host `~/.pi/agent`, so container code can read host sessions and credentials.");
   }
 
-  // Paths the container does have: the workspace, the agent dir, and whatever
-  // the profile mounts explicitly (the target is the middle field of -v).
-  const containerPaths = [WORKDIR, AGENT_DIR, ...(sandbox.mounts ?? []).map((mount) => mount.split(":")[1]).filter(Boolean)];
+  // Paths the container does have: the workspace, the agent dir, the system
+  // directories the image itself provides (a globally installed extension lives
+  // in /usr/local/lib/node_modules), and whatever the profile mounts explicitly
+  // (the target is the middle field of -v).
+  const containerPaths = [
+    WORKDIR,
+    AGENT_DIR,
+    CONTAINER_HOME,
+    "/usr",
+    "/opt",
+    ...(sandbox.mounts ?? []).map((mount) => mount.split(":")[1]).filter(Boolean)
+  ];
 
   const root = path.resolve(workspaceRoot ?? ".");
   for (const [label, entries] of [["extension", extensions], ["skill", skills]]) {
@@ -377,11 +439,16 @@ export function listSandboxContainers() {
  * Everything `sandbox status` needs: whether docker is usable, whether the
  * image exists and which sandbox containers are still around.
  */
-export function sandboxStatus(sandbox = null) {
+export function sandboxStatus(sandbox = null, { images = [], workspaceRoot = null } = {}) {
   const image = sandbox?.image ?? DEFAULT_SANDBOX_IMAGE;
   const report = {
     image,
-    dockerfile: sandboxDockerfile(),
+    dockerfile: safeDockerfile("base", workspaceRoot),
+    images: images.map((entry) => ({
+      ...entry,
+      dockerfilePath: safeDockerfile(entry.dockerfile, workspaceRoot),
+      present: runCommand("docker", ["image", "inspect", entry.image, "--format", "{{.Created}}"]).status === 0
+    })),
     dockerAvailable: binaryAvailable("docker"),
     daemon: null,
     daemonError: null,
@@ -408,16 +475,104 @@ export function sandboxStatus(sandbox = null) {
   return report;
 }
 
-export function sandboxDockerfile() {
-  return path.resolve(fileURLToPath(new URL("../../sandbox/Dockerfile", import.meta.url)));
+/**
+ * Directories searched for a named Dockerfile, most specific first — the same
+ * layering as stored prompts.
+ *
+ * The one shipped with the plugin is a fallback, not the source of truth: the
+ * plugin is updated from git, so an image edited in place there would be lost
+ * on the next pull. A file with the same name under `~/.claude/pi/sandbox/`
+ * shadows it and survives updates; a project can pin its own.
+ */
+/** Status must survive a profile naming a Dockerfile that does not exist yet. */
+function safeDockerfile(name, workspaceRoot) {
+  try {
+    return sandboxDockerfile(name, { workspaceRoot });
+  } catch {
+    return null;
+  }
+}
+
+export function dockerfileSearchPath(workspaceRoot = null) {
+  return [
+    workspaceRoot ? path.join(workspaceRoot, ".claude", "pi", "sandbox") : null,
+    path.join(os.homedir(), ".claude", "pi", "sandbox"),
+    path.resolve(fileURLToPath(new URL("../../sandbox", import.meta.url)))
+  ].filter(Boolean);
+}
+
+/**
+ * Resolve which Dockerfile builds an image.
+ *
+ * `name` is either a bare name looked up along the search path (`base` →
+ * `base.Dockerfile`, falling back to plain `Dockerfile` for the plugin's own)
+ * or an explicit path, which is taken as given.
+ */
+export function sandboxDockerfile(name = "base", { workspaceRoot = null } = {}) {
+  const value = String(name ?? "base").trim() || "base";
+
+  if (/^[~./]|^[A-Za-z]:[\\/]/.test(value)) {
+    const resolved = path.resolve(expandHome(value, os.homedir()));
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`Dockerfile not found: ${resolved}`);
+    }
+    return resolved;
+  }
+
+  const candidates = [];
+  for (const dir of dockerfileSearchPath(workspaceRoot)) {
+    candidates.push(path.join(dir, `${value}.Dockerfile`), path.join(dir, value));
+    if (value === "base") {
+      candidates.push(path.join(dir, "Dockerfile"));
+    }
+  }
+  const found = candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+  if (!found) {
+    throw new Error(
+      `No Dockerfile named "${value}". Looked for ${value}.Dockerfile in: ${dockerfileSearchPath(workspaceRoot).join(", ")}.`
+    );
+  }
+  return found;
+}
+
+/**
+ * Every image the config knows about: the base one plus whatever profiles name.
+ * A profile that names an `image` but no `dockerfile` is built from the base.
+ */
+export function listSandboxImages(config = {}) {
+  // Keyed by image tag, because that is what a build produces: profiles sharing
+  // a tag share one build, and an explicit `dockerfile` among them wins.
+  const images = new Map([
+    [DEFAULT_SANDBOX_IMAGE, { name: "base", image: DEFAULT_SANDBOX_IMAGE, dockerfile: "base", profiles: [] }]
+  ]);
+
+  for (const [name, profile] of Object.entries(config.sandboxProfiles ?? {})) {
+    const image = profile?.image ?? DEFAULT_SANDBOX_IMAGE;
+    const existing = images.get(image);
+    if (existing) {
+      existing.profiles.push(name);
+      if (profile?.dockerfile) {
+        existing.dockerfile = profile.dockerfile;
+      }
+      continue;
+    }
+    images.set(image, { name, image, dockerfile: profile?.dockerfile ?? name, profiles: [name] });
+  }
+  return [...images.values()];
 }
 
 /**
  * Build the sandbox image. Output is streamed straight through so the caller
  * sees docker's own progress instead of a silent wait.
  */
-export function buildSandboxImage({ image = DEFAULT_SANDBOX_IMAGE, piVersion = null, noCache = false } = {}) {
-  const dockerfile = sandboxDockerfile();
+export function buildSandboxImage({
+  image = DEFAULT_SANDBOX_IMAGE,
+  dockerfile: dockerfileName = "base",
+  workspaceRoot = null,
+  piVersion = null,
+  noCache = false
+} = {}) {
+  const dockerfile = sandboxDockerfile(dockerfileName, { workspaceRoot });
   const args = ["build", "-t", image, "-f", dockerfile];
   if (piVersion) {
     args.push("--build-arg", `PI_VERSION=${piVersion}`);
@@ -428,7 +583,7 @@ export function buildSandboxImage({ image = DEFAULT_SANDBOX_IMAGE, piVersion = n
   args.push(path.dirname(dockerfile));
 
   const result = spawnSync("docker", args, { stdio: "inherit" });
-  return { status: result.status ?? 1, command: `docker ${args.join(" ")}` };
+  return { status: result.status ?? 1, dockerfile, command: `docker ${args.join(" ")}` };
 }
 
 /** Description of the sandbox for reports and job records. */

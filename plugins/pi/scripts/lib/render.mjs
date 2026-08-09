@@ -159,6 +159,8 @@ function renderRunHeader(title, { job, settings, execution }) {
     thinking ? `- Thinking: \`${thinking}\`` : null,
     settings.sandboxLabel ? `- Sandbox: ${settings.sandboxLabel}` : null,
     settings.presetName ? `- Preset: \`${settings.presetName}\`` : null,
+    // Only worth a line when it is not the directory the caller is standing in.
+    job.runRoot && job.runRoot !== job.workspaceRoot ? `- Working directory: \`${job.runRoot}\`` : null,
     settings.promptLabel ? `- ${settings.promptLabel.replace(/^system prompt/, "System prompt")}` : null,
     settings.readOnly ? "- Tools: read-only (`read`, `grep`, `find`, `ls`)" : null,
     execution?.sessionId ? `- pi session: \`${execution.sessionId}\` (resume with \`pi --session ${execution.sessionId}\`)` : null,
@@ -197,7 +199,7 @@ export function renderRunResult({ title, job, settings, execution }) {
   return joinLines(lines);
 }
 
-export function renderBackgroundStart({ job, settings }) {
+export function renderBackgroundStart({ job, settings, detachedLog = null }) {
   return joinLines([
     `Started pi job \`${job.id}\` in the background.`,
     "",
@@ -205,8 +207,10 @@ export function renderBackgroundStart({ job, settings }) {
     `- Model: ${settings.model ? `\`${settings.model}\`` : "pi default"}`,
     settings.sandboxLabel ? `- Sandbox: ${settings.sandboxLabel}` : null,
     settings.promptName ? `- System prompt: \`${settings.promptName}\`` : null,
+    job.runRoot && job.runRoot !== job.workspaceRoot ? `- Working directory: \`${job.runRoot}\`` : null,
+    detachedLog ? `- Startup log: ${detachedLog}` : null,
     "",
-    "Check progress with `/pi:status`, read the answer with `/pi:result`, stop it with `/pi:cancel`."
+    "The run continues on its own; this command is done. Check progress with `/pi:status`, read the answer with `/pi:result`, stop it with `/pi:cancel`."
   ]);
 }
 
@@ -243,6 +247,9 @@ export function renderStatusReport(snapshot) {
     lines.push(jobLine(job));
     if (job.title) {
       lines.push(`  - Task: ${job.title}`);
+    }
+    if (job.runRoot && job.runRoot !== job.workspaceRoot) {
+      lines.push(`  - Working directory: ${job.runRoot}`);
     }
     if (job.status === "running" && job.progress?.length) {
       lines.push(`  - Progress:`);
@@ -333,6 +340,20 @@ export function renderSandboxReport(report) {
       ? `- Image status: **built**${report.imageCreated ? ` (${report.imageCreated})` : ""}`
       : "- Image status: **missing** — build it with `pi-companion.mjs sandbox build`"
   );
+
+  if (report.images?.length > 1) {
+    lines.push("");
+    lines.push("## Images");
+    lines.push("");
+    for (const entry of report.images) {
+      const used = entry.profiles.length ? ` — profiles: ${entry.profiles.join(", ")}` : "";
+      lines.push(
+        `- \`${entry.image}\` ${entry.present ? "built" : "**missing**"} · ${entry.dockerfilePath ?? `no Dockerfile named "${entry.dockerfile}"`}${used}`
+      );
+    }
+    lines.push("");
+    lines.push("Build one with `pi-companion.mjs sandbox build <name>`, all of them with `--all`.");
+  }
 
   lines.push("");
   lines.push("## Containers");

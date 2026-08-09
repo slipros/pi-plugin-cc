@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { BUILT_IN_CONFIG, resolveRunSettings } from "../plugins/pi/scripts/lib/config.mjs";
+import { BUILT_IN_CONFIG, mergeConfigLayer, resolveRunSettings } from "../plugins/pi/scripts/lib/config.mjs";
 
 const CONFIG = {
   ...BUILT_IN_CONFIG,
@@ -126,6 +126,84 @@ test("the question tool is excluded by default, since nobody is at the keyboard"
 test("a preset can hand the question tool back with an empty exclude list", () => {
   const config = { ...CONFIG, presets: { ...CONFIG.presets, chatty: { excludeTools: [] } } };
   assert.deepEqual(resolveRunSettings(config, "delegate", { preset: "chatty" }).excludeTools, []);
+});
+
+test("a later layer tunes one field of a preset instead of replacing it", () => {
+  const merged = mergeConfigLayer(
+    { ...BUILT_IN_CONFIG, presets: { "go-fix": { model: "global", systemPrompt: "fixer", sandbox: "go" } } },
+    { presets: { "go-fix": { model: "project" } } }
+  );
+  assert.deepEqual(merged.presets["go-fix"], {
+    model: "project",
+    systemPrompt: "fixer",
+    sandbox: "go"
+  });
+});
+
+test("a later layer adds to a sandbox profile without losing its toolchain", () => {
+  const merged = mergeConfigLayer(
+    {
+      ...BUILT_IN_CONFIG,
+      sandboxProfiles: {
+        go: { mounts: ["~/go/bin:/gobin:ro"], env: ["PATH=/gobin:/bin"], extensions: ["/hooks/index.ts"] }
+      }
+    },
+    { sandboxProfiles: { go: { mounts: ["~/shared:/shared:ro"] } } }
+  );
+  assert.deepEqual(merged.sandboxProfiles.go, {
+    mounts: ["~/go/bin:/gobin:ro", "~/shared:/shared:ro"],
+    env: ["PATH=/gobin:/bin"],
+    extensions: ["/hooks/index.ts"]
+  });
+});
+
+test("an additive entry overrides the inherited one it collides with", () => {
+  const merged = mergeConfigLayer(
+    {
+      ...BUILT_IN_CONFIG,
+      sandboxProfiles: { go: { mounts: ["~/a:/data:ro"], env: ["PATH=/gobin", "GOFLAGS=-mod=mod"] } }
+    },
+    { sandboxProfiles: { go: { mounts: ["~/b:/data:ro"], env: ["PATH=/other"] } } }
+  );
+  assert.deepEqual(
+    merged.sandboxProfiles.go.mounts,
+    ["~/b:/data:ro"],
+    "same container path, so the project mount wins the slot"
+  );
+  assert.deepEqual(merged.sandboxProfiles.go.env, ["PATH=/other", "GOFLAGS=-mod=mod"]);
+});
+
+test("null removes a field a lower layer set", () => {
+  const merged = mergeConfigLayer(
+    { ...BUILT_IN_CONFIG, presets: { review: { model: "m", sandbox: "go", readOnly: true } } },
+    { presets: { review: { sandbox: null } } }
+  );
+  assert.deepEqual(merged.presets.review, { model: "m", readOnly: true });
+});
+
+test("nested sandbox objects merge field by field", () => {
+  const merged = mergeConfigLayer(
+    { ...BUILT_IN_CONFIG, presets: { caged: { sandbox: { mode: "docker", image: "custom:1", network: "bridge" } } } },
+    { presets: { caged: { sandbox: { network: "none" } } } }
+  );
+  assert.deepEqual(merged.presets.caged.sandbox, { mode: "docker", image: "custom:1", network: "none" });
+});
+
+test("tools are replaced, not accumulated: a project means exactly what it lists", () => {
+  const merged = mergeConfigLayer(
+    { ...BUILT_IN_CONFIG, presets: { narrow: { excludeTools: ["ask_question", "bash"] } } },
+    { presets: { narrow: { excludeTools: ["bash"] } } }
+  );
+  assert.deepEqual(merged.presets.narrow.excludeTools, ["bash"]);
+});
+
+test("mounts stack across every layer, like the other equipment", () => {
+  const config = {
+    ...CONFIG,
+    presets: { deep: { ...CONFIG.presets.deep, mounts: ["~/from-preset:/preset:ro"] } }
+  };
+  const settings = resolveRunSettings(config, "delegate", { mounts: ["~/from-flag:/flag:ro"] });
+  assert.deepEqual(settings.mounts, ["~/from-preset:/preset:ro", "~/from-flag:/flag:ro"]);
 });
 
 test("sandbox is resolved through the same layers as everything else", () => {

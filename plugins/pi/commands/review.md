@@ -1,6 +1,6 @@
 ---
 description: Run a read-only pi code review of the current git changes
-argument-hint: '[--background|--wait] [--base <ref>] [--scope auto|working-tree|branch] [--preset <name>] [--system-prompt reviewer|adversarial] [focus text]'
+argument-hint: '[--background|--wait] [--base <ref>] [--scope auto|working-tree|branch] [--preset <name>] [--system-prompt reviewer|adversarial] [--cwd <path>] [focus text]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Bash(git:*), Read, Glob, Grep, AskUserQuestion
 ---

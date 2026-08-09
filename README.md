@@ -116,11 +116,37 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
 }
 ```
 
-**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Define them once and run `--preset dba`.
+**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Define them once and run `--preset dba`.
+
+### Tuning a global preset for one project
+
+The project file **merges into** your personal one field by field, so a repository names only what it changes. Keep the preset, swap the model, add a note and one more mounted directory:
+
+```json
+{
+  "presets": {
+    "go-review": {
+      "model": "opencode-go/kimi-k3",
+      "appendSystemPrompt": ["This service uses sqlc; migrations are generated, do not hand-edit them."]
+    }
+  },
+  "sandboxProfiles": {
+    "go": { "mounts": ["~/proj/protos:/protos:ro"] }
+  }
+}
+```
+
+The system prompt, `readOnly`, the sandbox and the whole Go toolchain come from the global definitions untouched. Three rules cover what "merges" means:
+
+- **Equipment accumulates** — `appendSystemPrompt`, `extensions`, `skills`, `mounts`, `env`, `args`. The project adds to the list rather than replacing it. An entry that collides with an inherited one takes its place: mounts are matched by container path, env by variable name, so `"mounts": ["~/other:/gobin:ro"]` redirects `/gobin` instead of mounting it twice.
+- **Decisions are replaced** — `model`, `thinking`, `systemPrompt`, `sandbox`, `readOnly`, `tools`, `excludeTools`, `timeoutMs`. A project that lists `excludeTools` means exactly those.
+- **`null` removes** — `"sandbox": null` drops a sandbox the global preset asked for. It is the way back out of a merge.
+
+Nested objects merge the same way, so `"sandbox": {"network": "none"}` keeps the image, mounts and everything else the layer below set.
 
 One default is set for you: `excludeTools` is `["ask_question"]`, because a delegated run has nobody at the keyboard and a question tool would burn a turn waiting for an answer that never comes. Set `"excludeTools": []` in any layer to hand it back.
 
-Values resolve layer by layer, highest first: command-line flags → preset → per-command defaults → global defaults. The system prompt is chosen as a unit, so `--system-prompt` on the command line replaces a preset's prompt outright; `appendSystemPrompt`, `extensions` and `skills` stack across layers instead of replacing each other.
+Values resolve layer by layer, highest first: command-line flags → preset → per-command defaults → global defaults. The system prompt is chosen as a unit, so `--system-prompt` on the command line replaces a preset's prompt outright; `appendSystemPrompt`, `extensions`, `skills` and `mounts` stack across layers instead of replacing each other.
 
 ## Choosing the agent's tools
 
@@ -201,6 +227,20 @@ The container is deliberately bare — node, git, ripgrep. An agent that has to 
 A profile understands the same fields as an inline sandbox object, plus two that only make sense with one:
 
 - `extensions` / `skills` — loaded **only** when the sandbox is active, so they can point at container paths that do not exist on your host. This is where gate extensions belong: a pre-commit linter gate that is missing inside the container does not fail loudly, it just stops gating.
+
+**Language servers.** The image ships the `pi-lsp-adapter` extension (`/usr/local/lib/node_modules/pi-lsp-adapter/src/index.ts`) so a run gets `lsp_definition`, `lsp_references`, `lsp_workspace_symbols` and `lsp_diagnostics` without downloading anything. The server itself is bind mounted from the host — `gopls` is a static Go binary and runs as it is. Two things the adapter needs, and one trap:
+
+```json
+"mounts": [
+  "~/go/bin:/gobin:ro",
+  "~/.pi/agent/lsp.sandbox.json:/home/pi/.pi/agent/lsp.json:ro",
+  "~/.pi/agent/lsp.sandbox.lock.json:/home/pi/.pi/agent/lsp/lsp.lock.json:ro"
+]
+```
+
+The adapter resolves every path from the **home directory**, not from `PI_CODING_AGENT_DIR`, so its config is `$HOME/.pi/agent/lsp.json` and never `/pi-agent/lsp.json`. A server is treated as missing until it appears in `lsp.lock.json` — even with `"installMode": "off"` and an absolute `bin` — and `/lsp install` is interactive, so a headless run cannot fix it: mount a lockfile naming the container path (`{"servers": {"gopls": {"installer": "system", "resolvedCommand": ["/gobin/gopls"]}}}`).
+
+Nothing about this needs a volume. The adapter's writable directories (`pids`, `logs`, `cache`, `workspaces`) are created by the image with permissive modes, they stay empty across a run, and the index that actually costs time to rebuild belongs to the language server, which keeps it under `$HOME/.cache` — a volume you already have. Let the adapter's state die with the container.
 - Everything else (`image`, `network`, `mounts`, `env`, `args`, `agentDir`, `user`) behaves as above.
 
 Mechanics worth knowing:
@@ -208,9 +248,68 @@ Mechanics worth knowing:
 - Host binaries are not copied in, they are bind mounted: `~/go/bin:/gobin:ro` makes the same file on disk visible at `/gobin` inside, read-only. Statically linked binaries (anything built by Go) run as-is; something linked against host libraries would need to be installed in the image instead.
 - `env` entries take both forms: `"NAME"` forwards the host value, `"NAME=value"` sets one for the container. A mounted binary is useless until `PATH` names its directory.
 - Named volumes (`pi-plugin-gomod:/home/pi/go/pkg/mod`) keep module and build caches between runs; without them every run recompiles the world.
-- `"sandbox": {"profile": "go", "network": "none"}` starts from a profile and overrides single fields.
+- `"sandbox": {"profile": "go", "network": "none"}` starts from a profile and overrides single fields. Equipment (`mounts`, `env`, `extensions`, `skills`, `args`) adds to the profile rather than replacing it, so `{"profile": "go", "env": ["PI_HOOKS=…"]}` keeps the profile's `PATH` — without which every mounted binary is unreachable. An entry colliding with an inherited one still wins its slot.
+- A profile may itself name a `profile`, so `go-mem` is `go` plus the memory CLI instead of a copy of it. A cycle is reported, not hung.
 
 `--sandbox <name>` also takes a profile name on the command line, so `--sandbox go` works for a one-off run.
+
+### Running somewhere else: --cwd
+
+`--cwd <path>` moves the agent's working directory without moving you:
+
+```
+/pi:delegate --preset go-developer --cwd ~/proj/bookmarks   implement SPEC.md
+/pi:review --cwd ../other-repo
+```
+
+Only the agent moves. The directory is what gets bind mounted at `/workspace`, what pi runs in, and the tree `review` diffs — while the job records stay in the workspace you typed the command in, so `status`, `watch`, `steer` and `result` keep finding the job without you leaving your own repository. The run header and `status` show a `Working directory` line, and a directory outside your workspace also raises a warning: the edits land there, not here.
+
+A missing path is an error before the job exists, because the usual cause is a typo and an agent started in the wrong tree is worse than one not started. Relative and `~` paths resolve against your current directory, then expand to the enclosing git root.
+
+Configuration does **not** follow: presets, prompts and `.claude/pi/config.json` come from your workspace, never from the target. `--cwd` hands the agent code, not somebody else's settings. To pick up the target's own instructions, say so: `--append-system-prompt @../other-repo/.claude/pi/SYSTEM.md`.
+
+`--mount host:container[:ro]` adds one more directory to whatever profile the run ended up with, without restating it — a sibling repository, a directory of protobufs, a data set:
+
+```
+/pi:delegate --preset go-fix --mount ~/proj/shared-lib:/shared:ro   port this module to the new API
+```
+
+It is repeatable, and a relative host path (`./fixtures:/fixtures:ro`) resolves against the workspace rather than being read by docker as a named volume. Mounting onto a container path the profile already uses replaces that mount instead of adding a second one, so a run can redirect `/gobin` as well as extend the profile. Without a sandbox there is nowhere to mount into and the flag is an error, not a no-op.
+
+### One image per stack
+
+A profile may name its own image and the Dockerfile that builds it:
+
+```json
+"sandboxProfiles": {
+  "go":   { "image": "pi-sandbox-go:latest",   "dockerfile": "go" },
+  "node": { "image": "pi-sandbox-node:latest", "dockerfile": "node" }
+}
+```
+
+```
+/pi:sandbox                  # every image: built or missing, from which file, used by which profiles
+/pi:sandbox build go         # build one, by image name or by profile name
+/pi:sandbox build --all      # build everything the config knows about
+```
+
+Dockerfiles are looked up as `<name>.Dockerfile` in `<workspace>/.claude/pi/sandbox`, then `~/.claude/pi/sandbox`, then the plugin's own directory — the same layering as stored prompts. **Keep yours in `~/.claude/pi/sandbox/`**: the plugin is updated from git, so an image edited inside it is lost on the next pull, while a user file of the same name shadows the plugin's and survives.
+
+The base image is the foundation — pi, git, ripgrep, make, the LSP adapter — and stack images build on it:
+
+```dockerfile
+FROM pi-plugin-sandbox:latest
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+```
+
+That example is not hypothetical: `go test -race` links the race runtime through cgo, so without a C compiler the race detector — part of any serious test gate — fails outright, and `CGO_ENABLED=1` is pinned in the image so a stray `CGO_ENABLED=0` cannot switch it back off.
+
+Three kinds of tooling, three homes:
+
+- **In the image** — anything versioned and reproducible: the language SDK, `gopls`, the C toolchain.
+- **Mounted from the host** — locally built binaries no registry has: `custom-gcl` (golangci-lint carrying house rules), `mockery`, protoc plugins. They live in `~/go/bin`, which the profile mounts read-only.
+- **Proxied, not copied** — the module cache. Bind mount the host download cache read-only and point Go at it: `GOPROXY=file:///host-gomod,https://proxy.golang.org,direct`. Gigabytes of already-fetched modules, private ones included, resolve instantly; the container never writes to the host cache and unpacks into its own volume. Verified with `--network none`: `go mod download` and `go test -race -count=1` both pass offline.
 
 ### The full inline form
 
@@ -268,6 +367,8 @@ Long runs belong in the background:
 /pi:result
 /pi:cancel
 ```
+
+`--background` **detaches the run**: the command validates the preset and the sandbox, hands the work to a separate process, prints the job id and exits in about a second. The agent then outlives the shell that started it, so nothing has to hold a terminal (or a Claude Code turn) open for an hour, and nothing is killed by a stray `timeout` or a cancelled turn. Startup problems still surface in front of you — detaching happens after validation — and whatever the detached process says before it becomes a tracked job goes to the `Startup log` named in the output. Stop a run deliberately with `/pi:cancel`.
 
 Job state lives outside your repository, bucketed per workspace, and survives Claude Code restarts. Each record keeps the pi session id, so any run can be picked up in pi itself:
 

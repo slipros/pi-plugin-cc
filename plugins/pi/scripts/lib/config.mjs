@@ -14,6 +14,10 @@ import path from "node:path";
  *   2. user config    ~/.claude/pi/config.json
  *   3. project config <workspace>/.claude/pi/config.json
  *   4. command line flags (applied by the caller)
+ *
+ * Layers merge field by field, so a project can tune one detail of a global
+ * preset — a model, an extra mount — without restating the whole thing. See
+ * `mergeConfigLayer` for what "tune" means per field type.
  */
 
 export const USER_CONFIG_RELATIVE = path.join(".claude", "pi", "config.json");
@@ -65,26 +69,95 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function mergeLayer(base, layer) {
+/**
+ * Fields that describe equipment rather than a choice: a later layer adds to
+ * them instead of replacing them, so a project can hand a global preset one
+ * more mount or one more note without repeating the ones it already has.
+ *
+ * `tools` and `excludeTools` are deliberately absent — they are a decision
+ * about what the agent may do, and a project restating them means exactly
+ * those and no others.
+ */
+const ADDITIVE_KEYS = new Set(["appendSystemPrompt", "extensions", "skills", "mounts", "env", "args"]);
+
+/**
+ * How two values of an additive field are keyed against each other, so the
+ * later layer overrides the matching entry instead of piling a second one on
+ * top: mounts by their container path, env by variable name.
+ */
+const ADDITIVE_IDENTITY = {
+  mounts: (value) => String(value).split(":")[1] ?? String(value),
+  env: (value) => String(value).split("=")[0]
+};
+
+/**
+ * Merge one additive field the way config layers do. Exported because a sandbox
+ * object naming a profile is the same situation: `{"profile": "go", "env": [...]}`
+ * has to keep the profile's PATH, not replace it with one entry.
+ */
+export function concatAdditive(key, base = [], layer = []) {
+  return concatUnique(base, layer, ADDITIVE_IDENTITY[key]);
+}
+
+function concatUnique(base, layer, identity = (value) => value) {
+  const merged = new Map();
+  for (const value of [...base, ...layer]) {
+    // Map keeps the position of the first insertion and takes the later value,
+    // so an overriding entry lands where the inherited one stood.
+    merged.set(identity(value), value);
+  }
+  return [...merged.values()];
+}
+
+/**
+ * Merge one named entry (a preset, a sandbox profile, a command) field by field.
+ *
+ * - additive fields concatenate, later layers overriding matching entries
+ * - nested objects merge recursively, so `sandbox: {network}` keeps the rest
+ * - `null` removes an inherited field, the way out of a merge
+ * - everything else is replaced
+ */
+function mergeEntry(base, layer) {
+  if (!isPlainObject(base) || !isPlainObject(layer)) {
+    return layer;
+  }
+
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(layer)) {
+    if (value === null) {
+      delete merged[key];
+      continue;
+    }
+    if (ADDITIVE_KEYS.has(key) && Array.isArray(merged[key]) && Array.isArray(value)) {
+      merged[key] = concatUnique(merged[key], value, ADDITIVE_IDENTITY[key]);
+      continue;
+    }
+    if (isPlainObject(merged[key]) && isPlainObject(value)) {
+      merged[key] = mergeEntry(merged[key], value);
+      continue;
+    }
+    merged[key] = value;
+  }
+  return merged;
+}
+
+function mergeNamed(base, layer) {
+  const merged = { ...base };
+  for (const [name, value] of Object.entries(isPlainObject(layer) ? layer : {})) {
+    merged[name] = mergeEntry(merged[name], value);
+  }
+  return merged;
+}
+
+export function mergeConfigLayer(base, layer) {
   if (!isPlainObject(layer)) {
     return base;
   }
   return {
-    defaults: { ...base.defaults, ...(isPlainObject(layer.defaults) ? layer.defaults : {}) },
-    presets: { ...base.presets, ...(isPlainObject(layer.presets) ? layer.presets : {}) },
-    sandboxProfiles: {
-      ...base.sandboxProfiles,
-      ...(isPlainObject(layer.sandboxProfiles) ? layer.sandboxProfiles : {})
-    },
-    commands: {
-      ...base.commands,
-      ...Object.fromEntries(
-        Object.entries(isPlainObject(layer.commands) ? layer.commands : {}).map(([name, value]) => [
-          name,
-          { ...(base.commands[name] ?? {}), ...(isPlainObject(value) ? value : {}) }
-        ])
-      )
-    },
+    defaults: mergeEntry(base.defaults, isPlainObject(layer.defaults) ? layer.defaults : {}),
+    presets: mergeNamed(base.presets, layer.presets),
+    sandboxProfiles: mergeNamed(base.sandboxProfiles, layer.sandboxProfiles),
+    commands: mergeNamed(base.commands, layer.commands)
   };
 }
 
@@ -104,7 +177,7 @@ export function loadConfig(workspaceRoot) {
     }
     if (value) {
       sources.push(filePath);
-      config = mergeLayer(config, value);
+      config = mergeConfigLayer(config, value);
     }
   }
 
@@ -157,8 +230,10 @@ export function resolveRunSettings(config, command, overrides = {}) {
   const layers = [config.defaults ?? {}, commandDefaults, preset, overrides];
   const flagOf = (key) =>
     layers.reduce((acc, layer) => (typeof layer?.[key] === "boolean" ? layer[key] : acc), false);
-  const mergeLists = (key) =>
-    layers.flatMap((layer) => (Array.isArray(layer?.[key]) ? layer[key] : []));
+  const mergeLists = (key) => {
+    const values = layers.flatMap((layer) => (Array.isArray(layer?.[key]) ? layer[key] : []));
+    return ADDITIVE_IDENTITY[key] ? concatUnique([], values, ADDITIVE_IDENTITY[key]) : values;
+  };
 
   const readOnly = flagOf("readOnly");
 
@@ -184,6 +259,10 @@ export function resolveRunSettings(config, command, overrides = {}) {
     // Raw value; the caller normalizes it, because "docker" and a full sandbox
     // object have to resolve to the same thing.
     sandbox: pick("sandbox"),
+    // Mounts named outside the sandbox descriptor: a preset or a `--mount` flag
+    // adding one directory to whatever profile the run ended up with, without
+    // having to restate the profile.
+    mounts: mergeLists("mounts"),
     engine: pick("engine") ?? "rpc",
     timeoutMs: Number(pick("timeoutMs") ?? BUILT_IN.defaults.timeoutMs)
   };

@@ -57,3 +57,21 @@ test("redactArgs hides prompt bodies but keeps the flags visible", () => {
     "--print --mode json --model opencode-go/glm-5.2 --system-prompt <2500 chars> --append-system-prompt <5 chars>"
   );
 });
+
+test("--cwd resolves against the caller and rejects what is not a directory", async () => {
+  const { resolveRunRoot } = await import("../plugins/pi/scripts/lib/workspace.mjs");
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-runroot-"));
+  fs.mkdirSync(path.join(base, "target"));
+  fs.writeFileSync(path.join(base, "a-file"), "");
+
+  assert.equal(resolveRunRoot("target", { cwd: base }), fs.realpathSync(path.join(base, "target")));
+  assert.equal(resolveRunRoot(null, { cwd: base }), resolveRunRoot(undefined, { cwd: base }));
+  assert.throws(() => resolveRunRoot("nope", { cwd: base }), /no such directory/);
+  assert.throws(() => resolveRunRoot("a-file", { cwd: base }), /not a directory/);
+
+  fs.rmSync(base, { recursive: true, force: true });
+});

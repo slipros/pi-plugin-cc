@@ -130,9 +130,12 @@ export function formatElapsed(fromIso, toIso = null) {
  * surface it as failed instead of pretending it is still running.
  */
 export function enrichJob(job) {
-  const running = job.status === "running";
-  const alive = running ? processAlive(job.pid) : false;
-  const status = running && !alive ? "orphaned" : job.status;
+  // `pending` counts too: a detached background start records the job before
+  // the child takes over, so a child that dies on startup would otherwise sit
+  // as "pending" forever instead of showing up as gone.
+  const tracked = job.status === "running" || job.status === "pending";
+  const alive = tracked ? processAlive(job.pid) : false;
+  const status = tracked && job.pid && !alive ? "orphaned" : job.status;
   return {
     ...job,
     status,

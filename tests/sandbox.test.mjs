@@ -5,11 +5,13 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  attachMounts,
   buildDockerRunArgs,
   containerNameForJob,
   describeSandbox,
   isSandboxed,
   normalizeSandbox,
+  parseMount,
   resolveLaunch,
   sandboxRunWarnings,
   DEFAULT_SANDBOX_IMAGE,
@@ -310,4 +312,152 @@ test("profile tooling reaches docker as mounts and environment, not as pi flags"
   assert.ok(mounts(args).includes("/home/me/go/bin:/gobin:ro"));
   assert.ok(args.includes("PATH=/gobin:/usr/local/bin:/usr/bin:/bin"));
   assert.ok(!args.includes("/pi-agent/host-extensions/custom-gcl-precommit.ts"));
+});
+
+test("--mount adds a directory to the profile the run already has", () => {
+  const sandbox = attachMounts(normalizeSandbox("go", PROFILES), ["~/proj/shared:/shared:ro"]);
+  assert.deepEqual(sandbox.mounts, [
+    "~/go/bin:/gobin:ro",
+    "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
+    "~/proj/shared:/shared:ro"
+  ]);
+  assert.deepEqual(
+    sandbox.extensions,
+    ["/pi-agent/host-extensions/custom-gcl-precommit.ts"],
+    "the rest of the profile is untouched"
+  );
+});
+
+test("a mount on a path the profile already uses takes the slot over", () => {
+  const sandbox = attachMounts(normalizeSandbox("go", PROFILES), ["~/other/bin:/gobin:ro"]);
+  assert.deepEqual(sandbox.mounts, [
+    "~/other/bin:/gobin:ro",
+    "~/.pi/agent/extensions:/pi-agent/host-extensions:ro"
+  ]);
+});
+
+test("attaching nothing leaves the sandbox as it was", () => {
+  const sandbox = normalizeSandbox("go", PROFILES);
+  assert.equal(attachMounts(sandbox, []), sandbox);
+});
+
+test("a malformed mount is rejected with the syntax it should have used", () => {
+  assert.throws(() => parseMount("/just-a-path"), /host:container/);
+  assert.throws(() => parseMount("~/data:data"), /absolute path inside the container/);
+  assert.deepEqual(parseMount("~/data:/data:ro"), {
+    source: "~/data",
+    target: "/data",
+    options: ["ro"]
+  });
+});
+
+test("a relative host path is resolved against the workspace, not left to docker", () => {
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox({ mounts: ["./shared:/shared:ro", "pi-plugin-gomod:/home/pi/go/pkg/mod"] }),
+    cwd: "/work/repo",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  assert.ok(
+    mounts(args).includes("/work/repo/shared:/shared:ro"),
+    "docker would have read ./shared as a named volume and mounted an empty one"
+  );
+  assert.ok(
+    mounts(args).includes("pi-plugin-gomod:/home/pi/go/pkg/mod"),
+    "named volumes still pass through untouched"
+  );
+});
+
+test("a sandbox object starting from a profile adds to its equipment, not over it", () => {
+  const sandbox = normalizeSandbox(
+    { profile: "go", env: ["PI_HOOKS=goimports-on-edit"], mounts: ["~/skills:/pi-skills:ro"] },
+    PROFILES
+  );
+  assert.deepEqual(
+    sandbox.env,
+    ["PATH=/gobin:/usr/local/bin:/usr/bin:/bin", "PI_HOOKS=goimports-on-edit"],
+    "the profile PATH survives; without it every mounted binary is unreachable"
+  );
+  assert.deepEqual(sandbox.mounts, [
+    "~/go/bin:/gobin:ro",
+    "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
+    "~/skills:/pi-skills:ro"
+  ]);
+  assert.deepEqual(sandbox.extensions, ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]);
+});
+
+test("an inline value still overrides the profile entry it collides with", () => {
+  const sandbox = normalizeSandbox(
+    { profile: "go", env: ["PATH=/only-this"], mounts: ["~/other:/gobin:ro"] },
+    PROFILES
+  );
+  assert.deepEqual(sandbox.env, ["PATH=/only-this"]);
+  assert.deepEqual(sandbox.mounts, ["~/other:/gobin:ro", "~/.pi/agent/extensions:/pi-agent/host-extensions:ro"]);
+});
+
+test("a profile can start from another profile", () => {
+  const profiles = {
+    ...PROFILES,
+    "go-mem": { profile: "go", mounts: ["~/mem:/mem-cli:ro"], env: ["MEMORY_MEM_PATH=/mem-cli/mem"] }
+  };
+  const sandbox = normalizeSandbox("go-mem", profiles);
+  assert.deepEqual(sandbox.mounts, [
+    "~/go/bin:/gobin:ro",
+    "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
+    "~/mem:/mem-cli:ro"
+  ]);
+  assert.deepEqual(sandbox.env, [
+    "PATH=/gobin:/usr/local/bin:/usr/bin:/bin",
+    "MEMORY_MEM_PATH=/mem-cli/mem"
+  ]);
+  assert.deepEqual(sandbox.extensions, ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]);
+  assert.equal(sandbox.profile, undefined);
+});
+
+test("a profile cycle is reported instead of hanging", () => {
+  const profiles = { a: { profile: "b" }, b: { profile: "a" } };
+  assert.throws(() => normalizeSandbox("a", profiles), /extends itself/);
+});
+
+test("an extension the image itself installs is not mistaken for a host path", () => {
+  const warnings = sandboxRunWarnings(normalizeSandbox("docker"), {
+    workspaceRoot: "/work",
+    extensions: ["/usr/local/lib/node_modules/pi-lsp-adapter/src/index.ts"]
+  });
+  assert.deepEqual(warnings, []);
+});
+
+test("an explicit path is taken as the Dockerfile, a missing one is refused", async () => {
+  const { sandboxDockerfile } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dockerfile-"));
+  const file = path.join(dir, "go.Dockerfile");
+  fs.writeFileSync(file, "FROM scratch\n");
+
+  assert.equal(sandboxDockerfile(file), file);
+  assert.throws(() => sandboxDockerfile(path.join(dir, "nope.Dockerfile")), /not found/);
+  assert.throws(() => sandboxDockerfile("definitely-not-a-known-image"), /No Dockerfile named/);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("images are collected from the profiles that name them", async () => {
+  const { listSandboxImages, DEFAULT_SANDBOX_IMAGE: base } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const images = listSandboxImages({
+    sandboxProfiles: {
+      go: { mounts: [] },
+      node: { image: "pi-sandbox-node:latest" },
+      "node-e2e": { image: "pi-sandbox-node:latest" },
+      rust: { image: "pi-sandbox-rust:latest", dockerfile: "~/.claude/pi/sandbox/rust.Dockerfile" }
+    }
+  });
+
+  const byImage = Object.fromEntries(images.map((entry) => [entry.image, entry]));
+  assert.deepEqual(byImage[base].profiles, ["go"], "a profile without its own image builds on the base one");
+  assert.deepEqual(
+    byImage["pi-sandbox-node:latest"].profiles,
+    ["node", "node-e2e"],
+    "profiles sharing an image share one build"
+  );
+  assert.equal(byImage["pi-sandbox-rust:latest"].dockerfile, "~/.claude/pi/sandbox/rust.Dockerfile");
 });

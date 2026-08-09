@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -18,4 +19,30 @@ export function resolveWorkspaceRoot(cwd = process.cwd()) {
     }
   }
   return path.resolve(cwd);
+}
+
+/**
+ * Resolve where the pi agent actually runs.
+ *
+ * Two directories are involved in a run and `--cwd` splits them: the workspace
+ * that owns the job records stays where the command was typed, so `status` and
+ * `watch` keep finding the job, while the agent's own working directory — the
+ * one bind mounted into a sandbox and the one git commands see — moves.
+ *
+ * A missing directory is an error rather than a silently created one: the
+ * common cause is a typo, and starting an agent in the wrong tree is worse
+ * than not starting it.
+ */
+export function resolveRunRoot(target, { cwd = process.cwd() } = {}) {
+  if (!target) {
+    return resolveWorkspaceRoot(cwd);
+  }
+  const resolved = path.resolve(cwd, String(target).replace(/^~(?=\/|$)/, os.homedir()));
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`--cwd ${target}: no such directory (${resolved}).`);
+  }
+  if (!fs.statSync(resolved).isDirectory()) {
+    throw new Error(`--cwd ${target}: not a directory (${resolved}).`);
+  }
+  return resolveWorkspaceRoot(resolved);
 }

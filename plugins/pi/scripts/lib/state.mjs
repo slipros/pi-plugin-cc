@@ -59,6 +59,16 @@ export function resolveJobLogFile(workspaceRoot, jobId) {
   return path.join(resolveJobsDir(workspaceRoot), `${jobId}.log`);
 }
 
+/**
+ * Where a detached background run sends its own stdout and stderr. Separate
+ * from the job log: this file holds whatever the process says before (or
+ * instead of) becoming a tracked job, which is exactly what has to be readable
+ * when a background start fails.
+ */
+export function resolveDetachedLogFile(workspaceRoot, jobId) {
+  return path.join(resolveJobsDir(workspaceRoot), `${jobId}.detached.log`);
+}
+
 /** Raw pi event stream for a job, replayed by `watch`. */
 export function eventsPath(workspaceRoot, jobId) {
   return path.join(resolveJobsDir(workspaceRoot), `${jobId}.events.jsonl`);

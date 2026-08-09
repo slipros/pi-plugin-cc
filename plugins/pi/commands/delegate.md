@@ -1,6 +1,6 @@
 ---
 description: Hand a task to a pi agent, with a chosen model and system prompt
-argument-hint: '[--background|--wait] [--preset <name>] [--model <id>] [--system-prompt <name|@file|text>] [--thinking <level>] [--read-only] [--sandbox docker] [--session last] <task>'
+argument-hint: '[--background|--wait] [--preset <name>] [--model <id>] [--system-prompt <name|@file|text>] [--thinking <level>] [--read-only] [--sandbox docker] [--cwd <path>] [--mount <h:c:ro>] [--session last] <task>'
 disable-model-invocation: false
 allowed-tools: Bash(node:*), Bash(git:*), Read, Glob, Grep, AskUserQuestion
 ---
@@ -18,6 +18,8 @@ Argument handling:
 - System prompt: `--system-prompt <value>` takes a stored prompt name (`fixer`, `reviewer`, `adversarial`, `explorer`, or a project file in `.claude/pi/prompts/`), an `@path/to/file.md`, or inline text. `--append-system-prompt <text|@file>` adds to it. Without it, pi keeps its own coding-assistant prompt unless the config says otherwise.
 - By default the pi agent can edit files and run commands. Pass `--read-only` when the user only wants investigation.
 - Isolation: `--sandbox docker` runs the whole pi process in a container with only the workspace mounted. Pass it when the user asks for it, and suggest it for work on an untrusted repository or a long unattended run. It needs the image from `/pi:sandbox build`; the script fails with that instruction if it is missing.
+- Other directory: `--cwd <path>` runs the agent in another repository while the job stays recorded here, so `/pi:status` and `/pi:watch` keep working from where you are. Pass it when the user names a directory the work belongs to; never `cd` there instead.
+- Extra directories: `--mount host:container[:ro]` adds one to whatever sandbox the run has — a sibling repository, fixtures, a data set. Repeatable. Pass it when the user names a directory the task needs; a task that only touches the current repository does not need it, the workspace is mounted already.
 - `--session last` continues the most recent pi session in this workspace; `--fresh` forces a new one.
 
 Execution mode rules:

@@ -370,7 +370,8 @@ export async function runPiTurn({
       stdoutRest = stdoutRest.slice(newlineIndex + 1);
       if (line) {
         try {
-          report(applyPiEvent(state, JSON.parse(line)));
+          const update = applyPiEvent(state, JSON.parse(line));
+          report(update ? { ...update, usage: state.usage } : null);
         } catch {
           // Non-JSON output on stdout is diagnostic noise, not a fatal error.
         }
@@ -403,7 +404,8 @@ export async function runPiTurn({
 
   if (stdoutRest.trim()) {
     try {
-      report(applyPiEvent(state, JSON.parse(stdoutRest.trim())));
+      const tailUpdate = applyPiEvent(state, JSON.parse(stdoutRest.trim()));
+      report(tailUpdate ? { ...tailUpdate, usage: state.usage } : null);
     } catch {
       // Trailing partial line; nothing useful to recover.
     }

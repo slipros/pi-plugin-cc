@@ -251,6 +251,11 @@ export function renderStatusReport(snapshot) {
     if (job.runRoot && job.runRoot !== job.workspaceRoot) {
       lines.push(`  - Working directory: ${job.runRoot}`);
     }
+    // Recorded as the run goes, so a job still working can answer "how much has
+    // this cost me so far" without reading the whole transcript.
+    if (formatUsage(job.usage)) {
+      lines.push(`  - Usage: ${formatUsage(job.usage)}`);
+    }
     if (job.status === "running" && job.progress?.length) {
       lines.push(`  - Progress:`);
       for (const entry of job.progress) {
@@ -382,3 +387,47 @@ export function renderCancelReport(job, cancelled) {
 }
 
 export { formatUsage, formatCost };
+
+function formatTokens(value) {
+  return Number(value ?? 0).toLocaleString("en-US");
+}
+
+function formatDuration(totalSeconds) {
+  const seconds = Number(totalSeconds ?? 0);
+  if (!seconds) {
+    return "0s";
+  }
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  return hours ? `${hours}h ${minutes}m` : `${minutes || Math.round(seconds)}${hours ? "m" : minutes ? "m" : "s"}`;
+}
+
+export function renderStatsReport({ rows, totals, by, days, database }) {
+  const period = days ? `last ${days} day(s)` : "all time";
+  const lines = [`# pi usage — ${period}, by ${by}`, ""];
+
+  if (!Number(totals?.runs ?? 0)) {
+    lines.push("No runs recorded yet.", "", `Journal: \`${database}\``);
+    lines.push("", "Runs are recorded as they happen; nothing to show until the first one finishes.");
+    return joinLines(lines);
+  }
+
+  lines.push(
+    `- Runs: ${totals.runs}`,
+    `- Tokens: in ${formatTokens(totals.input)} · out ${formatTokens(totals.output)}` +
+      (Number(totals.cache_read) ? ` · cache ${formatTokens(totals.cache_read)}` : ""),
+    Number(totals.cost) ? `- Cost: ${formatCost(totals.cost)}` : "- Cost: not reported by these providers",
+    `- Agent time: ${formatDuration(totals.seconds)}`,
+    ""
+  );
+
+  lines.push(`| ${by} | runs | in | out | cache | time |`, "| --- | ---: | ---: | ---: | ---: | ---: |");
+  for (const row of rows) {
+    lines.push(
+      `| ${row.bucket} | ${row.runs} | ${formatTokens(row.input)} | ${formatTokens(row.output)} | ${formatTokens(row.cache_read)} | ${formatDuration(row.seconds)} |`
+    );
+  }
+
+  lines.push("", `Journal: \`${database}\` · group by \`--by day|model|preset|workspace|kind\` · \`--days N\` or \`--all\`.`);
+  return joinLines(lines);
+}

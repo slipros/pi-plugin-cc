@@ -4,6 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+// Tracked runs also write to the durable journal, whose default location is the
+// user's own data directory. Point it somewhere disposable before importing
+// anything that records, or a test run pollutes real usage statistics.
+process.env.PI_PLUGIN_DB = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-")), "jobs.db");
+
 import {
   buildStatusSnapshot,
   createJobLogFile,
@@ -154,4 +159,35 @@ test("elapsed time is formatted for humans", () => {
   assert.equal(formatElapsed(start, "2026-01-01T00:03:07.000Z"), "3m 7s");
   assert.equal(formatElapsed(start, "2026-01-01T02:05:00.000Z"), "2h 5m");
   assert.equal(formatElapsed("nonsense"), null);
+});
+
+test("usage is recorded while the job runs, one write per assistant turn", async () => {
+  const { createProgressReporter } = await import("../plugins/pi/scripts/lib/jobs.mjs");
+  const { resolveJobFile, writeJobFile, ensureStateDir } = await import("../plugins/pi/scripts/lib/state.mjs");
+  const os = await import("node:os");
+  const fsMod = await import("node:fs");
+  const pathMod = await import("node:path");
+
+  const workspaceRoot = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), "pi-usage-"));
+  ensureStateDir(workspaceRoot);
+  const jobId = "delegate-usage-1";
+  writeJobFile(workspaceRoot, jobId, { id: jobId, status: "running" });
+  const logFile = pathMod.join(workspaceRoot, "job.log");
+  const report = createProgressReporter({ workspaceRoot, jobId, logFile });
+
+  const read = () => JSON.parse(fsMod.readFileSync(resolveJobFile(workspaceRoot, jobId), "utf8"));
+
+  report({ phase: "working", message: "Turn 1 started.", usage: {} });
+  assert.equal(read().usage, undefined, "an empty usage object is not worth a write");
+
+  report({ phase: "working", message: "answer", usage: { input: 100, output: 20, cost: 0.5 } });
+  assert.deepEqual(read().usage, { input: 100, output: 20, cost: 0.5 });
+
+  report({ phase: "working", message: "bash: ls", usage: { input: 100, output: 20, cost: 0.5 } });
+  assert.deepEqual(read().usage, { input: 100, output: 20, cost: 0.5 }, "unchanged counters do not rewrite");
+
+  report({ phase: "working", message: "answer", usage: { input: 250, output: 40, cost: 1.5 } });
+  assert.deepEqual(read().usage, { input: 250, output: 40, cost: 1.5 });
+
+  fsMod.rmSync(workspaceRoot, { recursive: true, force: true });
 });

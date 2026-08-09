@@ -17,6 +17,7 @@ Built in the shape of the official [Codex plugin](https://github.com/openai/code
 | `/pi:result` | Stored output of a finished job. |
 | `/pi:cancel` | Stop a running job (soft abort first). |
 | `/pi:sandbox` | Build and inspect the container image runs are isolated in. |
+| `stats` | Token usage across every workspace, grouped by day, model, preset or project. |
 | `/pi:setup` | Check that pi is installed, authenticated and configured. |
 
 Plus the `pi:pi-delegate` subagent (so Claude can delegate without a slash command) and the `pi-cli-runtime` skill (so Claude knows how pi's flags, sessions and event stream behave).
@@ -369,6 +370,21 @@ Long runs belong in the background:
 ```
 
 `--background` **detaches the run**: the command validates the preset and the sandbox, hands the work to a separate process, prints the job id and exits in about a second. The agent then outlives the shell that started it, so nothing has to hold a terminal (or a Claude Code turn) open for an hour, and nothing is killed by a stray `timeout` or a cancelled turn. Startup problems still surface in front of you — detaching happens after validation — and whatever the detached process says before it becomes a tracked job goes to the `Startup log` named in the output. Stop a run deliberately with `/pi:cancel`.
+
+Token usage is recorded as the run goes, not only at the end: `/pi:status` shows `Usage: in … · out … · $…` for a job that is still working, updated on every model answer. One write per assistant turn, not per tool call.
+
+## Token accounting
+
+Job files answer "what is running now"; they cannot answer "what did this week cost" — they live in a temp tree, are split per workspace, keep the newest 50 each and vanish on reboot. So finished and starting runs are also appended to a durable SQLite journal at `~/.local/share/pi-plugin/jobs.db` (override with `PI_PLUGIN_DB`).
+
+```
+pi-companion.mjs stats                       # last 30 days, by day
+pi-companion.mjs stats --by model            # which model burned what
+pi-companion.mjs stats --by preset --days 7
+pi-companion.mjs stats --by workspace --all
+```
+
+It uses `node:sqlite`, which ships with Node 22.3+ and needs no dependency; on older Node the journal is simply skipped and everything else works unchanged. Cost is only shown when the provider reports it — `ollama-pro` and `opencode-go` send zero, so there the honest answer is tokens, not money.
 
 Job state lives outside your repository, bucketed per workspace, and survives Claude Code restarts. Each record keeps the pi session id, so any run can be picked up in pi itself:
 

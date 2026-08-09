@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { recordJobSafely } from "./db.mjs";
 import {
   ensureStateDir,
   listJobs,
@@ -52,6 +53,7 @@ export function appendLogBlock(logFile, title, body) {
  */
 export function createProgressReporter({ workspaceRoot, jobId, logFile, stderr = false }) {
   let lastPhase = null;
+  let lastUsageKey = null;
 
   return (event) => {
     if (!event) {
@@ -65,13 +67,32 @@ export function createProgressReporter({ workspaceRoot, jobId, logFile, stderr =
       process.stderr.write(`[pi] ${message}\n`);
     }
 
-    if (phase && phase !== lastPhase) {
+    // Usage only moves when the model answers, so keying on the counters keeps
+    // this to one write per assistant turn instead of one per tool call.
+    const usage = event.usage && Object.keys(event.usage).length ? event.usage : null;
+    const usageKey = usage ? `${usage.input ?? 0}/${usage.output ?? 0}/${usage.cacheRead ?? 0}` : null;
+    const usageChanged = usageKey !== null && usageKey !== lastUsageKey;
+    const phaseChanged = Boolean(phase) && phase !== lastPhase;
+
+    if (!phaseChanged && !usageChanged) {
+      return;
+    }
+    if (phaseChanged) {
       lastPhase = phase;
-      upsertJob(workspaceRoot, { id: jobId, phase });
-      const jobFile = resolveJobFile(workspaceRoot, jobId);
-      if (fs.existsSync(jobFile)) {
-        writeJobFile(workspaceRoot, jobId, { ...readJobFile(jobFile), phase });
-      }
+    }
+    if (usageChanged) {
+      lastUsageKey = usageKey;
+    }
+
+    const patch = {
+      id: jobId,
+      ...(phaseChanged ? { phase } : {}),
+      ...(usageChanged ? { usage } : {})
+    };
+    upsertJob(workspaceRoot, patch);
+    const jobFile = resolveJobFile(workspaceRoot, jobId);
+    if (fs.existsSync(jobFile)) {
+      writeJobFile(workspaceRoot, jobId, { ...readJobFile(jobFile), ...patch });
     }
   };
 }
@@ -256,6 +277,10 @@ export async function runTrackedJob(job, runner) {
   };
   writeJobFile(job.workspaceRoot, job.id, running);
   upsertJob(job.workspaceRoot, running);
+  // The journal is written at the two moments that matter — a run appearing and
+  // a run ending — rather than on every progress event: it exists for history,
+  // while live status is read from the JSON record.
+  recordJobSafely(running);
 
   try {
     const execution = await runner();
@@ -285,6 +310,7 @@ export async function runTrackedJob(job, runner) {
       model: record.model,
       summary: record.summary
     });
+    recordJobSafely(record);
     appendLogBlock(job.logFile, "Final output", execution.rendered);
     return execution;
   } catch (error) {
@@ -306,6 +332,7 @@ export async function runTrackedJob(job, runner) {
       completedAt,
       errorMessage: message
     });
+    recordJobSafely({ ...running, status: "failed", phase: "failed", completedAt, errorMessage: message });
     appendLogLine(job.logFile, `Failed: ${message}`);
     throw error;
   }

@@ -113,7 +113,11 @@ export async function runPiRpcTurn({
       settledAt = null;
     }
 
-    report(applyPiEvent(state, event));
+    const update = applyPiEvent(state, event);
+    // The accumulated usage rides along with every progress event, so a job
+    // that is still running can report what it has spent so far — until now
+    // the number only existed in this process and landed on disk at the end.
+    report(update ? { ...update, usage: state.usage } : null);
   });
 
   child.stderr.setEncoding("utf8");

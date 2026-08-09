@@ -71,10 +71,12 @@ import {
   renderRunResult,
   renderSandboxReport,
   renderSetupReport,
+  renderStatsReport,
   renderStatusReport,
   renderStoredJobResult
 } from "./lib/render.mjs";
 import { resolveRunRoot, resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { databasePath, openDatabase, queryStats, queryTotals } from "./lib/db.mjs";
 
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -139,6 +141,7 @@ function usage() {
     "  pi-companion.mjs cancel [job-id] [--json]",
     "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
     "  pi-companion.mjs watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]",
+    "  pi-companion.mjs stats [--by day|model|preset|workspace|kind] [--days N|--all] [--json]",
     "  pi-companion.mjs sandbox [status|build [name|--all]|clean] [--image <tag>]",
     "                            [--dockerfile <name|path>] [--pi-version <v>]",
     "",
@@ -842,6 +845,41 @@ async function commandWatch(argv, workspaceRoot) {
  * behaves like the one running on the host instead of drifting to whatever npm
  * publishes next.
  */
+/**
+ * Token accounting across every workspace, from the durable journal rather than
+ * the per-workspace job files (which are capped, split by directory and live in
+ * a temp tree).
+ */
+async function commandStats(argv, workspaceRoot) {
+  const { flags } = parseArgs(argv, {
+    booleans: ["json", "all"],
+    strings: ["by", "days", "limit"]
+  });
+
+  const handle = openDatabase();
+  if (!handle) {
+    throw new Error(
+      `Cannot open the job journal at ${databasePath()}. It needs Node 22.3+ with node:sqlite.`
+    );
+  }
+
+  try {
+    const days = flags.all ? null : Number(flags.days ?? 30);
+    const by = flags.by ?? "day";
+    const rows = queryStats(handle, { by, days, limit: Number(flags.limit ?? 50) });
+    const totals = queryTotals(handle, { days });
+
+    output(
+      renderStatsReport({ rows, totals, by, days, database: databasePath() }),
+      { by, days, database: databasePath(), totals, rows },
+      Boolean(flags.json)
+    );
+    return 0;
+  } finally {
+    handle.close();
+  }
+}
+
 async function commandSandbox(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, {
     booleans: ["json", "no-cache", "all"],
@@ -1001,6 +1039,7 @@ const COMMANDS = {
   cancel: commandCancel,
   steer: commandSteer,
   watch: commandWatch,
+  stats: commandStats,
   sandbox: commandSandbox
 };
 

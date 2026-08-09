@@ -237,6 +237,21 @@ export function resolveRunSettings(config, command, overrides = {}) {
 
   const readOnly = flagOf("readOnly");
 
+  /**
+   * Commit identity for the agent. Merged across layers rather than picked, so
+   * a preset can set the name and a project only the address.
+   */
+  const git = layers.reduce(
+    (acc, layer) => (isPlainObject(layer?.git) ? { ...acc, ...layer.git } : acc),
+    {}
+  );
+  if ((git.name && !git.email) || (git.email && !git.name)) {
+    throw new Error(
+      `Commit identity needs both a name and an email; got ${JSON.stringify(git)}. ` +
+        "Git refuses to commit with half of one."
+    );
+  }
+
   return {
     presetName,
     model: pick("model"),
@@ -259,6 +274,7 @@ export function resolveRunSettings(config, command, overrides = {}) {
     // Raw value; the caller normalizes it, because "docker" and a full sandbox
     // object have to resolve to the same thing.
     sandbox: pick("sandbox"),
+    git: git.name ? git : null,
     // Mounts named outside the sandbox descriptor: a preset or a `--mount` flag
     // adding one directory to whatever profile the run ended up with, without
     // having to restate the profile.

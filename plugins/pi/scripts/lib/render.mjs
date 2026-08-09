@@ -163,6 +163,7 @@ function renderRunHeader(title, { job, settings, execution }) {
     job.runRoot && job.runRoot !== job.workspaceRoot ? `- Working directory: \`${job.runRoot}\`` : null,
     settings.promptLabel ? `- ${settings.promptLabel.replace(/^system prompt/, "System prompt")}` : null,
     settings.readOnly ? "- Tools: read-only (`read`, `grep`, `find`, `ls`)" : null,
+    settings.git ? `- Commits as: ${settings.git.name} <${settings.git.email}>` : null,
     execution?.sessionId ? `- pi session: \`${execution.sessionId}\` (resume with \`pi --session ${execution.sessionId}\`)` : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,
     execution?.elapsed ? `- Duration: ${execution.elapsed}` : null

@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { loadConfig, resolveRunSettings, userConfigPath } from "./lib/config.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, ensureGitRepository, resolveCommitIdentity, resolveReviewTarget } from "./lib/git.mjs";
 import {
   appendLogLine,
   buildStatusSnapshot,
@@ -114,7 +114,9 @@ const RUN_FLAGS = {
     "scope",
     "engine",
     "sandbox",
-    "cwd"
+    "cwd",
+    "git-name",
+    "git-email"
   ],
   collect: ["append-system-prompt", "extension", "skill", "mount"],
   aliases: {
@@ -161,6 +163,8 @@ function usage() {
     "  --cwd <path>            directory the agent works in (mounted at /workspace,",
     "                          and the tree `review` diffs). Job records stay with",
     "                          the caller, so status/watch keep finding the job.",
+    "  --git-name <name>       commit identity for the agent; --git-email goes with it",
+    "  --git-email <address>   (both are needed — git refuses half of one)",
     "  --json                  machine-readable output",
     "",
     "Tool flags (what the pi agent is allowed to use):",
@@ -260,12 +264,21 @@ function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRo
     ...(flags["no-skills"] ? { noSkills: true } : {}),
     ...(flags.engine ? { engine: flags.engine } : {}),
     ...(flags.sandbox ? { sandbox: flags.sandbox } : {}),
+    ...(flags["git-name"] || flags["git-email"]
+      ? { git: { ...(flags["git-name"] ? { name: flags["git-name"] } : {}), ...(flags["git-email"] ? { email: flags["git-email"] } : {}) } }
+      : {}),
     ...(flags["read-only"] ? { readOnly: true } : {}),
     ...(flags.write ? { readOnly: false } : {}),
     ...(flags.timeout ? { timeoutMs: Number(flags.timeout) * 1000 } : {})
   };
 
   const settings = resolveRunSettings(config, command, overrides);
+  if (!settings.git) {
+    // Nothing was named explicitly, so inherit whatever git would use in this
+    // directory. In a sandbox that is the only way a per-directory rule can
+    // survive: the container sees /workspace, not the path the rule matches.
+    settings.git = resolveCommitIdentity(runRoot);
+  }
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
 
   const warnings = [];
@@ -287,6 +300,13 @@ function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRo
   }
   if (isSandboxed(sandbox)) {
     sandbox = attachMounts(sandbox, settings.mounts);
+    const identity = gitIdentityEnv(settings.git);
+    if (Object.keys(identity).length) {
+      sandbox = {
+        ...sandbox,
+        env: [...sandbox.env, ...Object.entries(identity).map(([key, value]) => `${key}=${value}`)]
+      };
+    }
 
     // Gates the profile brings come first: an extension that blocks a tool call
     // should get the event before the ones the run asked for.
@@ -339,6 +359,23 @@ function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRo
     promptLabel: prompt.sources.find((source) => source.startsWith("system prompt")) ?? null,
     promptSources: prompt.sources,
     warnings
+  };
+}
+
+/**
+ * Git reads these before any config file, so one identity covers a sandboxed
+ * run (where ~/.gitconfig may not exist at all) and a host run (where it exists
+ * but names the human, not the agent).
+ */
+function gitIdentityEnv(git) {
+  if (!git?.name || !git?.email) {
+    return {};
+  }
+  return {
+    GIT_AUTHOR_NAME: git.name,
+    GIT_AUTHOR_EMAIL: git.email,
+    GIT_COMMITTER_NAME: git.name,
+    GIT_COMMITTER_EMAIL: git.email
   };
 }
 
@@ -456,6 +493,7 @@ async function executeRun({
     const runner = settings.engine === "json" ? runPiTurn : runPiRpcTurn;
     const result = await runner({
       cwd: runRoot,
+      env: { ...process.env, ...gitIdentityEnv(settings.git) },
       prompt,
       model: settings.model,
       provider: settings.provider,

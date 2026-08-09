@@ -75,3 +75,47 @@ test("--cwd resolves against the caller and rejects what is not a directory", as
 
   fs.rmSync(base, { recursive: true, force: true });
 });
+
+test("commit identity is read from the directory, so gitdir rules apply", async () => {
+  const { resolveCommitIdentity } = await import("../plugins/pi/scripts/lib/git.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-identity-"));
+  const inner = path.join(root, "client-work");
+  fs.mkdirSync(inner);
+
+  // A config that switches identity below one subdirectory — the mechanism a
+  // developer uses to keep work and personal commits apart.
+  const includeFile = path.join(root, "client.gitconfig");
+  fs.writeFileSync(includeFile, "[user]\n\tname = Client Name\n\temail = dev@client.example\n");
+  const gitConfig = path.join(root, "home.gitconfig");
+  fs.writeFileSync(
+    gitConfig,
+    `[user]\n\tname = Personal\n\temail = me@example.dev\n[includeIf "gitdir:${inner}/"]\n\tpath = ${includeFile}\n`
+  );
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_SYSTEM: "/dev/null", HOME: root };
+  execFileSync("git", ["init", "-q", path.join(root, "repo")], { env });
+  execFileSync("git", ["init", "-q", path.join(inner, "repo")], { env });
+
+  const previous = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = gitConfig;
+  try {
+    assert.deepEqual(resolveCommitIdentity(path.join(root, "repo")), {
+      name: "Personal",
+      email: "me@example.dev"
+    });
+    assert.deepEqual(
+      resolveCommitIdentity(path.join(inner, "repo")),
+      { name: "Client Name", email: "dev@client.example" },
+      "the narrower gitdir rule wins, which is the whole point"
+    );
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

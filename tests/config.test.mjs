@@ -222,3 +222,31 @@ test("sandbox is resolved through the same layers as everything else", () => {
     "a flag can switch the preset's sandbox off"
   );
 });
+
+test("commit identity merges across layers and refuses half of one", () => {
+  const config = {
+    ...CONFIG,
+    defaults: { ...CONFIG.defaults, git: { name: "pi agent", email: "pi@example.dev" } },
+    presets: { bot: { git: { email: "bot@example.dev" } } },
+    commands: { delegate: {} }
+  };
+
+  assert.deepEqual(resolveRunSettings(config, "delegate").git, {
+    name: "pi agent",
+    email: "pi@example.dev"
+  });
+  assert.deepEqual(
+    resolveRunSettings(config, "delegate", { preset: "bot" }).git,
+    { name: "pi agent", email: "bot@example.dev" },
+    "a preset can change just the address"
+  );
+  assert.deepEqual(
+    resolveRunSettings(config, "delegate", { preset: "bot", git: { name: "flag", email: "flag@example.dev" } }).git,
+    { name: "flag", email: "flag@example.dev" }
+  );
+  assert.equal(resolveRunSettings(CONFIG, "delegate").git, null, "unset stays unset");
+  assert.throws(
+    () => resolveRunSettings({ ...CONFIG, defaults: { ...CONFIG.defaults, git: { name: "only" } } }, "delegate"),
+    /needs both a name and an email/
+  );
+});

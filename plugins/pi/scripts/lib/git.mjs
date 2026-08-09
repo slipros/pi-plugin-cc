@@ -139,3 +139,21 @@ export function collectReviewContext(cwd, target, { maxBytes = DEFAULT_MAX_CONTE
   const combined = parts.filter(Boolean).join("\n\n");
   return truncate(combined, maxBytes);
 }
+
+/**
+ * The commit identity git itself would use in this directory.
+ *
+ * Resolved on the host, by asking git in the run root, so `includeIf
+ * "gitdir:…"` rules apply — the mechanism that gives one identity per project
+ * tree. Inside a container the same rules could never match: the repository is
+ * at /workspace there, and the path a rule keys on no longer exists.
+ */
+export function resolveCommitIdentity(cwd) {
+  const name = runCommand("git", ["config", "user.name"], { cwd });
+  const email = runCommand("git", ["config", "user.email"], { cwd });
+  if (name.status !== 0 || email.status !== 0) {
+    return null;
+  }
+  const identity = { name: name.stdout.trim(), email: email.stdout.trim() };
+  return identity.name && identity.email ? identity : null;
+}

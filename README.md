@@ -373,6 +373,32 @@ Long runs belong in the background:
 
 Token usage is recorded as the run goes, not only at the end: `/pi:status` shows `Usage: in … · out … · $…` for a job that is still working, updated on every model answer. One write per assistant turn, not per tool call.
 
+## Who the agent commits as
+
+```json
+"defaults": { "git": { "name": "pi agent", "email": "pi@example.dev" } },
+"presets": { "go-developer": { "git": { "email": "go-developer@example.dev" } } }
+```
+
+```
+/pi:delegate --git-name "pi agent" --git-email pi@example.dev   implement SPEC.md
+```
+
+This sets `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, which git reads ahead of any config file — so one setting covers a sandboxed run (where `~/.gitconfig` may not exist at all) and a host run (where it does exist, but names you rather than the agent). The run header shows `Commits as: …`.
+
+Name and email come as a pair: half an identity is refused before the run starts, since git would refuse the commit anyway. Layers merge field by field, so a global name and a per-preset address work.
+
+**Leave it unset and the identity is inherited from the working directory.** The companion asks git, in the directory the agent will work in, who it would commit as — so `includeIf "gitdir:…"` rules keep working inside the sandbox:
+
+```gitconfig
+[includeIf "gitdir:~/work/"]
+	path = ~/work/.gitconfig
+[includeIf "gitdir:~/work/client/"]
+	path = ~/work/client/.gitconfig
+```
+
+Rules apply top to bottom, so the narrower one goes below the general one. The lookup happens **on the host, before the container starts** — inside it never could: the repository is at `/workspace` there, and the path the rule matches on does not exist.
+
 ## Token accounting
 
 Job files answer "what is running now"; they cannot answer "what did this week cost" — they live in a temp tree, are split per workspace, keep the newest 50 each and vanish on reboot. So finished and starting runs are also appended to a durable SQLite journal at `~/.local/share/pi-plugin/jobs.db` (override with `PI_PLUGIN_DB`).

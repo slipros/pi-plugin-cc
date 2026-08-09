@@ -168,6 +168,51 @@ The rest of your home directory, your SSH keys and everything outside the worksp
 
 Extensions loaded from host paths (`--extension ~/.pi/agent/extensions/…`) do not exist inside the container; the plugin warns when a run asks for one. `npm:` and `git:` sources are fetched inside the container and work normally.
 
+### Sandbox profiles: giving an agent its toolchain
+
+The container is deliberately bare — node, git, ripgrep. An agent that has to build Go, run a linter or honour your commit gates needs those tools inside, and that equipment is the same for every Go preset you own. So it is named once, under `sandboxProfiles`, and referenced by name:
+
+```json
+{
+  "sandboxProfiles": {
+    "go": {
+      "mounts": [
+        "/home/linuxbrew/.linuxbrew/opt/go/libexec:/usr/local/go:ro",
+        "~/go/bin:/gobin:ro",
+        "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
+        "pi-plugin-gomod:/home/pi/go/pkg/mod",
+        "pi-plugin-gocache:/home/pi/.cache"
+      ],
+      "env": ["PATH=/usr/local/go/bin:/gobin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+      "extensions": [
+        "/pi-agent/host-extensions/custom-gcl-precommit.ts",
+        "/pi-agent/host-extensions/claude-hooks.ts"
+      ]
+    }
+  },
+  "presets": {
+    "go-fix":    { "model": "opencode-go/kimi-k3", "systemPrompt": "fixer",      "sandbox": "go" },
+    "go-review": { "model": "opencode-go/glm-5.2", "systemPrompt": "adversarial", "sandbox": "go", "readOnly": true }
+  }
+}
+```
+
+A profile understands the same fields as an inline sandbox object, plus two that only make sense with one:
+
+- `extensions` / `skills` — loaded **only** when the sandbox is active, so they can point at container paths that do not exist on your host. This is where gate extensions belong: a pre-commit linter gate that is missing inside the container does not fail loudly, it just stops gating.
+- Everything else (`image`, `network`, `mounts`, `env`, `args`, `agentDir`, `user`) behaves as above.
+
+Mechanics worth knowing:
+
+- Host binaries are not copied in, they are bind mounted: `~/go/bin:/gobin:ro` makes the same file on disk visible at `/gobin` inside, read-only. Statically linked binaries (anything built by Go) run as-is; something linked against host libraries would need to be installed in the image instead.
+- `env` entries take both forms: `"NAME"` forwards the host value, `"NAME=value"` sets one for the container. A mounted binary is useless until `PATH` names its directory.
+- Named volumes (`pi-plugin-gomod:/home/pi/go/pkg/mod`) keep module and build caches between runs; without them every run recompiles the world.
+- `"sandbox": {"profile": "go", "network": "none"}` starts from a profile and overrides single fields.
+
+`--sandbox <name>` also takes a profile name on the command line, so `--sandbox go` works for a one-off run.
+
+### The full inline form
+
 The profile is configurable per preset, in full:
 
 ```json

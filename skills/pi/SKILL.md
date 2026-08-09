@@ -103,6 +103,37 @@ sandbox clean                       # убрать контейнеры, ост�
 
 Профиль песочницы целиком настраивается в пресете (`sandbox: { mode, image, network, agentDir, env, mounts, args }`); `--sandbox none` разово отключает песочницу пресета.
 
+### Оснастка агента: sandboxProfiles
+
+Образ намеренно голый — node, git, ripgrep. Если агенту нужен тулчейн (собрать Go, прогнать линтер, соблюсти твои гейты на коммит), эта оснастка описывается один раз в `sandboxProfiles` и подключается по имени:
+
+```json
+{
+  "sandboxProfiles": {
+    "go": {
+      "mounts": [
+        "/home/linuxbrew/.linuxbrew/opt/go/libexec:/usr/local/go:ro",
+        "~/go/bin:/gobin:ro",
+        "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
+        "pi-plugin-gomod:/home/pi/go/pkg/mod",
+        "pi-plugin-gocache:/home/pi/.cache"
+      ],
+      "env": ["PATH=/usr/local/go/bin:/gobin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+      "extensions": ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]
+    }
+  },
+  "presets": {
+    "go-fix": { "model": "opencode-go/kimi-k3", "systemPrompt": "fixer", "sandbox": "go" }
+  }
+}
+```
+
+- `extensions`/`skills` профиля подключаются **только** когда песочница активна, поэтому могут ссылаться на контейнерные пути. Гейты живут здесь: гейт, которого нет внутри контейнера, не падает с ошибкой — он просто перестаёт гейтить.
+- Бинари не копируются, а монтируются: `~/go/bin:/gobin:ro` показывает контейнеру тот же файл на диске. Статические бинари (всё, что собрано Go) работают как есть.
+- `env` принимает обе формы: `"NAME"` пробрасывает значение с хоста, `"NAME=значение"` задаёт своё. Смонтированный бинарь бесполезен, пока его каталог не в `PATH`.
+- Volume-ы (`pi-plugin-gomod:/home/pi/go/pkg/mod`) держат кэши между прогонами — без них каждый прогон пересобирает всё заново.
+- `"sandbox": {"profile": "go", "network": "none"}` — взять профиль за основу и переопределить отдельные поля. `--sandbox go` подключает профиль разово.
+
 Если образ не собран или демон недоступен, прогон падает **до** создания задачи — с текстом, что именно делать.
 
 ## Наблюдение за работой агента

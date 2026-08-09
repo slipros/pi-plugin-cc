@@ -33,6 +33,9 @@ const BUILT_IN = {
     timeoutMs: 1_800_000
   },
   presets: {},
+  // Named sandbox profiles: the toolchain an agent needs inside the container
+  // (mounted binaries, PATH, gate extensions), referenced by `"sandbox": "go"`.
+  sandboxProfiles: {},
   commands: {
     delegate: {},
     review: { systemPrompt: "reviewer", readOnly: true }
@@ -69,6 +72,10 @@ function mergeLayer(base, layer) {
   return {
     defaults: { ...base.defaults, ...(isPlainObject(layer.defaults) ? layer.defaults : {}) },
     presets: { ...base.presets, ...(isPlainObject(layer.presets) ? layer.presets : {}) },
+    sandboxProfiles: {
+      ...base.sandboxProfiles,
+      ...(isPlainObject(layer.sandboxProfiles) ? layer.sandboxProfiles : {})
+    },
     commands: {
       ...base.commands,
       ...Object.fromEntries(

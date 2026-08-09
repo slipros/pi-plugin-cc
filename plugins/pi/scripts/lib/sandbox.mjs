@@ -44,7 +44,11 @@ const SANDBOX_DEFAULTS = {
   user: "current",
   env: [],
   mounts: [],
-  args: []
+  args: [],
+  // Tooling the agent only gets inside this sandbox: extensions and skills
+  // whose paths exist in the container, not on the host.
+  extensions: [],
+  skills: []
 };
 
 const DISABLED = new Set(["none", "off", "false", "no", "host"]);
@@ -58,15 +62,25 @@ function asList(value) {
     .filter(Boolean);
 }
 
+function unknownProfile(name, profiles) {
+  const available = Object.keys(profiles ?? {});
+  return new Error(
+    available.length
+      ? `Unknown sandbox "${name}". Use docker, none, or a sandbox profile: ${available.join(", ")}.`
+      : `Unknown sandbox "${name}". Use docker or none, or define "${name}" under "sandboxProfiles" in the config.`
+  );
+}
+
 /**
  * Turn a config value or `--sandbox` flag into a normalized descriptor.
  *
- * Accepts `"docker"`, `"none"`, `true`/`false` and a full object, so a preset
- * can carry the whole sandbox profile while a flag flips the mode for one run.
+ * Accepts `"docker"`, `"none"`, `true`/`false`, the name of a profile from
+ * `sandboxProfiles`, and a full object — so a preset can name the toolchain its
+ * agent needs (`"sandbox": "go"`) while a flag still flips the mode for one run.
  *
  * @returns {{mode: "none"} | object}
  */
-export function normalizeSandbox(value) {
+export function normalizeSandbox(value, profiles = {}) {
   if (value == null || value === false || value === "") {
     return { mode: "none" };
   }
@@ -74,14 +88,18 @@ export function normalizeSandbox(value) {
     return { ...SANDBOX_DEFAULTS };
   }
   if (typeof value === "string") {
-    const mode = value.trim().toLowerCase();
+    const name = value.trim();
+    const mode = name.toLowerCase();
     if (DISABLED.has(mode)) {
       return { mode: "none" };
     }
-    if (mode !== "docker") {
-      throw new Error(`Unknown sandbox mode "${value}". Supported modes: docker, none.`);
+    if (mode === "docker") {
+      return { ...SANDBOX_DEFAULTS };
     }
-    return { ...SANDBOX_DEFAULTS };
+    if (profiles?.[name]) {
+      return normalizeSandbox({ ...profiles[name], profile: undefined }, profiles);
+    }
+    throw unknownProfile(name, profiles);
   }
   if (typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Invalid sandbox setting: ${JSON.stringify(value)}.`);
@@ -95,13 +113,25 @@ export function normalizeSandbox(value) {
     throw new Error(`Unknown sandbox mode "${value.mode}". Supported modes: docker, none.`);
   }
 
+  // A profile is the base; the object's own fields override it field by field.
+  let base = SANDBOX_DEFAULTS;
+  if (value.profile) {
+    const profile = profiles?.[value.profile];
+    if (!profile) {
+      throw unknownProfile(value.profile, profiles);
+    }
+    base = { ...SANDBOX_DEFAULTS, ...profile };
+  }
+
+  const merged = { ...base, ...value, mode: "docker" };
+  delete merged.profile;
   return {
-    ...SANDBOX_DEFAULTS,
-    ...value,
-    mode: "docker",
-    env: asList(value.env),
-    mounts: asList(value.mounts),
-    args: asList(value.args)
+    ...merged,
+    env: asList(merged.env),
+    mounts: asList(merged.mounts),
+    args: asList(merged.args),
+    extensions: asList(merged.extensions),
+    skills: asList(merged.skills)
   };
 }
 
@@ -115,6 +145,11 @@ export function containerNameForJob(jobId) {
   return `pi-plugin-${slug}`.slice(0, 60);
 }
 
+/** `~/go/bin:/gobin:ro` — only the host side of a mount can be a home path. */
+function expandHome(value, homeDir) {
+  return String(value).replace(/^~(?=\/|$)/, homeDir);
+}
+
 function resolveAgentMount(sandbox, homeDir) {
   if (sandbox.agentDir === "volume") {
     return { source: sandbox.volume || DEFAULT_SANDBOX_VOLUME, isolated: true };
@@ -122,7 +157,7 @@ function resolveAgentMount(sandbox, homeDir) {
   if (sandbox.agentDir === "host") {
     return { source: path.join(homeDir, ".pi", "agent"), isolated: false };
   }
-  return { source: path.resolve(sandbox.agentDir), isolated: false };
+  return { source: path.resolve(expandHome(sandbox.agentDir, homeDir)), isolated: false };
 }
 
 /**
@@ -160,9 +195,10 @@ export function buildDockerRunArgs({
 
   args.push("-e", `HOME=${CONTAINER_HOME}`);
   args.push("-e", `PI_CODING_AGENT_DIR=${AGENT_DIR}`);
-  for (const name of sandbox.env ?? []) {
-    if (env[name] != null) {
-      args.push("-e", name);
+  for (const entry of sandbox.env ?? []) {
+    // `NAME` forwards the host value, `NAME=value` sets one for the container.
+    if (entry.includes("=") || env[entry] != null) {
+      args.push("-e", entry);
     }
   }
 
@@ -180,7 +216,7 @@ export function buildDockerRunArgs({
   }
 
   for (const mount of sandbox.mounts ?? []) {
-    args.push("-v", mount);
+    args.push("-v", expandHome(mount, homeDir));
   }
   args.push(...(sandbox.args ?? []));
 
@@ -273,12 +309,19 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
     warnings.push("Sandbox mounts the host `~/.pi/agent`, so container code can read host sessions and credentials.");
   }
 
+  // Paths the container does have: the workspace, the agent dir, and whatever
+  // the profile mounts explicitly (the target is the middle field of -v).
+  const containerPaths = [WORKDIR, AGENT_DIR, ...(sandbox.mounts ?? []).map((mount) => mount.split(":")[1]).filter(Boolean)];
+
   const root = path.resolve(workspaceRoot ?? ".");
   for (const [label, entries] of [["extension", extensions], ["skill", skills]]) {
     for (const entry of entries) {
       const value = String(entry ?? "");
       if (!/^[~./]|^[A-Za-z]:[\\/]/.test(value)) {
         continue; // npm: / git: sources are resolved inside the container.
+      }
+      if (containerPaths.some((target) => value === target || value.startsWith(`${target}/`))) {
+        continue; // Already a path inside the container.
       }
       const resolved = path.resolve(root, value.replace(/^~(?=\/|$)/, os.homedir()));
       if (!resolved.startsWith(`${root}${path.sep}`) && resolved !== root) {

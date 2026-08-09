@@ -156,9 +156,11 @@ function usage() {
     "  --engine rpc|json       rpc (default) keeps the run steerable",
     "",
     "Isolation:",
-    "  --sandbox docker|none   run the whole pi process in a container",
-    "                          (workspace is bind mounted; build the image first",
-    "                          with `pi-companion.mjs sandbox build`)"
+    "  --sandbox <name>        docker, none, or a profile from sandboxProfiles",
+    "                          in the config (a named toolchain: mounted binaries,",
+    "                          PATH, gate extensions). The whole pi process runs in",
+    "                          the container; build the image first with",
+    "                          `pi-companion.mjs sandbox build`."
   ].join("\n");
 }
 
@@ -238,8 +240,13 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
 
   const warnings = [];
-  const sandbox = normalizeSandbox(settings.sandbox);
+  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles);
   if (isSandboxed(sandbox)) {
+    // Gates the profile brings come first: an extension that blocks a tool call
+    // should get the event before the ones the run asked for.
+    settings.extensions = [...sandbox.extensions, ...settings.extensions];
+    settings.skills = [...sandbox.skills, ...settings.skills];
+
     // A missing daemon or image is a setup problem: fail before a job record
     // exists rather than recording a run that never started.
     const preflight = sandboxPreflight(sandbox);
@@ -398,7 +405,7 @@ async function commandSetup(argv, workspaceRoot) {
   const { flags } = parseArgs(argv, { booleans: ["json"] });
   const availability = getPiAvailability(workspaceRoot);
   const { config, sources, errors } = loadConfig(workspaceRoot);
-  const configuredSandbox = normalizeSandbox(config.defaults?.sandbox ?? null);
+  const configuredSandbox = normalizeSandbox(config.defaults?.sandbox ?? null, config.sandboxProfiles);
 
   const payload = {
     ...availability,
@@ -725,7 +732,7 @@ async function commandSandbox(argv, workspaceRoot) {
 
   const action = positional[0] ?? "status";
   const { config } = loadConfig(workspaceRoot);
-  const configured = normalizeSandbox(config.defaults?.sandbox ?? null);
+  const configured = normalizeSandbox(config.defaults?.sandbox ?? null, config.sandboxProfiles);
   const image = flags.image ?? (isSandboxed(configured) ? configured.image : DEFAULT_SANDBOX_IMAGE);
 
   if (action === "build") {

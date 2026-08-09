@@ -58,7 +58,8 @@ test("an object can switch the sandbox off", () => {
 });
 
 test("an unknown mode is rejected instead of silently ignored", () => {
-  assert.throws(() => normalizeSandbox("gondolin"), /Unknown sandbox mode/);
+  // A bare name is read as a sandbox profile, so the error points at the config.
+  assert.throws(() => normalizeSandbox("gondolin"), /Unknown sandbox "gondolin"/);
   assert.throws(() => normalizeSandbox({ mode: "podman" }), /Unknown sandbox mode/);
 });
 
@@ -214,4 +215,79 @@ test("the host auth file is mounted read-only, and only when it exists", () => {
   } finally {
     fs.rmSync(homeDir, { recursive: true, force: true });
   }
+});
+
+test("an env entry with a value is set, not forwarded from the host", () => {
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox({ env: ["PATH=/gobin:/usr/bin", "HOME_ONLY_ON_HOST"] }),
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {}
+  });
+  assert.ok(args.includes("PATH=/gobin:/usr/bin"));
+  assert.ok(!args.includes("HOME_ONLY_ON_HOST"));
+});
+
+test("a mount can name the host side with ~", () => {
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox({ mounts: ["~/go/bin:/gobin:ro"] }),
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  assert.ok(mounts(args).includes("/home/me/go/bin:/gobin:ro"));
+});
+
+test("a path that the profile mounts into the container is not warned about", () => {
+  const sandbox = normalizeSandbox({ mounts: ["~/.pi/agent/extensions:/pi-agent/host-extensions:ro"] });
+  const warnings = sandboxRunWarnings(sandbox, {
+    workspaceRoot: "/work",
+    extensions: ["/pi-agent/host-extensions/custom-gcl-precommit.ts", "/home/me/elsewhere/ext.ts"]
+  });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /elsewhere/);
+});
+
+const PROFILES = {
+  go: {
+    mounts: ["~/go/bin:/gobin:ro", "~/.pi/agent/extensions:/pi-agent/host-extensions:ro"],
+    env: ["PATH=/gobin:/usr/local/bin:/usr/bin:/bin"],
+    extensions: ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]
+  }
+};
+
+test("a sandbox can be named: the profile carries the toolchain", () => {
+  const sandbox = normalizeSandbox("go", PROFILES);
+  assert.equal(sandbox.mode, "docker");
+  assert.equal(sandbox.image, DEFAULT_SANDBOX_IMAGE, "unnamed fields keep their defaults");
+  assert.deepEqual(sandbox.env, ["PATH=/gobin:/usr/local/bin:/usr/bin:/bin"]);
+  assert.deepEqual(sandbox.extensions, ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]);
+});
+
+test("a preset can start from a profile and override single fields", () => {
+  const sandbox = normalizeSandbox({ profile: "go", network: "none" }, PROFILES);
+  assert.equal(sandbox.network, "none");
+  assert.deepEqual(sandbox.extensions, ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]);
+  assert.equal(sandbox.profile, undefined, "the profile reference does not leak into docker args");
+});
+
+test("an unknown profile name lists the profiles that do exist", () => {
+  assert.throws(() => normalizeSandbox("rust", PROFILES), /sandbox profile: go/);
+  assert.throws(() => normalizeSandbox({ profile: "rust" }, PROFILES), /sandbox profile: go/);
+});
+
+test("profile tooling reaches docker as mounts and environment, not as pi flags", () => {
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("go", PROFILES),
+    piArgs: ["--mode", "rpc"],
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  assert.ok(mounts(args).includes("/home/me/go/bin:/gobin:ro"));
+  assert.ok(args.includes("PATH=/gobin:/usr/local/bin:/usr/bin:/bin"));
+  assert.ok(!args.includes("/pi-agent/host-extensions/custom-gcl-precommit.ts"));
 });

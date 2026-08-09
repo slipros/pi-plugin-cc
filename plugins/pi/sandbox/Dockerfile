@@ -17,9 +17,13 @@ RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSIO
 
 # The container runs under the calling user's uid so that files written through
 # the workspace bind mount stay owned by them. That uid has no passwd entry
-# here, so both HOME and the agent directory have to be writable by anyone;
-# a named volume mounted at /pi-agent inherits these permissions.
-RUN mkdir -p /home/pi /pi-agent && chmod 1777 /home/pi /pi-agent
+# here, so both HOME and the agent directory have to be writable by anyone.
+#
+# The cache directories are created here on purpose: a named volume takes its
+# ownership from the image path it covers, and a path that does not exist yet is
+# created by the daemon as root — which a non-root container then cannot write.
+RUN mkdir -p /home/pi/.cache /home/pi/go/pkg/mod /pi-agent \
+  && chmod -R 1777 /home/pi /pi-agent
 
 ENV HOME=/home/pi \
     PI_CODING_AGENT_DIR=/pi-agent \

@@ -194,6 +194,26 @@ test("the sandbox description names the image, agent dir and network", () => {
   assert.match(description, /network: bridge/);
 });
 
+test("custom provider definitions come along, so the sandbox sees the same models", () => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sandbox-test-"));
+  const build = (sandbox) =>
+    buildDockerRunArgs({ sandbox, cwd: "/work", identity: IDENTITY, homeDir, env: {} });
+
+  try {
+    const modelsFile = path.join(homeDir, ".pi", "agent", "models.json");
+    fs.mkdirSync(path.dirname(modelsFile), { recursive: true });
+    fs.writeFileSync(modelsFile, "{}\n", "utf8");
+
+    assert.ok(mounts(build(normalizeSandbox("docker"))).includes(`${modelsFile}:/pi-agent/models.json:ro`));
+    assert.ok(
+      mounts(build(normalizeSandbox({ auth: false }))).includes(`${modelsFile}:/pi-agent/models.json:ro`),
+      "provider definitions are configuration, not credentials, so auth: false keeps them"
+    );
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
 test("the host auth file is mounted read-only, and only when it exists", () => {
   const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sandbox-test-"));
   const build = () =>

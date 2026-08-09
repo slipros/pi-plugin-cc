@@ -206,12 +206,20 @@ export function buildDockerRunArgs({
 
   const agent = resolveAgentMount(sandbox, homeDir);
   args.push("-v", `${agent.source}:${AGENT_DIR}`);
-  if (agent.isolated && sandbox.auth) {
-    // Nested mount: docker applies the longer target path after the volume, so
-    // the credentials file lands inside the otherwise container-local dir.
-    const authFile = path.join(homeDir, ".pi", "agent", "auth.json");
-    if (fs.existsSync(authFile)) {
-      args.push("-v", `${authFile}:${AGENT_DIR}/auth.json:ro`);
+  if (agent.isolated) {
+    // Nested mounts: docker applies the longer target path after the volume, so
+    // these land inside the otherwise container-local agent directory.
+    //
+    // models.json defines custom providers (a local gateway, ollama, llama.cpp).
+    // Without it the sandbox can reach fewer models than the host, and a preset
+    // naming one fails with "Unknown provider". It holds no credentials —
+    // those are in auth.json, which only comes along when `auth` is on.
+    const hostAgentDir = path.join(homeDir, ".pi", "agent");
+    for (const [file, wanted] of [["models.json", true], ["auth.json", Boolean(sandbox.auth)]]) {
+      const source = path.join(hostAgentDir, file);
+      if (wanted && fs.existsSync(source)) {
+        args.push("-v", `${source}:${AGENT_DIR}/${file}:ro`);
+      }
     }
   }
 

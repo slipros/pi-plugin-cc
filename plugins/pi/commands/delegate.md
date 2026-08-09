@@ -1,6 +1,6 @@
 ---
 description: Hand a task to a pi agent, with a chosen model and system prompt
-argument-hint: '[--background|--wait] [--preset <name>] [--model <id>] [--system-prompt <name|@file|text>] [--thinking <level>] [--read-only] [--session last] <task>'
+argument-hint: '[--background|--wait] [--preset <name>] [--model <id>] [--system-prompt <name|@file|text>] [--thinking <level>] [--read-only] [--sandbox docker] [--session last] <task>'
 disable-model-invocation: false
 allowed-tools: Bash(node:*), Bash(git:*), Read, Glob, Grep, AskUserQuestion
 ---
@@ -17,6 +17,7 @@ Argument handling:
 - Profile: `--preset <name>` applies a full agent profile (model, thinking, system prompt, tools, extensions) from the config; individual flags `--model`, `--provider`, `--thinking` override single fields. If the user names a model that is not in the catalogue, the script warns and still passes it to pi — relay that warning.
 - System prompt: `--system-prompt <value>` takes a stored prompt name (`fixer`, `reviewer`, `adversarial`, `explorer`, or a project file in `.claude/pi/prompts/`), an `@path/to/file.md`, or inline text. `--append-system-prompt <text|@file>` adds to it. Without it, pi keeps its own coding-assistant prompt unless the config says otherwise.
 - By default the pi agent can edit files and run commands. Pass `--read-only` when the user only wants investigation.
+- Isolation: `--sandbox docker` runs the whole pi process in a container with only the workspace mounted. Pass it when the user asks for it, and suggest it for work on an untrusted repository or a long unattended run. It needs the image from `/pi:sandbox build`; the script fails with that instruction if it is missing.
 - `--session last` continues the most recent pi session in this workspace; `--fresh` forces a new one.
 
 Execution mode rules:
@@ -45,6 +46,7 @@ Bash({
 ```
 
 - Do not poll `BashOutput` in this turn.
-- Tell the user the job started and that `/pi:status` shows progress, `/pi:result` shows the answer.
+- Tell the user the job started and that `/pi:status` shows progress, `/pi:watch` shows the transcript and `/pi:result` shows the answer.
+- When checking on it in a later turn, use `watch <job-id> --tail 20` and then `watch <job-id> --since <cursor>` with the cursor from the previous output, so only new events come back. `watch --follow --for <seconds>` is the bounded way to look for a while; unbounded `--follow` never returns while the agent works.
 
 If the pi agent was allowed to write, remind the user at the end to review the resulting diff with `git diff` before committing.

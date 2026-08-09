@@ -63,6 +63,12 @@ export function renderSetupReport(report) {
     }
   }
   lines.push(`- Presets: ${report.presets.length ? report.presets.join(", ") : "none configured"}`);
+  if (report.sandbox) {
+    const state = report.sandbox.ready
+      ? `image \`${report.sandbox.image}\` is built`
+      : `image \`${report.sandbox.image}\` is not ready — run \`pi-companion.mjs sandbox build\``;
+    lines.push(`- Sandbox: ${report.sandbox.configured ?? "off by default"} · ${state}`);
+  }
   lines.push(`- System prompts: ${report.prompts.join(", ")}`);
   lines.push(`- Job state directory: \`${report.stateDir}\``);
 
@@ -144,10 +150,14 @@ export function renderModelsReport({ models, presets, prompts, defaults, search 
 }
 
 function renderRunHeader(title, { job, settings, execution }) {
+  // The effective thinking level comes back from pi's own state; the requested
+  // one is only a fallback for engines that never report it.
+  const thinking = execution?.thinkingLevel ?? settings.thinking ?? null;
   const meta = [
     `- Job: \`${job.id}\``,
     `- Model: ${execution?.model ? `\`${execution.model}\`` : settings.model ? `\`${settings.model}\`` : "pi default"}`,
-    settings.thinking ? `- Thinking: \`${settings.thinking}\`` : null,
+    thinking ? `- Thinking: \`${thinking}\`` : null,
+    settings.sandboxLabel ? `- Sandbox: ${settings.sandboxLabel}` : null,
     settings.presetName ? `- Preset: \`${settings.presetName}\`` : null,
     settings.promptLabel ? `- ${settings.promptLabel.replace(/^system prompt/, "System prompt")}` : null,
     settings.readOnly ? "- Tools: read-only (`read`, `grep`, `find`, `ls`)" : null,
@@ -161,6 +171,17 @@ function renderRunHeader(title, { job, settings, execution }) {
 
 export function renderRunResult({ title, job, settings, execution }) {
   const lines = renderRunHeader(title, { job, settings, execution });
+
+  // Setup problems that did not stop the run — a model the catalogue does not
+  // know, an extension the sandbox cannot see — belong in the report, not only
+  // in the job log where nobody looks until something breaks.
+  if (settings.warnings?.length) {
+    lines.push("## Warnings", "");
+    for (const warning of settings.warnings) {
+      lines.push(`- ${warning}`);
+    }
+    lines.push("");
+  }
 
   if (execution.errors?.length) {
     lines.push("## Problems", "");
@@ -182,6 +203,7 @@ export function renderBackgroundStart({ job, settings }) {
     "",
     `- Kind: ${job.kind}`,
     `- Model: ${settings.model ? `\`${settings.model}\`` : "pi default"}`,
+    settings.sandboxLabel ? `- Sandbox: ${settings.sandboxLabel}` : null,
     settings.promptName ? `- System prompt: \`${settings.promptName}\`` : null,
     "",
     "Check progress with `/pi:status`, read the answer with `/pi:result`, stop it with `/pi:cancel`."
@@ -284,6 +306,45 @@ export function renderStoredJobResult(job, stored) {
 
   lines.push("---", "");
   lines.push(stored?.rendered?.trim() || "_No stored output for this job._");
+
+  return joinLines(lines);
+}
+
+export function renderSandboxReport(report) {
+  const lines = ["# pi sandbox", ""];
+
+  lines.push(`- Mode: ${report.configured ? report.configured : "not configured (pass `--sandbox docker` to enable)"}`);
+  lines.push(`- Image: \`${report.image}\``);
+  lines.push(`- Dockerfile: \`${report.dockerfile}\``);
+
+  if (!report.dockerAvailable) {
+    lines.push("- Docker: **not on PATH**");
+    lines.push("", "Install Docker, then build the image with `pi-companion.mjs sandbox build`.");
+    return joinLines(lines);
+  }
+  if (report.daemonError) {
+    lines.push(`- Docker daemon: **unreachable** — ${report.daemonError}`);
+    return joinLines(lines);
+  }
+
+  lines.push(`- Docker daemon: ${report.daemon}`);
+  lines.push(
+    report.imagePresent
+      ? `- Image status: **built**${report.imageCreated ? ` (${report.imageCreated})` : ""}`
+      : "- Image status: **missing** — build it with `pi-companion.mjs sandbox build`"
+  );
+
+  lines.push("");
+  lines.push("## Containers");
+  lines.push("");
+  if (report.containers.length) {
+    for (const container of report.containers) {
+      lines.push(`- \`${container.name}\` — ${container.status} (${container.image})`);
+    }
+    lines.push("", "Remove finished ones with `pi-companion.mjs sandbox clean`.");
+  } else {
+    lines.push("- none");
+  }
 
   return joinLines(lines);
 }

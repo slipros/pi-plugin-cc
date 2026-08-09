@@ -25,6 +25,11 @@ const BUILT_IN = {
     provider: null,
     thinking: null,
     systemPrompt: null,
+    // Nobody is at the keyboard during a delegated run, so a question tool
+    // would burn a turn waiting for an answer that never comes. Set
+    // `"excludeTools": []` in a preset or config layer to hand it back.
+    excludeTools: ["ask_question"],
+    sandbox: null,
     timeoutMs: 1_800_000
   },
   presets: {},
@@ -169,6 +174,9 @@ export function resolveRunSettings(config, command, overrides = {}) {
     // tools without a preset having to know about them.
     extensions: mergeLists("extensions"),
     skills: mergeLists("skills"),
+    // Raw value; the caller normalizes it, because "docker" and a full sandbox
+    // object have to resolve to the same thing.
+    sandbox: pick("sandbox"),
     engine: pick("engine") ?? "rpc",
     timeoutMs: Number(pick("timeoutMs") ?? BUILT_IN.defaults.timeoutMs)
   };

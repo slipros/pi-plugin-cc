@@ -3,6 +3,7 @@ import process from "node:process";
 
 import { listModels } from "./models.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
+import { isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
 
@@ -124,7 +125,15 @@ export function buildPiArgs({
     }
   }
 
-  const toolAllowList = tools ?? (readOnly ? READ_ONLY_TOOLS.join(",") : null);
+  // An empty list is a deliberate "no restriction", so it must not turn into
+  // an empty --tools / --exclude-tools value.
+  const asToolList = (value) => {
+    const list = Array.isArray(value) ? value.join(",") : value;
+    return list ? String(list) : null;
+  };
+  const toolAllowList = asToolList(tools) ?? (readOnly ? READ_ONLY_TOOLS.join(",") : null);
+  const toolDenyList = asToolList(excludeTools);
+
   if (noTools) {
     args.push("--no-tools");
   } else {
@@ -132,10 +141,10 @@ export function buildPiArgs({
       args.push("--no-builtin-tools");
     }
     if (toolAllowList) {
-      args.push("--tools", Array.isArray(toolAllowList) ? toolAllowList.join(",") : toolAllowList);
+      args.push("--tools", toolAllowList);
     }
-    if (excludeTools) {
-      args.push("--exclude-tools", Array.isArray(excludeTools) ? excludeTools.join(",") : excludeTools);
+    if (toolDenyList) {
+      args.push("--exclude-tools", toolDenyList);
     }
   }
 
@@ -278,6 +287,7 @@ export function createTurnState() {
     assistantTexts: [],
     usage: {},
     model: null,
+    thinkingLevel: null,
     stopReason: null,
     errors: [],
     queue: { steering: [], followUp: [] },
@@ -301,13 +311,16 @@ export async function runPiTurn({
   onProgress = null,
   onSpawn = null,
   env = process.env,
+  sandbox = null,
+  jobId = null,
   ...options
 } = {}) {
   if (!prompt || !String(prompt).trim()) {
     throw new Error("Refusing to start pi with an empty prompt.");
   }
 
-  const args = buildPiArgs(options);
+  const piArgs = buildPiArgs(options);
+  const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
   const state = createTurnState();
   const report = (event) => {
     if (event && onProgress) {
@@ -315,18 +328,18 @@ export async function runPiTurn({
     }
   };
 
-  report({ phase: "starting", message: `Running ${PI_BINARY} ${redactArgs(args)}` });
+  report({ phase: "starting", message: `Running ${launch.command} ${redactArgs(launch.args)}` });
 
   // detached puts pi in its own process group, so cancelling a job can take
   // down the tools it spawned without touching the caller's shell.
-  const child = spawn(PI_BINARY, args, {
+  const child = spawn(launch.command, launch.args, {
     cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32"
   });
 
-  onSpawn?.(child.pid ?? null);
+  onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
 
   let stderr = "";
   let stdoutRest = "";
@@ -340,6 +353,10 @@ export async function runPiTurn({
             process.kill(-child.pid, "SIGKILL");
           } catch {
             child.kill("SIGKILL");
+          }
+          // Signalling the `docker run` client does not stop the container.
+          if (isSandboxed(sandbox)) {
+            removeSandboxContainer(launch.containerName);
           }
         }, timeoutMs)
       : null;
@@ -416,6 +433,7 @@ export async function runPiTurn({
     stderr: stderr.trim(),
     errors,
     timedOut,
-    command: `${PI_BINARY} ${redactArgs(args)}`
+    containerName: launch.containerName,
+    command: `${launch.command} ${redactArgs(launch.args)}`
   };
 }

@@ -183,3 +183,13 @@ test("unknown or malformed events are ignored", () => {
   assert.deepEqual(progress, []);
   assert.equal(state.settled, false);
 });
+
+test("an empty tool list means no restriction, not an empty flag value", () => {
+  const args = buildPiArgs({ tools: [], excludeTools: [] });
+  assert.deepEqual(args, ["--print", "--mode", "json"]);
+});
+
+test("excluded tools are passed as one comma separated list", () => {
+  const args = buildPiArgs({ excludeTools: ["ask_question", "bash"] });
+  assert.deepEqual(args.slice(3), ["--exclude-tools", "ask_question,bash"]);
+});

@@ -38,6 +38,19 @@ import { parseJsonLine } from "./lib/jsonl.mjs";
 import { runPiRpcTurn } from "./lib/rpc.mjs";
 import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
+  buildSandboxImage,
+  describeSandbox,
+  isSandboxed,
+  listSandboxContainers,
+  normalizeSandbox,
+  removeSandboxContainer,
+  sandboxDockerfile,
+  sandboxPreflight,
+  sandboxRunWarnings,
+  sandboxStatus,
+  DEFAULT_SANDBOX_IMAGE
+} from "./lib/sandbox.mjs";
+import {
   eventsPath,
   generateJobId,
   listJobs,
@@ -51,6 +64,7 @@ import {
   renderCancelReport,
   renderModelsReport,
   renderRunResult,
+  renderSandboxReport,
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult
@@ -86,7 +100,8 @@ const RUN_FLAGS = {
     "name",
     "base",
     "scope",
-    "engine"
+    "engine",
+    "sandbox"
   ],
   collect: ["append-system-prompt", "extension", "skill"],
   aliases: {
@@ -111,7 +126,8 @@ function usage() {
     "  pi-companion.mjs result [job-id] [--json]",
     "  pi-companion.mjs cancel [job-id] [--json]",
     "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
-    "  pi-companion.mjs watch [job-id] [--follow] [--tail <n>] [--json]",
+    "  pi-companion.mjs watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]",
+    "  pi-companion.mjs sandbox [status|build|clean] [--image <tag>] [--pi-version <v>]",
     "",
     "Run flags:",
     "  --model <id>            model id or pattern (provider/model[:thinking])",
@@ -137,7 +153,12 @@ function usage() {
     "  --skill <path>          load a pi skill; repeatable",
     "  --no-extensions         ignore discovered extensions",
     "  --no-skills             ignore discovered skills",
-    "  --engine rpc|json       rpc (default) keeps the run steerable"
+    "  --engine rpc|json       rpc (default) keeps the run steerable",
+    "",
+    "Isolation:",
+    "  --sandbox docker|none   run the whole pi process in a container",
+    "                          (workspace is bind mounted; build the image first",
+    "                          with `pi-companion.mjs sandbox build`)"
   ].join("\n");
 }
 
@@ -207,6 +228,7 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
     ...(flags["no-extensions"] ? { noExtensions: true } : {}),
     ...(flags["no-skills"] ? { noSkills: true } : {}),
     ...(flags.engine ? { engine: flags.engine } : {}),
+    ...(flags.sandbox ? { sandbox: flags.sandbox } : {}),
     ...(flags["read-only"] ? { readOnly: true } : {}),
     ...(flags.write ? { readOnly: false } : {}),
     ...(flags.timeout ? { timeoutMs: Number(flags.timeout) * 1000 } : {})
@@ -216,6 +238,24 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
 
   const warnings = [];
+  const sandbox = normalizeSandbox(settings.sandbox);
+  if (isSandboxed(sandbox)) {
+    // A missing daemon or image is a setup problem: fail before a job record
+    // exists rather than recording a run that never started.
+    const preflight = sandboxPreflight(sandbox);
+    if (!preflight.ok) {
+      throw new Error(`Sandbox is not ready.\n- ${preflight.errors.join("\n- ")}`);
+    }
+    warnings.push(
+      ...preflight.warnings,
+      ...sandboxRunWarnings(sandbox, {
+        workspaceRoot,
+        extensions: settings.extensions,
+        skills: settings.skills
+      })
+    );
+  }
+
   let catalogue = [];
   try {
     catalogue = listModels(PI_BINARY, { cwd: workspaceRoot });
@@ -233,6 +273,8 @@ function buildRunSettings({ command, flags, workspaceRoot, config }) {
 
   return {
     ...settings,
+    sandbox,
+    sandboxLabel: describeSandbox(sandbox),
     model: selection.model,
     provider: selection.provider,
     systemPromptText: prompt.systemPrompt,
@@ -274,6 +316,7 @@ async function executeRun({
     systemPromptName: settings.promptName,
     preset: settings.presetName,
     readOnly: settings.readOnly,
+    sandbox: settings.sandboxLabel,
     background: Boolean(flags.background),
     status: "pending",
     createdAt: nowIso()
@@ -325,10 +368,13 @@ async function executeRun({
       timeoutMs: settings.timeoutMs,
       eventsFile,
       inboxFile,
+      sandbox: settings.sandbox,
+      jobId,
       onProgress,
-      onSpawn: (piPid) => {
-        // Recorded so /pi:cancel can signal pi itself, not just this wrapper.
-        upsertJob(workspaceRoot, { id: jobId, piPid });
+      onSpawn: ({ pid: piPid, containerName }) => {
+        // Recorded so /pi:cancel can signal pi itself, not just this wrapper —
+        // and, in a sandbox, remove the container the signal cannot reach.
+        upsertJob(workspaceRoot, { id: jobId, piPid, containerName: containerName ?? null });
       }
     });
 
@@ -352,9 +398,17 @@ async function commandSetup(argv, workspaceRoot) {
   const { flags } = parseArgs(argv, { booleans: ["json"] });
   const availability = getPiAvailability(workspaceRoot);
   const { config, sources, errors } = loadConfig(workspaceRoot);
+  const configuredSandbox = normalizeSandbox(config.defaults?.sandbox ?? null);
 
   const payload = {
     ...availability,
+    sandbox: {
+      configured: describeSandbox(configuredSandbox),
+      image: isSandboxed(configuredSandbox) ? configuredSandbox.image : DEFAULT_SANDBOX_IMAGE,
+      ready: sandboxPreflight(
+        isSandboxed(configuredSandbox) ? configuredSandbox : { mode: "docker", image: DEFAULT_SANDBOX_IMAGE }
+      ).ok
+    },
     configSources: sources,
     configErrors: errors,
     presets: Object.keys(config.presets ?? {}),
@@ -541,11 +595,15 @@ function joinReport(lines) {
 
 /**
  * Replay (and optionally follow) a job's event stream as a readable transcript.
+ *
+ * A background job outlives the turn that started it, so watching has to work
+ * in slices: `--since` continues from the cursor the previous call printed, and
+ * `--for` bounds `--follow` so it always returns to the caller.
  */
 async function commandWatch(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, {
     booleans: ["json", "follow"],
-    strings: ["tail"]
+    strings: ["tail", "since", "for"]
   });
 
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
@@ -564,6 +622,15 @@ async function commandWatch(argv, workspaceRoot) {
 
   const file = target.eventsFile ?? eventsPath(workspaceRoot, target.id);
   const tailLimit = flags.tail ? Math.max(1, Number(flags.tail)) : null;
+  const since = flags.since ? Math.max(0, Number(flags.since)) : 0;
+  if (!Number.isFinite(since)) {
+    throw new Error(`--since expects a cursor number, got "${flags.since}".`);
+  }
+  const followSeconds = flags.for ? Number(flags.for) : null;
+  if (followSeconds != null && (!Number.isFinite(followSeconds) || followSeconds <= 0)) {
+    throw new Error(`--for expects a number of seconds, got "${flags.for}".`);
+  }
+  const deadline = followSeconds ? Date.now() + followSeconds * 1000 : null;
 
   const readEvents = (fromLine) => {
     if (!fs.existsSync(file)) {
@@ -576,31 +643,48 @@ async function commandWatch(argv, workspaceRoot) {
     };
   };
 
-  const initial = readEvents(0);
+  const initial = readEvents(since);
   if (flags.json) {
-    output("", { job: target, events: initial.events }, true);
+    output("", { job: target, events: initial.events, cursor: initial.nextLine, since }, true);
     return 0;
   }
 
+  // Rendering is stateful (tool calls pair up with their results), so a run
+  // that starts mid-stream replays the skipped events into a throwaway state.
   const state = {};
+  if (since > 0) {
+    for (const event of readEvents(0).events.slice(0, since)) {
+      renderTranscriptEvent(event, state);
+    }
+  }
+
   let lines = initial.events.flatMap((event) => renderTranscriptEvent(event, state));
   if (tailLimit) {
     lines = lines.slice(-tailLimit);
   }
 
+  const cursorHint = (cursor, status) =>
+    `\n_Cursor ${cursor}${status === "running" ? `; continue with \`watch ${target.id} --since ${cursor}\`` : ""}._\n`;
+
   process.stdout.write(
     `# pi transcript — \`${target.id}\` (${target.status})\n${target.title ? `\n${target.title}\n` : ""}\n`
   );
-  process.stdout.write(lines.length ? `${lines.join("\n")}\n` : "_No events recorded yet._\n");
+  process.stdout.write(
+    lines.length ? `${lines.join("\n")}\n` : since ? "_Nothing new since the last check._\n" : "_No events recorded yet._\n"
+  );
 
   if (!flags.follow) {
     if (target.status === "running") {
-      process.stdout.write("\n_Job is still running. Re-run watch, or add --follow to stream it live._\n");
+      process.stdout.write(
+        "\n_Job is still running. Re-run watch, or add --follow (with --for <seconds> to bound it)._"
+      );
     }
+    process.stdout.write(cursorHint(initial.nextLine, target.status));
     return 0;
   }
 
-  // Follow mode: stream until the job stops running and the file is drained.
+  // Follow mode: stream until the job stops running and the file is drained,
+  // or until the --for deadline, whichever comes first.
   let cursor = initial.nextLine;
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, 400));
@@ -615,9 +699,77 @@ async function commandWatch(argv, workspaceRoot) {
     const current = enrichJob(listJobs(workspaceRoot).find((job) => job.id === target.id) ?? target);
     if (current.status !== "running" && !next.events.length) {
       process.stdout.write(`\n■ job ${current.status}\n`);
+      process.stdout.write(cursorHint(cursor, current.status));
+      return 0;
+    }
+    if (deadline && Date.now() >= deadline) {
+      process.stdout.write(`\n■ still ${current.status} after ${followSeconds}s\n`);
+      process.stdout.write(cursorHint(cursor, current.status));
       return 0;
     }
   }
+}
+
+/**
+ * Manage the container image the sandbox runs in.
+ *
+ * The image is pinned to the host pi version by default, so a sandboxed agent
+ * behaves like the one running on the host instead of drifting to whatever npm
+ * publishes next.
+ */
+async function commandSandbox(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, {
+    booleans: ["json", "no-cache"],
+    strings: ["image", "pi-version"]
+  });
+
+  const action = positional[0] ?? "status";
+  const { config } = loadConfig(workspaceRoot);
+  const configured = normalizeSandbox(config.defaults?.sandbox ?? null);
+  const image = flags.image ?? (isSandboxed(configured) ? configured.image : DEFAULT_SANDBOX_IMAGE);
+
+  if (action === "build") {
+    const piVersion = flags["pi-version"] ?? getPiAvailability(workspaceRoot).version ?? null;
+    process.stderr.write(
+      `Building \`${image}\` from ${sandboxDockerfile()}${piVersion ? ` with pi ${piVersion}` : ""}.\n`
+    );
+    const build = buildSandboxImage({ image, piVersion, noCache: Boolean(flags["no-cache"]) });
+    const payload = { action, image, piVersion, status: build.status, command: build.command };
+    output(
+      build.status === 0
+        ? `Built sandbox image \`${image}\`${piVersion ? ` with pi ${piVersion}` : ""}.\n`
+        : `Failed to build \`${image}\` (docker exited ${build.status}).\n`,
+      payload,
+      Boolean(flags.json)
+    );
+    return build.status === 0 ? 0 : 1;
+  }
+
+  if (action === "clean") {
+    const containers = listSandboxContainers();
+    const removed = containers.filter((container) => removeSandboxContainer(container.name));
+    const payload = { action, removed: removed.map((container) => container.name) };
+    output(
+      removed.length
+        ? `Removed ${removed.length} sandbox container(s): ${removed.map((c) => `\`${c.name}\``).join(", ")}.\n`
+        : "No sandbox containers to remove.\n",
+      payload,
+      Boolean(flags.json)
+    );
+    return 0;
+  }
+
+  if (action !== "status") {
+    throw new Error(`Unknown sandbox action "${action}". Use status, build or clean.`);
+  }
+
+  const report = {
+    ...sandboxStatus(isSandboxed(configured) ? configured : { image }),
+    image,
+    configured: describeSandbox(configured)
+  };
+  output(renderSandboxReport(report), report, Boolean(flags.json));
+  return 0;
 }
 
 async function commandCancel(argv, workspaceRoot) {
@@ -648,6 +800,13 @@ async function commandCancel(argv, workspaceRoot) {
       cancelled = piStopped || wrapperStopped;
     }
 
+    // Signals reach the `docker run` client, never the container behind it, so
+    // a sandboxed job is only really stopped once the container is gone.
+    if (job.containerName) {
+      const removed = removeSandboxContainer(job.containerName);
+      cancelled = cancelled || removed;
+    }
+
     const record = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() };
     upsertJob(workspaceRoot, record);
     // Keep whatever the run already stored (partial output, session id) and
@@ -672,7 +831,8 @@ const COMMANDS = {
   result: commandResult,
   cancel: commandCancel,
   steer: commandSteer,
-  watch: commandWatch
+  watch: commandWatch,
+  sandbox: commandSandbox
 };
 
 async function main() {

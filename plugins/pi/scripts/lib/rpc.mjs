@@ -5,6 +5,7 @@ import process from "node:process";
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
 import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs } from "./pi.mjs";
+import { isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 const SETTLE_GRACE_MS = 1500;
 const SHUTDOWN_GRACE_MS = 5000;
@@ -26,13 +27,16 @@ export async function runPiRpcTurn({
   inboxFile = null,
   settleGraceMs = SETTLE_GRACE_MS,
   env = process.env,
+  sandbox = null,
+  jobId = null,
   ...options
 } = {}) {
   if (!prompt || !String(prompt).trim()) {
     throw new Error("Refusing to start pi with an empty prompt.");
   }
 
-  const args = buildPiArgs({ ...options, mode: "rpc" });
+  const piArgs = buildPiArgs({ ...options, mode: "rpc" });
+  const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
   const state = createTurnState();
   const report = (event) => {
     if (event && onProgress) {
@@ -40,15 +44,15 @@ export async function runPiRpcTurn({
     }
   };
 
-  report({ phase: "starting", message: `Running ${PI_BINARY} ${redactArgs(args)}` });
+  report({ phase: "starting", message: `Running ${launch.command} ${redactArgs(launch.args)}` });
 
-  const child = spawn(PI_BINARY, args, {
+  const child = spawn(launch.command, launch.args, {
     cwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32"
   });
-  onSpawn?.(child.pid ?? null);
+  onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
 
   let stderr = "";
   let settledAt = null;
@@ -83,8 +87,15 @@ export async function runPiRpcTurn({
     }
 
     if (event.type === "response") {
-      if (event.command === "get_state" && event.data?.sessionId) {
-        state.sessionId = String(event.data.sessionId);
+      if (event.command === "get_state" && event.data) {
+        if (event.data.sessionId) {
+          state.sessionId = String(event.data.sessionId);
+        }
+        // The effective thinking level, which is what pi resolved from flags,
+        // settings and the model — not necessarily what the caller asked for.
+        if (event.data.thinkingLevel) {
+          state.thinkingLevel = String(event.data.thinkingLevel);
+        }
       }
       if (event.success === false) {
         const detail = event.error ?? event.message ?? "unknown error";
@@ -153,12 +164,21 @@ export async function runPiRpcTurn({
 
   const inbox = inboxFile ? createInboxWatcher(inboxFile, handleControl) : null;
 
+  // Killing the `docker run` client leaves the container running, so a
+  // sandboxed job has to be stopped on the docker side as well.
+  const stop = () => {
+    killTree(child);
+    if (isSandboxed(sandbox)) {
+      removeSandboxContainer(launch.containerName);
+    }
+  };
+
   let timedOut = false;
   const hardTimer =
     timeoutMs > 0
       ? setTimeout(() => {
           timedOut = true;
-          killTree(child);
+          stop();
         }, timeoutMs)
       : null;
 
@@ -196,7 +216,7 @@ export async function runPiRpcTurn({
     closed,
     new Promise((resolve) =>
       setTimeout(() => {
-        killTree(child);
+        stop();
         resolve(closed);
       }, SHUTDOWN_GRACE_MS).unref?.()
     )
@@ -234,12 +254,14 @@ export async function runPiRpcTurn({
     queue: state.queue,
     steering: delivered,
     aborted,
+    thinkingLevel: state.thinkingLevel ?? null,
     exitStatus: errors.length ? 1 : (exitStatus ?? 0),
     stderr: stderr.trim(),
     errors,
     timedOut,
     closing,
-    command: `${PI_BINARY} ${redactArgs(args)}`
+    containerName: launch.containerName,
+    command: `${launch.command} ${redactArgs(launch.args)}`
   };
 }
 

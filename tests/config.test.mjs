@@ -118,3 +118,29 @@ test("timeout falls back to the built-in default", () => {
   assert.equal(resolveRunSettings(CONFIG, "review").timeoutMs, BUILT_IN_CONFIG.defaults.timeoutMs);
   assert.equal(resolveRunSettings(CONFIG, "review", { timeoutMs: 5000 }).timeoutMs, 5000);
 });
+
+test("the question tool is excluded by default, since nobody is at the keyboard", () => {
+  assert.deepEqual(resolveRunSettings(CONFIG, "delegate").excludeTools, ["ask_question"]);
+});
+
+test("a preset can hand the question tool back with an empty exclude list", () => {
+  const config = { ...CONFIG, presets: { ...CONFIG.presets, chatty: { excludeTools: [] } } };
+  assert.deepEqual(resolveRunSettings(config, "delegate", { preset: "chatty" }).excludeTools, []);
+});
+
+test("sandbox is resolved through the same layers as everything else", () => {
+  const config = {
+    ...CONFIG,
+    presets: { ...CONFIG.presets, caged: { sandbox: { mode: "docker", image: "custom:1" } } }
+  };
+  assert.equal(resolveRunSettings(config, "delegate").sandbox, null);
+  assert.deepEqual(resolveRunSettings(config, "delegate", { preset: "caged" }).sandbox, {
+    mode: "docker",
+    image: "custom:1"
+  });
+  assert.equal(
+    resolveRunSettings(config, "delegate", { preset: "caged", sandbox: "none" }).sandbox,
+    "none",
+    "a flag can switch the preset's sandbox off"
+  );
+});

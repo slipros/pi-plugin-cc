@@ -10,10 +10,11 @@ Prefer the companion script over raw `pi` calls: it tracks the job, captures the
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" delegate --preset deep "task text"
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" review --base main
-node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" watch [job-id] [--follow] [--tail n]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" watch [job-id] [--since n] [--follow [--for s]] [--tail n]
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" steer [job-id] [--follow-up] "instruction"
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" status|result|cancel [job-id]
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" models [search]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" sandbox [status|build|clean]
 ```
 
 ## Raw pi invocation
@@ -47,7 +48,18 @@ Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
 - `--exclude-tools bash` denies specific tools; `--no-builtin-tools` keeps only extension tools; `--no-tools` disables everything.
 - `--extension <path|npm:pkg|git-url>` (repeatable) is how pi gains tools beyond the built-ins; `--skill <path>` loads a pi skill. `--no-extensions` / `--no-skills` ignore whatever was discovered.
 - MCP servers reach pi through the `pi-mcp-adapter` extension, which reads `.mcp.json` / `~/.config/mcp/mcp.json` and exposes servers behind one proxy tool instead of dumping every tool definition into context.
-- pi has **no sandbox**: `bash`, `edit` and `write` act with the permissions of the process. Only enable them when the task genuinely needs to change the repository.
+- pi has **no sandbox of its own**: `bash`, `edit` and `write` act with the permissions of the process. Only enable them when the task genuinely needs to change the repository.
+
+### Sandboxing
+
+The companion's `--sandbox docker` runs the whole pi process in a container built from the plugin's Dockerfile (`sandbox build` builds it, pinned to the installed pi version). Only the workspace is bind mounted, at `/workspace`; the agent directory is a named volume with the host `auth.json` mounted read-only, and the container runs under the caller's uid so files written through the mount stay owned by them.
+
+Consequences worth knowing before using it:
+
+- Host-path extensions and skills do not exist inside the container; `npm:` and `git:` sources are installed there instead.
+- Sessions live in the volume, so host sessions and sandboxed sessions are separate histories.
+- Signals only reach the `docker run` client, never the container — the companion removes the container by name, which is why every job carries one.
+- Extensions still run wherever the pi process runs. Routing tools into a VM instead (Gondolin) is a different pattern and is not what `--sandbox docker` does.
 
 ### RPC mode: steering a live run
 

@@ -22,6 +22,7 @@ Useful flags:
 - `--append-system-prompt <text|@file>` — extend the prompt without replacing it.
 - `--extension <source>` / `--skill <path>` — give the agent more tools (e.g. `npm:pi-mcp-adapter` for MCP).
 - `--read-only` — restrict pi to `read`, `grep`, `find`, `ls`.
+- `--sandbox docker` — run the whole pi process in a container with only the workspace mounted. Needs the image from `... sandbox build`; the script says so when it is missing.
 - `--session last` — continue the previous pi session in this workspace.
 - `--timeout <seconds>` — hard limit; the default is 30 minutes.
 

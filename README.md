@@ -16,6 +16,7 @@ Built in the shape of the official [Codex plugin](https://github.com/openai/code
 | `/pi:status` | Running and recent pi jobs for this workspace. |
 | `/pi:result` | Stored output of a finished job. |
 | `/pi:cancel` | Stop a running job (soft abort first). |
+| `/pi:sandbox` | Build and inspect the container image runs are isolated in. |
 | `/pi:setup` | Check that pi is installed, authenticated and configured. |
 
 Plus the `pi:pi-delegate` subagent (so Claude can delegate without a slash command) and the `pi-cli-runtime` skill (so Claude knows how pi's flags, sessions and event stream behave).
@@ -115,7 +116,9 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
 }
 ```
 
-**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Define them once and run `--preset dba`.
+**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Define them once and run `--preset dba`.
+
+One default is set for you: `excludeTools` is `["ask_question"]`, because a delegated run has nobody at the keyboard and a question tool would burn a turn waiting for an answer that never comes. Set `"excludeTools": []` in any layer to hand it back.
 
 Values resolve layer by layer, highest first: command-line flags → preset → per-command defaults → global defaults. The system prompt is chosen as a unit, so `--system-prompt` on the command line replaces a preset's prompt outright; `appendSystemPrompt`, `extensions` and `skills` stack across layers instead of replacing each other.
 
@@ -138,20 +141,72 @@ Anything beyond the built-ins comes from pi extensions — including MCP servers
 /pi:delegate --no-extensions                  clean run, no third-party tools
 ```
 
-pi has **no sandbox** — `bash`, `edit` and `write` run with your permissions. `/pi:review` is always read-only; `/pi:delegate` allows writes by default. A delegated run that edited files leaves those edits in your working tree: review them with `git diff` before committing, the plugin never commits anything.
+pi itself has **no sandbox** — by default `bash`, `edit` and `write` run with your permissions. `/pi:review` is always read-only; `/pi:delegate` allows writes by default. A delegated run that edited files leaves those edits in your working tree: review them with `git diff` before committing, the plugin never commits anything. For real isolation, see the next section.
+
+## Sandboxing a run
+
+`--sandbox docker` runs the whole pi process inside a container: built-in tools, `!` commands and extensions all execute there, and the only thing mounted from the host is the workspace.
+
+```bash
+/pi:sandbox build                    # build the image (pinned to your pi version)
+/pi:delegate --sandbox docker        rewrite this module and run the tests
+/pi:sandbox                          # image state and leftover containers
+/pi:sandbox clean                    # remove containers a crash left behind
+```
+
+What the container gets:
+
+| | |
+| --- | --- |
+| Workspace | bind mounted at `/workspace`, read-write — edits land in your tree as usual |
+| Agent directory | a named docker volume, so host settings, sessions and installed pi packages stay out |
+| Credentials | `~/.pi/agent/auth.json` bind mounted read-only, so providers work without the rest of `~/.pi/agent` |
+| Identity | your uid/gid, so files written through the mount are not owned by root |
+| Network | on by default, because the model call needs it |
+
+The rest of your home directory, your SSH keys and everything outside the workspace are simply not there. Sessions live in the volume, so `--session last` keeps working across sandboxed runs — but a session started on the host cannot be continued in the sandbox, and vice versa.
+
+Extensions loaded from host paths (`--extension ~/.pi/agent/extensions/…`) do not exist inside the container; the plugin warns when a run asks for one. `npm:` and `git:` sources are fetched inside the container and work normally.
+
+The profile is configurable per preset, in full:
+
+```json
+"presets": {
+  "caged": {
+    "model": "opencode-go/kimi-k3",
+    "sandbox": {
+      "mode": "docker",
+      "image": "pi-plugin-sandbox:latest",
+      "network": "bridge",
+      "agentDir": "volume",
+      "env": ["ANTHROPIC_API_KEY"],
+      "mounts": ["/opt/toolchain:/opt/toolchain:ro"],
+      "args": ["--memory=4g"]
+    }
+  }
+}
+```
+
+`"sandbox": "docker"` is shorthand for the defaults, and `--sandbox none` switches a preset's sandbox back off for one run.
+
+Two limits worth knowing: the workspace bind mount is read-write, so a sandboxed agent can still rewrite your checkout (that is the point — the isolation is about the rest of the machine), and the container-local agent directory means the extensions and skills you installed on the host are absent unless the preset asks for them explicitly.
 
 ## Watching and steering a running agent
 
 Delegated runs are not black boxes. Every job records pi's full event stream, and the run stays reachable while it works.
 
 ```bash
-/pi:watch                 # what is the agent doing right now
-/pi:watch --tail 20       # just the tail
-/pi:watch <job> --follow  # live stream until the job ends
+/pi:watch                        # what is the agent doing right now
+/pi:watch --tail 20              # just the tail
+/pi:watch <job> --since 149      # only what happened since the last check
+/pi:watch <job> --follow --for 30  # stream for 30 seconds, then return
+/pi:watch <job> --follow         # stream until the job ends
 
 /pi:steer  hold on — stop reading files and start editing
 /pi:steer  --follow-up  when you are done, add tests
 ```
+
+Every snapshot ends with a cursor, and `--since <cursor>` picks up from there. That is what makes a background job followable from inside a Claude Code turn: check in, get only the new events, steer if needed, check in again. `--follow` on its own never returns while the agent works, so pair it with `--for <seconds>` unless you are running it yourself in a terminal.
 
 A steering message is delivered after the agent's current turn finishes its tool calls and **before the next model call**, so it redirects work in progress instead of interrupting a tool mid-run. `--follow-up` waits until the agent is otherwise done. If the job already settled, the message is sent as a new prompt in the same pi session.
 

@@ -316,6 +316,19 @@ export function buildDockerRunArgs({
 
   const agent = resolveAgentMount(sandbox, homeDir);
   args.push("-v", `${agent.source}:${AGENT_DIR}`);
+  if (sandbox.credentialProxy) {
+    // pi is started with the masked provider, so the files describing it have to
+    // be there whatever the agent directory is. Tied to `isolated` before, a
+    // profile with `agentDir: host` started every run with "Unknown provider".
+    const credentials = writeProxyCredentials(sandbox);
+    const models = writeProxyModels(hostAgentDirOf(homeDir), sandbox);
+    if (credentials) {
+      args.push("-v", `${credentials}:${AGENT_DIR}/auth.json:ro`);
+    }
+    if (models) {
+      args.push("-v", `${models}:${AGENT_DIR}/models.json:ro`);
+    }
+  }
   if (agent.isolated) {
     // pi resolves `fd` and `rg` from its own tools directory before PATH, and
     // that directory is in a volume every run shares. Left writable, one run can
@@ -336,16 +349,12 @@ export function buildDockerRunArgs({
     // With a proxy in front, the container's provider table points at it rather
     // than at the model host: the run reaches models exactly as before, it just
     // never learns the address or the key of the real endpoint.
-    const models = sandbox.credentialProxy
-      ? writeProxyModels(hostAgentDir, sandbox)
-      : path.join(hostAgentDir, "models.json");
+    const models = sandbox.credentialProxy ? null : path.join(hostAgentDir, "models.json");
     if (models && fs.existsSync(models)) {
       args.push("-v", `${models}:${AGENT_DIR}/models.json:ro`);
     }
-    if (sandbox.auth) {
-      const credentials = sandbox.credentialProxy
-        ? writeProxyCredentials(sandbox)
-        : resolveCredentialsMount(hostAgentDir, sandbox.provider ?? null);
+    if (sandbox.auth && !sandbox.credentialProxy) {
+      const credentials = resolveCredentialsMount(hostAgentDir, sandbox.provider ?? null);
       if (credentials) {
         args.push("-v", `${credentials}:${AGENT_DIR}/auth.json:ro`);
       }
@@ -360,6 +369,11 @@ export function buildDockerRunArgs({
   args.push(sandbox.image || DEFAULT_SANDBOX_IMAGE);
   args.push(...piArgs);
   return args;
+}
+
+/** Where the host keeps pi's own agent directory. */
+function hostAgentDirOf(homeDir) {
+  return path.join(homeDir, ".pi", "agent");
 }
 
 /** An empty directory that exists, for mounting over something that must not be written. */

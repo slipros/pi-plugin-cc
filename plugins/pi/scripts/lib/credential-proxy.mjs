@@ -30,6 +30,9 @@ import { runCommand } from "./process.mjs";
 /** Requests hang here rather than at the model: generous, but not unbounded. */
 const UPSTREAM_TIMEOUT_MS = 600_000;
 
+/** Ceiling on a buffered request body; prompts are large, but not this large. */
+const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+
 /**
  * Read the provider table the host uses.
  *
@@ -166,6 +169,35 @@ function resolveTarget(upstream, requestUrl) {
   return target;
 }
 
+/** Thinking levels pi accepts as a `model:level` suffix. */
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/**
+ * The model id a provider expects, taken from what the caller asked for.
+ *
+ * Only the provider prefix comes off, and only the first one: model ids at
+ * openrouter, huggingface and the gateways contain slashes of their own
+ * (`openrouter/deepseek/deepseek-v4-flash-0731` names the model
+ * `deepseek/deepseek-v4-flash-0731`), so cutting at the last slash produced an
+ * id no provider has ever heard of. A trailing thinking level is pi's own
+ * syntax and travels as a flag, not as part of the name.
+ */
+export function modelIdFor(provider, model) {
+  if (!model) {
+    return null;
+  }
+  let id = String(model);
+  const prefix = provider ? `${provider}/` : null;
+  if (prefix && id.startsWith(prefix)) {
+    id = id.slice(prefix.length);
+  }
+  const suffix = id.match(/:([a-z]+)$/i);
+  if (suffix && THINKING_LEVELS.has(suffix[1].toLowerCase())) {
+    id = id.slice(0, -suffix[0].length);
+  }
+  return id;
+}
+
 /** Name the container sees instead of the provider's own. */
 export const MASKED_PROVIDER = "sandbox";
 /** Name the container sees instead of the model's own. */
@@ -246,7 +278,7 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
   // The container is told it is talking to a generic endpoint. Which model
   // actually answers is decided here, so an agent cannot quietly move itself to
   // a bigger one — the bill for that arrives on the host, not in the sandbox.
-  const realModel = model ? String(model).split("/").pop() : null;
+  const realModel = modelIdFor(provider, model);
   const upstream = new URL(endpoint.baseUrl);
   const transport = upstream.protocol === "http:" ? http : https;
 
@@ -273,9 +305,12 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
     }
     const headers = { ...request.headers };
     // Host must match the upstream, and hop-by-hop headers are ours to set.
-    delete headers.host;
-    delete headers.connection;
-    delete headers["content-length"];
+    // transfer-encoding especially: leaving it while adding content-length
+    // makes the framing ambiguous, and a correct server answers 400 rather
+    // than guess which one to believe.
+    for (const header of ["host", "connection", "content-length", "transfer-encoding", "keep-alive", "te", "trailer", "upgrade", "proxy-authorization"]) {
+      delete headers[header];
+    }
     headers.authorization = `Bearer ${credential}`;
 
     const forward = (body) => {
@@ -292,6 +327,12 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
           // blob. Only the request is ever held whole, and only to rename a
           // model — responses stay a stream.
           upstreamResponse.pipe(response);
+          // pipe() detaches on a source error without closing the destination,
+          // so a provider that drops mid-stream left the agent waiting for a
+          // response that would never end — until the run's own timeout, half
+          // an hour later. Ending the socket makes it a read error it can retry.
+          upstreamResponse.on("error", () => response.destroy());
+          upstreamResponse.on("aborted", () => response.destroy());
         }
       );
 
@@ -321,8 +362,27 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
     // passed through untouched rather than rejected: the proxy is not the place
     // to decide what a provider accepts.
     const chunks = [];
-    request.on("data", (chunk) => chunks.push(chunk));
+    let size = 0;
+    let refused = false;
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      // The body is held whole only to rename a model. Without a ceiling the
+      // agent — which legitimately holds the token — could exhaust the host
+      // process with one large POST.
+      if (size > MAX_REQUEST_BODY_BYTES && !refused) {
+        refused = true;
+        response.writeHead(413, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "Request body too large for the proxy." } }));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("error", () => response.destroy());
     request.on("end", () => {
+      if (refused) {
+        return;
+      }
       const raw = Buffer.concat(chunks);
       try {
         const payload = JSON.parse(raw.toString("utf8"));
@@ -336,7 +396,6 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
       }
       forward(raw);
     });
-    request.on("error", () => response.destroy());
   });
 
   await new Promise((resolve, reject) => {
@@ -344,6 +403,10 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
     // Loopback only: the container reaches it through the host gateway, and
     // nothing outside this machine can.
     server.listen(0, "127.0.0.1", resolve);
+    // A listening socket keeps the event loop alive: an early throw between
+    // starting the proxy and closing it left the CLI hanging forever, with the
+    // run token still answering on loopback.
+    server.unref();
   });
 
   const { port } = server.address();

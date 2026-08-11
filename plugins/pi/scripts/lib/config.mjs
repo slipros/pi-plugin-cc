@@ -178,7 +178,19 @@ export function mergeConfigLayer(base, layer) {
  * may still describe its own model, prompts and toolchain — that is what the
  * project layer is for.
  */
-const PROJECT_FORBIDDEN_SANDBOX_KEYS = ["args", "mounts", "agentDir", "user", "image", "auth", "network"];
+const PROJECT_FORBIDDEN_SANDBOX_KEYS = [
+  "args",
+  "mounts",
+  "agentDir",
+  "user",
+  "image",
+  "auth",
+  "network",
+  // `{"mode": "none"}` disables the sandbox exactly like the string form does.
+  "mode",
+  "env",
+  "proxyCredentials"
+];
 
 function sanitizeUntrustedEntry(entry, path, warnings) {
   if (!isPlainObject(entry)) {
@@ -191,10 +203,20 @@ function sanitizeUntrustedEntry(entry, path, warnings) {
     delete clean.mounts;
   }
 
+  if ("env" in clean) {
+    // A bare NAME forwards the host's value into a container the repository
+    // controls, so the repository would be choosing which host variables leak.
+    warnings.push(`${path}.env ignored: the project config cannot pass host environment into the container.`);
+    delete clean.env;
+  }
+
   if ("sandbox" in clean) {
     const sandbox = clean.sandbox;
     const disables =
-      sandbox == null || sandbox === false || (typeof sandbox === "string" && /^(none|off|false|no)$/i.test(sandbox.trim()));
+      sandbox == null ||
+      sandbox === false ||
+      (typeof sandbox === "string" && /^(none|off|false|no)$/i.test(sandbox.trim())) ||
+      (isPlainObject(sandbox) && typeof sandbox.mode === "string" && /^(none|off|false|no)$/i.test(sandbox.mode.trim()));
     if (disables) {
       warnings.push(`${path}.sandbox ignored: the project config cannot turn the sandbox off.`);
       delete clean.sandbox;
@@ -228,16 +250,23 @@ export function sanitizeProjectLayer(layer, warnings = []) {
   if (isPlainObject(clean.defaults)) {
     clean.defaults = sanitizeUntrustedEntry(clean.defaults, "defaults", warnings);
   }
-  for (const section of ["presets", "sandboxProfiles"]) {
+  for (const section of ["presets", "sandboxProfiles", "commands"]) {
     if (!isPlainObject(clean[section])) {
       continue;
     }
     const entries = {};
     for (const [name, entry] of Object.entries(clean[section])) {
-      entries[name] =
-        section === "sandboxProfiles"
-          ? sanitizeUntrustedEntry({ sandbox: entry }, `${section}.${name}`, warnings).sandbox ?? entry
-          : sanitizeUntrustedEntry(entry, `${section}.${name}`, warnings);
+      if (section === "sandboxProfiles") {
+        const checked = sanitizeUntrustedEntry({ sandbox: entry }, `${section}.${name}`, warnings);
+        // A profile the sanitizer rejected outright is dropped, not restored:
+        // `?? entry` used to hand the original value straight back, so a profile
+        // of "none" printed a warning and disabled the sandbox anyway.
+        if ("sandbox" in checked) {
+          entries[name] = checked.sandbox;
+        }
+        continue;
+      }
+      entries[name] = sanitizeUntrustedEntry(entry, `${section}.${name}`, warnings);
     }
     clean[section] = entries;
   }

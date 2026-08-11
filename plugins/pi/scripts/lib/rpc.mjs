@@ -6,6 +6,7 @@ import process from "node:process";
 
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
+import { runCommand } from "./process.mjs";
 import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs, summarizeTiming } from "./pi.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
@@ -50,8 +51,21 @@ async function openCredentialProxy(sandbox, onProgress, model) {
     if (proxy) {
       onProgress?.({ phase: "starting", message: `Credentials stay on the host: ${sandbox.provider} goes through a run-scoped proxy.` });
     }
+    if (!proxy) {
+      // Falling back means the provider's own credential goes into the
+      // container. That is a downgrade of the boundary and has to be audible,
+      // not a silent difference between two runs that look identical.
+      onProgress?.({
+        phase: "starting",
+        message: `Credential proxy unavailable for ${sandbox.provider}; mounting that provider's credential instead.`
+      });
+    }
     return proxy;
-  } catch {
+  } catch (error) {
+    onProgress?.({
+      phase: "starting",
+      message: `Credential proxy could not start (${error instanceof Error ? error.message : String(error)}); falling back to mounting credentials.`
+    });
     return null;
   }
 }
@@ -109,9 +123,26 @@ export async function runPiRpcTurn({
     detached: process.platform !== "win32"
   });
   onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
-  // The container exists now, so docker ps can see it and the reservation
-  // that covered the gap is no longer needed.
-  slot.release?.();
+  // `spawn` returns before the docker client has even exec'd, so releasing here
+  // would restore the very race the reservation exists for. The reservation
+  // expires on its own; releasing it early is only an optimisation, and it can
+  // wait until the container is actually visible.
+  const releaseSlotWhenVisible = () => {
+    if (!launch.containerName) {
+      slot.release?.();
+      return;
+    }
+    const deadline = Date.now() + 15_000;
+    const poll = setInterval(() => {
+      const visible = runCommand("docker", ["ps", "--filter", `name=${launch.containerName}`, "--format", "{{.Names}}"]);
+      if (Date.now() >= deadline || String(visible.stdout ?? "").includes(launch.containerName)) {
+        clearInterval(poll);
+        slot.release?.();
+      }
+    }, 500);
+    poll.unref?.();
+  };
+  releaseSlotWhenVisible();
 
   let stderr = "";
   let settledAt = null;

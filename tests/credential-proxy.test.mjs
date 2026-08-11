@@ -242,3 +242,53 @@ test("behavioural fields survive the mask, since they change how pi talks", asyn
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("only the provider prefix is stripped, so ids containing slashes survive", async () => {
+  const { modelIdFor } = await import("../plugins/pi/scripts/lib/credential-proxy.mjs");
+
+  // Model ids at openrouter and the gateways contain slashes of their own;
+  // cutting at the last one produced a name no provider knows.
+  assert.equal(modelIdFor("openrouter", "openrouter/deepseek/deepseek-v4-flash-0731"), "deepseek/deepseek-v4-flash-0731");
+  assert.equal(modelIdFor("openrouter", "openrouter/anthropic/claude-sonnet-4.5"), "anthropic/claude-sonnet-4.5");
+  assert.equal(modelIdFor("ollama-pro", "ollama-pro/deepseek-v4-flash:0731"), "deepseek-v4-flash:0731");
+
+  // A thinking level is pi's own syntax and travels as a flag…
+  assert.equal(modelIdFor("opencode-go", "opencode-go/glm-5.2:high"), "glm-5.2");
+  // …while a colon that is part of the id stays put.
+  assert.equal(modelIdFor("ollama-pro", "deepseek-v4-flash:preview"), "deepseek-v4-flash:preview");
+});
+
+test("a provider that drops mid-stream ends the client instead of hanging it", async () => {
+  const http = await import("node:http");
+  const { startCredentialProxy } = await import("../plugins/pi/scripts/lib/credential-proxy.mjs");
+
+  // Upstream writes two chunks and destroys the socket, the way a provider does
+  // when it fails halfway through a stream.
+  const flaky = http.createServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write("data: one\n\n");
+    setTimeout(() => response.destroy(), 20);
+  });
+  await new Promise((resolve) => flaky.listen(0, "127.0.0.1", resolve));
+
+  const home = fakeHome(flaky.address().port);
+  const proxy = await startCredentialProxy({ homeDir: home, provider: "test-provider", authEntry: { key: "k" } });
+  const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+
+  try {
+    // Without the error handler this read never settles and the run waits for
+    // its own timeout — half an hour by default.
+    const settled = await Promise.race([
+      fetch(`${local}/chat`, { method: "POST", headers: { authorization: `Bearer ${proxy.token}` }, body: "{}" })
+        .then((response) => response.text())
+        .then(() => "finished", () => "errored"),
+      new Promise((resolve) => setTimeout(() => resolve("hung"), 4000))
+    ]);
+    assert.notEqual(settled, "hung", "the client must not be left waiting");
+  } finally {
+    await proxy.close();
+    await new Promise((resolve) => flaky.close(resolve));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -290,8 +290,17 @@ export async function runTrackedJob(job, runner) {
     // response and the tokens are recorded. Counting those as failures put the
     // provider at 0% success in a comparison it had actually completed.
     const delivered = Boolean(String(execution.text ?? "").trim()) || Number(execution.usage?.output ?? 0) > 0;
-    const degraded = execution.exitStatus !== 0 && delivered && !execution.timedOut && !execution.aborted;
-    const status = execution.exitStatus === 0 || degraded ? "completed" : "failed";
+    // Only a stream that ended without saying why counts as cosmetic. Any other
+    // error — a 500 from the provider, a rejected command, a write that failed —
+    // is a real failure even if the model had already said something, and
+    // recording it as success poisoned exactly the comparisons degraded exists
+    // for. External kills (OOM, `sandbox clean`, docker restart) arrive as a
+    // signal with no error text, and those stay failures too.
+    const cosmetic =
+      (execution.errors ?? []).length > 0 &&
+      (execution.errors ?? []).every((message) => /finish_reason|stream ended/i.test(String(message)));
+    const degraded = execution.exitStatus !== 0 && delivered && cosmetic && !execution.timedOut && !execution.aborted;
+    const status = execution.exitStatus === 0 || degraded ? "completed" : execution.aborted ? "cancelled" : "failed";
     const completedAt = nowIso();
     const record = {
       ...running,

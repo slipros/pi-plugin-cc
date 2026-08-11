@@ -110,7 +110,10 @@ export function createEventReader(file) {
   let offset = 0;
   let line = 0;
   let base = 0;
-  let partial = "";
+  // Held as bytes, not text: a multi-byte character split across two reads was
+  // decoded twice as halves and came out as U+FFFD, quietly corrupting every
+  // non-ASCII transcript larger than the read size.
+  let partial = Buffer.alloc(0);
   let events = [];
 
   const pull = () => {
@@ -128,7 +131,7 @@ export function createEventReader(file) {
         offset = 0;
         line = 0;
         base = 0;
-        partial = "";
+        partial = Buffer.alloc(0);
         events = [];
       }
       while (offset < size) {
@@ -138,19 +141,25 @@ export function createEventReader(file) {
           break;
         }
         offset += read;
-        const chunk = partial + buffer.toString("utf8", 0, read);
-        const pieces = chunk.split("\n");
-        partial = pieces.pop() ?? "";
-        for (const piece of pieces) {
+        const chunk = Buffer.concat([partial, buffer.subarray(0, read)]);
+        let start = 0;
+        for (let index = 0; index < chunk.length; index += 1) {
+          if (chunk[index] !== 0x0a) {
+            continue;
+          }
+          const piece = chunk.toString("utf8", start, index);
+          start = index + 1;
           if (!piece) {
             continue;
           }
           line += 1;
           const event = parseJsonLine(piece);
-          if (event) {
-            events.push(event);
-          }
+          // Unparsable lines still advance the cursor, so the events array is
+          // indexed by line number rather than by its own length — mixing the
+          // two shifted the replay window by one per broken line.
+          events.push(event ?? null);
         }
+        partial = chunk.subarray(start);
       }
     } finally {
       fs.closeSync(handle);
@@ -163,7 +172,7 @@ export function createEventReader(file) {
       // Buffered events start at `base`; anything before the caller's cursor is
       // already seen. What is handed over is then released — a follow loop runs
       // for hours, and keeping every event alive would grow without bound.
-      const out = events.slice(Math.max(0, fromLine - base));
+      const out = events.slice(Math.max(0, fromLine - base)).filter(Boolean);
       base = line;
       events = [];
       return { events: out, nextLine: line };
@@ -510,6 +519,10 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     runRoot,
     sandbox,
     sandboxLabel: describeSandbox(sandbox),
+    // Recorded so a cancel that has no container name can still guess it: the
+    // fallback builds `pi-<profile>-<job>`, and without this it guessed the
+    // profile-less form and never found a profiled container.
+    sandboxProfile: sandbox?.profileName ?? null,
     // Occupancy at launch time: a run that has to queue should say so before it
     // starts, not leave the caller wondering why nothing is happening.
     slotUsage: describeSlotUsage(sandbox),
@@ -1323,7 +1336,10 @@ async function commandCancel(argv, workspaceRoot) {
     // is the only thing that helps an orphaned job, whose wrapper is already
     // dead, and a pending one, whose container may have started before the
     // record caught up.
-    const containerName = job.containerName ?? containerNameForJob(job.id, job.sandboxProfile ?? null);
+    // A run with no sandbox has no container to remove; only guess a name when
+    // the job actually had one.
+    const containerName =
+      job.containerName ?? (job.sandbox || job.sandboxProfile ? containerNameForJob(job.id, job.sandboxProfile ?? null) : null);
     if (containerName) {
       const removed = removeSandboxContainer(containerName);
       cancelled = cancelled || removed;

@@ -281,3 +281,30 @@ test("the project layer cannot weaken the sandbox it runs in", async () => {
   assert.ok(warnings.length >= 5, "each removal is reported rather than silent");
   assert.ok(warnings.some((line) => /cannot turn the sandbox off/.test(line)));
 });
+
+test("every route that could disable the sandbox from a repository is closed", async () => {
+  const { sanitizeProjectLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const sandboxOf = (layer) => {
+    const warnings = [];
+    const clean = sanitizeProjectLayer(layer, warnings);
+    return { clean, warnings };
+  };
+
+  // The object form disables it exactly like the string form.
+  assert.equal("sandbox" in sandboxOf({ defaults: { sandbox: { mode: "none" } } }).clean.defaults, false);
+
+  // `commands` was not sanitized at all, and resolveRunSettings reads it.
+  assert.equal("sandbox" in sandboxOf({ commands: { delegate: { sandbox: "none" } } }).clean.commands.delegate, false);
+  assert.equal("mounts" in sandboxOf({ commands: { delegate: { mounts: ["/:/host"] } } }).clean.commands.delegate, false);
+
+  // A profile given as the bare string "none" used to be handed straight back.
+  const profiles = sandboxOf({ sandboxProfiles: { x: "none" } });
+  assert.equal("x" in profiles.clean.sandboxProfiles, false, "a rejected profile is dropped, not restored");
+
+  // Host environment is the repository choosing what leaks into a container it controls.
+  assert.equal("env" in sandboxOf({ defaults: { sandbox: { env: ["AWS_SECRET_ACCESS_KEY"] } } }).clean.defaults.sandbox, false);
+
+  // What a repository legitimately sets still survives all of this.
+  const kept = sandboxOf({ presets: { p: { model: "x/y", thinking: "high" } } }).clean;
+  assert.deepEqual(kept.presets.p, { model: "x/y", thinking: "high" });
+});

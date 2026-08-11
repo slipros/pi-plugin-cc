@@ -237,6 +237,16 @@ export function buildDockerRunArgs({
     args.push("--network", String(sandbox.network));
   }
 
+  // Resource ceilings, all optional: unset means docker imposes none, which is
+  // how every run behaved before these existed. Worth setting when runs go
+  // parallel — a language server indexing a large repository holds hundreds of
+  // megabytes, and several containers at once add up on the host.
+  for (const [key, flag] of [["memory", "--memory"], ["cpus", "--cpus"], ["pidsLimit", "--pids-limit"]]) {
+    if (sandbox[key] != null && sandbox[key] !== false) {
+      args.push(flag, String(sandbox[key]));
+    }
+  }
+
   // Files the agent writes land on the host through the bind mount, so it has
   // to run as the calling user or the workspace fills up with root-owned files.
   if (sandbox.user && sandbox.user !== "root") {
@@ -594,5 +604,13 @@ export function describeSandbox(sandbox) {
   const parts = [`docker \`${sandbox.image}\``];
   parts.push(sandbox.agentDir === "volume" ? `agent dir: volume \`${sandbox.volume}\`` : `agent dir: ${sandbox.agentDir}`);
   parts.push(`network: ${sandbox.network}`);
+  const limits = [
+    sandbox.memory != null ? `memory ${sandbox.memory}` : null,
+    sandbox.cpus != null ? `cpus ${sandbox.cpus}` : null,
+    sandbox.pidsLimit != null ? `pids ${sandbox.pidsLimit}` : null
+  ].filter(Boolean);
+  if (limits.length) {
+    parts.push(`limits: ${limits.join(" · ")}`);
+  }
   return parts.join(", ");
 }

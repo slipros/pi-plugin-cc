@@ -331,13 +331,17 @@ The profile is configurable per preset, in full:
       "agentDir": "volume",
       "env": ["ANTHROPIC_API_KEY"],
       "mounts": ["/opt/toolchain:/opt/toolchain:ro"],
-      "args": ["--memory=4g"]
+      "memory": "4g",
+      "cpus": 2,
+      "pidsLimit": 512
     }
   }
 }
 ```
 
 `"sandbox": "docker"` is shorthand for the defaults, and `--sandbox none` switches a preset's sandbox back off for one run.
+
+`memory`, `cpus` and `pidsLimit` are optional ceilings — leave them out and docker imposes none, which is how runs behaved before they existed. They earn their place once runs go parallel: a language server indexing a large repository holds several hundred megabytes on its own, so a few containers at once are gigabytes on the host. A profile passes them down to any profile built on it, and `args` still takes any docker flag these three do not cover.
 
 Two limits worth knowing: the workspace bind mount is read-write, so a sandboxed agent can still rewrite your checkout (that is the point — the isolation is about the rest of the machine), and the container-local agent directory means the extensions and skills you installed on the host are absent unless the preset asks for them explicitly.
 

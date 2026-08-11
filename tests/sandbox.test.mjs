@@ -461,3 +461,36 @@ test("images are collected from the profiles that name them", async () => {
   );
   assert.equal(byImage["pi-sandbox-rust:latest"].dockerfile, "~/.claude/pi/sandbox/rust.Dockerfile");
 });
+
+test("resource limits are optional and only reach docker when set", async () => {
+  const { buildDockerRunArgs, describeSandbox, normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+
+  const plain = normalizeSandbox("docker", {});
+  const unlimited = buildDockerRunArgs({ sandbox: plain, piArgs: [], cwd: "/repo", env: {} });
+  for (const flag of ["--memory", "--cpus", "--pids-limit"]) {
+    assert.ok(!unlimited.includes(flag), `${flag} must not appear when nothing asked for it`);
+  }
+
+  const capped = normalizeSandbox({ mode: "docker", memory: "2g", cpus: 1.5, pidsLimit: 512 }, {});
+  const args = buildDockerRunArgs({ sandbox: capped, piArgs: [], cwd: "/repo", env: {} });
+  assert.deepEqual(args.slice(args.indexOf("--memory"), args.indexOf("--memory") + 6), [
+    "--memory",
+    "2g",
+    "--cpus",
+    "1.5",
+    "--pids-limit",
+    "512"
+  ]);
+  assert.match(describeSandbox(capped), /limits: memory 2g · cpus 1\.5 · pids 512/);
+});
+
+test("a profile passes its limits down to a profile that extends it", async () => {
+  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const profiles = {
+    go: { image: "pi-sandbox-go:latest", memory: "4g" },
+    "go-mem": { profile: "go", cpus: 2 }
+  };
+  const derived = normalizeSandbox("go-mem", profiles);
+  assert.equal(derived.memory, "4g", "inherited from the base profile");
+  assert.equal(derived.cpus, 2);
+});

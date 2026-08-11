@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import { runCommand } from "./process.mjs";
 
 const DEFAULT_MAX_CONTEXT_BYTES = 200_000;
@@ -156,4 +159,32 @@ export function resolveCommitIdentity(cwd) {
   }
   const identity = { name: name.stdout.trim(), email: email.stdout.trim() };
   return identity.name && identity.email ? identity : null;
+}
+
+/**
+ * The bind mount a sandboxed run needs when its working directory is a git
+ * worktree, or null when it is an ordinary repository.
+ *
+ * A worktree keeps no repository of its own: its `.git` is a file holding the
+ * absolute host path of the real one. The sandbox mounts the working directory
+ * at /workspace and nothing else, so that path resolves to nothing inside and
+ * every git command dies with `not a git repository`. Mounting the shared
+ * `.git` at the very path the file names fixes it — the worktree's own back
+ * reference into the container is never followed, so it can stay dangling.
+ *
+ * The mount has to be writable: git puts the index, HEAD and the reflog of each
+ * worktree under `.git/worktrees/<name>/`, so a read-only one fails at `git add`.
+ */
+export function resolveWorktreeMount(cwd) {
+  const dotGit = path.join(cwd, ".git");
+  if (!fs.existsSync(dotGit) || !fs.statSync(dotGit).isFile()) {
+    // A directory means an ordinary repository, which needs nothing extra;
+    // a missing .git means this is not a repository at all.
+    return null;
+  }
+  const commonDir = gitOutput(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).trim();
+  if (!commonDir || !fs.existsSync(commonDir)) {
+    return null;
+  }
+  return `${commonDir}:${commonDir}`;
 }

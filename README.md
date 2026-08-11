@@ -279,6 +279,8 @@ Configuration does **not** follow: presets, prompts and `.claude/pi/config.json`
 
 It is repeatable, and a relative host path (`./fixtures:/fixtures:ro`) resolves against the workspace rather than being read by docker as a named volume. Mounting onto a container path the profile already uses replaces that mount instead of adding a second one, so a run can redirect `/gobin` as well as extend the profile. Without a sandbox there is nowhere to mount into and the flag is an error, not a no-op.
 
+**A git worktree works as the working directory, with nothing to mount by hand.** A worktree owns no repository: its `.git` is a file naming the absolute path of the shared one, which the container would otherwise not have. The companion detects this from `--cwd` and mounts that repository at exactly the path the file names, adding a `Worktree: shared … mounted` line to the run header. This is what makes several agents work in one repository at once — one worktree and one background job per branch. The mount must be writable, since git keeps each worktree's index and HEAD inside it, so overriding it with a read-only `--mount` breaks `git add`.
+
 ### One image per stack
 
 A profile may name its own image and the Dockerfile that builds it:

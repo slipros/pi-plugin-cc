@@ -16,7 +16,13 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { loadConfig, resolveRunSettings, userConfigPath } from "./lib/config.mjs";
-import { collectReviewContext, ensureGitRepository, resolveCommitIdentity, resolveReviewTarget } from "./lib/git.mjs";
+import {
+  collectReviewContext,
+  ensureGitRepository,
+  resolveCommitIdentity,
+  resolveReviewTarget,
+  resolveWorktreeMount
+} from "./lib/git.mjs";
 import {
   appendLogLine,
   buildStatusSnapshot,
@@ -293,6 +299,7 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     );
   }
   let sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles);
+  let worktreeMount = null;
   if (settings.mounts.length && !isSandboxed(sandbox)) {
     // Without a container there is nothing to mount into: pi already sees the
     // whole filesystem, so silently dropping them would hide a real mistake.
@@ -302,7 +309,11 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     );
   }
   if (isSandboxed(sandbox)) {
-    sandbox = attachMounts(sandbox, settings.mounts);
+    // A worktree cannot see its own repository through /workspace alone, so the
+    // shared .git is mounted for it. Listed before the run's own mounts, which
+    // therefore win the deduplication if one names the same target explicitly.
+    worktreeMount = resolveWorktreeMount(runRoot);
+    sandbox = attachMounts(sandbox, worktreeMount ? [worktreeMount, ...settings.mounts] : settings.mounts);
     const identity = gitIdentityEnv(settings.git);
     if (Object.keys(identity).length) {
       sandbox = {
@@ -354,6 +365,7 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     runRoot,
     sandbox,
     sandboxLabel: describeSandbox(sandbox),
+    worktreeMount,
     model: selection.model,
     provider: selection.provider,
     systemPromptText: prompt.systemPrompt,

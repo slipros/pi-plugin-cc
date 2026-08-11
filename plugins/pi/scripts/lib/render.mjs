@@ -1,4 +1,5 @@
 import { groupByProvider } from "./models.mjs";
+import { READ_ONLY_TOOLS } from "./pi.mjs";
 
 function formatCost(cost) {
   if (typeof cost !== "number" || Number.isNaN(cost)) {
@@ -162,7 +163,9 @@ function renderRunHeader(title, { job, settings, execution }) {
     // Only worth a line when it is not the directory the caller is standing in.
     job.runRoot && job.runRoot !== job.workspaceRoot ? `- Working directory: \`${job.runRoot}\`` : null,
     settings.promptLabel ? `- ${settings.promptLabel.replace(/^system prompt/, "System prompt")}` : null,
-    settings.readOnly ? "- Tools: read-only (`read`, `grep`, `find`, `ls`)" : null,
+    settings.readOnly ? `- Tools: read-only (\`${READ_ONLY_TOOLS.join("`, `")}\`)` : null,
+    // The run works in a worktree, so the repository it belongs to came along.
+    settings.worktreeMount ? `- Worktree: shared \`${settings.worktreeMount.split(":")[0]}\` mounted` : null,
     settings.git ? `- Commits as: ${settings.git.name} <${settings.git.email}>` : null,
     execution?.sessionId ? `- pi session: \`${execution.sessionId}\` (resume with \`pi --session ${execution.sessionId}\`)` : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,

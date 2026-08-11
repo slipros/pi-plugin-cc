@@ -163,3 +163,31 @@ test("a gitconfig identity outranks the preset one, and flags outrank both", asy
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a worktree run mounts the repository it points at, an ordinary repo mounts nothing", async () => {
+  const { resolveWorktreeMount } = await import("../plugins/pi/scripts/lib/git.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-"));
+  const main = path.join(root, "main");
+  const tree = path.join(root, "tree");
+  const run = (args, cwd) =>
+    execFileSync("git", args, { cwd, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
+
+  try {
+    run(["init", "-q", main], root);
+    run(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "--no-gpg-sign", "-m", "init"], main);
+    run(["worktree", "add", "-q", tree, "-b", "side"], main);
+
+    // The worktree's .git is a file naming this path; the container has to see
+    // it at exactly that path for git to resolve anything at all.
+    assert.equal(resolveWorktreeMount(tree), `${path.join(main, ".git")}:${path.join(main, ".git")}`);
+    assert.equal(resolveWorktreeMount(main), null, "an ordinary repository carries its own .git");
+    assert.equal(resolveWorktreeMount(root), null, "a plain directory is not a repository");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -386,7 +386,9 @@ function writeProxyModels(hostAgentDir, sandbox) {
   } catch {
     return null;
   }
-  const entry = table?.providers?.[provider];
+  // A provider pi ships with has no entry here; the proxy supplies one so the
+  // container can be pointed at it like any custom provider.
+  const entry = table?.providers?.[provider] ?? sandbox.credentialProxy.providerEntry;
   if (!entry) {
     return null;
   }

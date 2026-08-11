@@ -3,7 +3,9 @@ import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
 import path from "node:path";
-import { URL } from "node:url";
+import { pathToFileURL, URL } from "node:url";
+
+import { runCommand } from "./process.mjs";
 
 /**
  * Keeps provider credentials on the host while a sandboxed run talks to models.
@@ -33,17 +35,101 @@ const UPSTREAM_TIMEOUT_MS = 600_000;
  *
  * @returns {{ baseUrl: string, api: string } | null}
  */
-export function resolveProviderEndpoint(homeDir, provider) {
+export async function resolveProviderEndpoint(homeDir, provider) {
   if (!provider) {
     return null;
   }
   try {
     const file = path.join(homeDir, ".pi", "agent", "models.json");
     const entry = JSON.parse(fs.readFileSync(file, "utf8"))?.providers?.[provider];
-    return entry?.baseUrl ? { baseUrl: String(entry.baseUrl), api: String(entry.api ?? "") } : null;
+    if (entry?.baseUrl) {
+      return { baseUrl: String(entry.baseUrl), api: String(entry.api ?? ""), source: "models.json" };
+    }
   } catch {
+    // No user table, or an unreadable one: the built-in catalogue may still know.
+  }
+  return builtInEndpoint(provider);
+}
+
+/**
+ * Base URL of a provider pi ships with.
+ *
+ * pi reaches openrouter with no local configuration at all, which means it
+ * carries these addresses itself: they live in a generated catalogue beside the
+ * CLI, as `MODELS[provider][model].baseUrl`. Reading it is what lets the proxy
+ * cover built-in providers instead of only the ones a user described by hand.
+ *
+ * Located from the `pi` binary rather than a fixed path, since installs differ
+ * per machine and version manager. Any failure returns null, which puts the
+ * caller back on mounting a single credential rather than breaking the run.
+ */
+async function builtInEndpoint(provider) {
+  const catalogue = await loadBuiltInCatalogue();
+  const models = catalogue?.[provider];
+  if (!models) {
     return null;
   }
+  // One provider can list several base URLs (a versioned path beside a bare
+  // one); the shortest is the prefix the others extend.
+  const urls = [...new Set(Object.values(models).map((model) => model?.baseUrl).filter(Boolean))].sort(
+    (left, right) => String(left).length - String(right).length
+  );
+  const api = Object.values(models).find((model) => model?.api)?.api ?? "";
+  return urls.length ? { baseUrl: String(urls[0]), api: String(api), source: "pi catalogue" } : null;
+}
+
+/**
+ * The provider table entry a container needs for this provider.
+ *
+ * A provider pi ships with is not in the user's models.json at all, so pointing
+ * it at the proxy means describing it there: name, api and its models, with the
+ * base URL replaced. Returns null for providers the user already describes —
+ * their own entry is used and only its base URL changes.
+ */
+export async function describeBuiltInProvider(provider) {
+  const catalogue = await loadBuiltInCatalogue();
+  const models = catalogue?.[provider];
+  if (!models) {
+    return null;
+  }
+  return {
+    name: provider,
+    api: Object.values(models).find((model) => model?.api)?.api ?? "openai-completions",
+    models: Object.values(models).map((model) => ({
+      id: model.id,
+      reasoning: Boolean(model.reasoning),
+      contextWindow: model.contextWindow ?? model.context ?? undefined,
+      maxTokens: model.maxTokens ?? undefined,
+      input: model.input ?? undefined,
+      cost: model.cost ?? undefined
+    }))
+  };
+}
+
+let cataloguePromise;
+
+function loadBuiltInCatalogue() {
+  cataloguePromise ??= (async () => {
+    try {
+      const binary = runCommand("which", ["pi"]).stdout.trim().split("\n")[0];
+      if (!binary) {
+        return null;
+      }
+      let dir = path.dirname(fs.realpathSync(binary));
+      for (let depth = 0; depth < 6 && dir !== path.dirname(dir); depth += 1) {
+        const candidate = path.join(dir, "node_modules", "@earendil-works", "pi-ai", "dist", "models.generated.js");
+        if (fs.existsSync(candidate)) {
+          const module = await import(pathToFileURL(candidate).href);
+          return module?.MODELS ?? null;
+        }
+        dir = path.dirname(dir);
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  })();
+  return cataloguePromise;
 }
 
 /**
@@ -51,10 +137,12 @@ export function resolveProviderEndpoint(homeDir, provider) {
  *
  * The path is parsed against a throwaway origin and only its pathname and query
  * are copied onto a clone of the upstream, so nothing in the request can move
- * the destination: the host, port and protocol come from the provider table and
- * from nowhere else. The final check is belt and braces — if any of them still
- * differs, the request is refused rather than sent with the real credential
- * attached.
+ * the destination: host, port and protocol come from the provider table and
+ * from nowhere else. `//elsewhere/v1` would otherwise resolve as a
+ * protocol-relative URL and turn this into an open relay handing out the real
+ * key — for any provider whose base URL carries no path. The final comparison
+ * is belt and braces: anything that still differs is refused rather than sent
+ * with the credential attached.
  */
 function resolveTarget(upstream, requestUrl) {
   const raw = String(requestUrl ?? "");
@@ -95,7 +183,7 @@ export function credentialOf(entry) {
  *   null when the provider cannot be proxied and the caller should fall back.
  */
 export async function startCredentialProxy({ homeDir, provider, authEntry, onWarning = null } = {}) {
-  const endpoint = resolveProviderEndpoint(homeDir, provider);
+  const endpoint = await resolveProviderEndpoint(homeDir, provider);
   const credential = credentialOf(authEntry);
   if (!endpoint || !credential) {
     return null;
@@ -167,6 +255,9 @@ export async function startCredentialProxy({ homeDir, provider, authEntry, onWar
   return {
     url: `http://host.docker.internal:${port}`,
     token,
+    // Present only for providers the user does not describe: the container's
+    // table has to gain an entry for them, not just a different address.
+    providerEntry: endpoint.source === "models.json" ? null : await describeBuiltInProvider(provider),
     async close() {
       await new Promise((resolve) => {
         server.close(() => resolve());

@@ -118,7 +118,7 @@ test("providers without a known endpoint are not proxied, and OAuth records are 
   const home = fakeHome(upstream.port);
 
   // Not in models.json: the caller falls back instead of getting a broken proxy.
-  assert.equal(resolveProviderEndpoint(home, "unknown-provider"), null);
+  assert.equal(await resolveProviderEndpoint(home, "unknown-provider"), null);
   assert.equal(await startCredentialProxy({ homeDir: home, provider: "unknown-provider", authEntry: { key: "k" } }), null);
 
   // An entry with no usable credential is not proxyable either.

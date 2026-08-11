@@ -514,7 +514,7 @@ export async function runPiTurn({
   // providers whose endpoint cannot be resolved.
   const proxy = await openCredentialProxy(sandbox, onProgress);
   if (proxy) {
-    sandbox = { ...sandbox, credentialProxy: { url: proxy.url, token: proxy.token } };
+    sandbox = { ...sandbox, credentialProxy: { url: proxy.url, token: proxy.token, providerEntry: proxy.providerEntry } };
   }
   const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });

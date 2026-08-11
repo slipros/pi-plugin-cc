@@ -620,3 +620,32 @@ test("a claimed slot counts before its container exists", async () => {
   }
   assert.equal(describeSlotUsage(sandbox).used, 0, "releasing frees it again");
 });
+
+test("slot bookkeeping does not confuse neighbouring pools or mutate on read", async () => {
+  const { awaitSandboxSlot, describeSlotUsage, normalizeSandbox } = await import(
+    "../plugins/pi/scripts/lib/sandbox.mjs"
+  );
+
+  // Pool names sharing a prefix are separate pools; the reservation file name
+  // used to let `a.b` count against `a`.
+  const outer = `zz-pool-${process.pid}`;
+  const inner = `${outer}.child`;
+  const of = (group) => normalizeSandbox({ mode: "docker", image: "img", concurrencyGroup: group, maxConcurrent: 1 }, {});
+
+  const claim = await awaitSandboxSlot(of(inner), { timeoutMs: 1000, pollMs: 10 });
+  try {
+    assert.equal(describeSlotUsage(of(inner)).used, 1);
+    assert.equal(describeSlotUsage(of(outer)).used, 0, "a nested pool name is a different pool");
+  } finally {
+    claim.release();
+  }
+});
+
+test("a zero slot limit is refused rather than read as unlimited", async () => {
+  const { awaitSandboxSlot, normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const sandbox = normalizeSandbox({ mode: "docker", image: "img", concurrencyGroup: "zero-pool", maxConcurrent: 0 }, {});
+
+  // "Allow zero containers" can only be a mistake, and silently meaning the
+  // opposite is worse than saying so.
+  await assert.rejects(() => awaitSandboxSlot(sandbox, { timeoutMs: 0 }), /positive number of containers/);
+});

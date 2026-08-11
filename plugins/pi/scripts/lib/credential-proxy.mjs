@@ -89,7 +89,7 @@ async function builtInEndpoint(provider) {
  * base URL replaced. Returns null for providers the user already describes —
  * their own entry is used and only its base URL changes.
  */
-export async function describeBuiltInProvider(provider) {
+async function describeBuiltInProvider(provider) {
   const catalogue = await loadBuiltInCatalogue();
   const models = catalogue?.[provider];
   if (!models) {
@@ -187,6 +187,19 @@ function restorePromptCacheKey(payload, upstream, token) {
     return;
   }
   payload.prompt_cache_key = `pi-run-${crypto.createHash("sha256").update(token).digest("hex").slice(0, 32)}`;
+}
+
+/**
+ * Compare the offered token without leaking its length or prefix through timing.
+ *
+ * The listener is reachable by any container on the host, so the token is the
+ * whole boundary; a `!==` returns as soon as bytes differ, which is a signal an
+ * attacker can measure. Hashing first keeps the comparison over equal lengths.
+ */
+function sameToken(offered, expected) {
+  const left = crypto.createHash("sha256").update(String(offered)).digest();
+  const right = crypto.createHash("sha256").update(String(expected)).digest();
+  return crypto.timingSafeEqual(left, right);
 }
 
 /** Thinking levels pi accepts as a `model:level` suffix. */
@@ -306,7 +319,7 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
     // The token is the only thing standing between this listener and any other
     // container on the host, so it is checked before anything else happens.
     const offered = String(request.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-    if (offered !== token) {
+    if (!sameToken(offered, token)) {
       response.writeHead(401, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: { message: "Invalid run token." } }));
       request.resume();

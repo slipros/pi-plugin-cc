@@ -64,9 +64,33 @@ const ABANDONED_SLICE_MS = 3_600_000;
 /** How long a slot reservation is trusted before it is treated as abandoned. */
 const RESERVATION_WINDOW_MS = 30_000;
 
+/**
+ * The configured slot limit, or NaN when there is none.
+ *
+ * `maxConcurrent: 0` used to read as "unlimited" through `?? 0`, which is the
+ * opposite of what it says. Absent means unlimited; zero is refused loudly,
+ * because a profile that allows no containers can only be a mistake.
+ */
+function slotLimitOf(sandbox) {
+  const configured = sandbox?.maxConcurrent;
+  if (configured == null) {
+    return Number.NaN;
+  }
+  const limit = Number(configured);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    throw new Error(
+      `maxConcurrent must be a positive number of containers, got ${JSON.stringify(configured)}. ` +
+        "Remove it to run without a limit."
+    );
+  }
+  return limit;
+}
+
 /** File-name-safe key identifying one slot scope (a pool or a profile). */
 function slotScopeKey(label, value) {
-  return `${label}-${value}`.replace(/[^a-zA-Z0-9_.-]+/g, "-");
+  // The dot separates the scope from the pid, so it must not survive inside the
+  // scope itself: a pool named `a.b` otherwise matched every file of pool `a`.
+  return `${label}-${value}`.replace(/[^a-zA-Z0-9_-]+/g, "-");
 }
 
 /**
@@ -670,7 +694,7 @@ function reservationDir() {
  * trusted, so a process that died between claiming and starting cannot hold a
  * slot forever.
  */
-function countReservations(scopeKey, { now = Date.now(), windowMs = RESERVATION_WINDOW_MS } = {}) {
+function countReservations(scopeKey, { now = Date.now(), windowMs = RESERVATION_WINDOW_MS, sweep = true } = {}) {
   let live = 0;
   let entries = [];
   try {
@@ -685,7 +709,12 @@ function countReservations(scopeKey, { now = Date.now(), windowMs = RESERVATION_
     const file = path.join(reservationDir(), entry);
     try {
       if (now - fs.statSync(file).mtimeMs > windowMs) {
-        fs.unlinkSync(file);
+        // Expired: not counted, and swept only when this call is the one
+        // claiming a slot. A read that merely reports occupancy has no business
+        // deleting another run's files.
+        if (sweep) {
+          fs.unlinkSync(file);
+        }
         continue;
       }
       live += 1;
@@ -715,7 +744,7 @@ function reserveSlot(scopeKey) {
 }
 
 export function describeSlotUsage(sandbox) {
-  const limit = Number(sandbox?.maxConcurrent ?? 0);
+  const limit = slotLimitOf(sandbox);
   const group = sandbox?.concurrencyGroup ?? null;
   const value = group ?? sandbox?.profileName ?? null;
   if (!isSandboxed(sandbox) || !value || !Number.isFinite(limit) || limit <= 0) {
@@ -723,7 +752,7 @@ export function describeSlotUsage(sandbox) {
   }
   const scopeKey = slotScopeKey(group ? "pool" : "profile", value);
   return {
-    used: countRunningForLabel(group ? "pool" : "profile", value) + countReservations(scopeKey),
+    used: countRunningForLabel(group ? "pool" : "profile", value) + countReservations(scopeKey, { sweep: false }),
     limit,
     scope: group ? `pool \`${group}\`` : `profile \`${sandbox.profileName}\``
   };
@@ -741,7 +770,7 @@ export function describeSlotUsage(sandbox) {
  * @returns {Promise<{waitedMs: number, slots: number|null}>}
  */
 export async function awaitSandboxSlot(sandbox, { timeoutMs = 900_000, onProgress = null, pollMs = 2000 } = {}) {
-  const limit = Number(sandbox?.maxConcurrent ?? 0);
+  const limit = slotLimitOf(sandbox);
   // Slots belong to a pool when the profile names one, and to the profile
   // otherwise. A pool is what a shared provider needs: several profiles hitting
   // the same account have to draw from one allowance, while a profile counting

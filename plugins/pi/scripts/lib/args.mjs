@@ -79,14 +79,21 @@ export function parseArgs(argv, schema = {}) {
       break;
     }
 
-    if (typeof token !== "string" || !token.startsWith("--")) {
+    // Short flags are real flags: `-m opus` used to fall through to positional
+    // and end up as part of the prompt, silently running on the default model.
+    const isShort = typeof token === "string" && /^-[a-zA-Z]$/.test(token);
+    if (typeof token !== "string" || (!token.startsWith("--") && !isShort)) {
       positional.push(token);
       continue;
     }
 
     const equalsIndex = token.indexOf("=");
-    const rawName = equalsIndex === -1 ? token.slice(2) : token.slice(2, equalsIndex);
-    const inlineValue = equalsIndex === -1 ? null : token.slice(equalsIndex + 1);
+    const rawName = isShort
+      ? token.slice(1)
+      : equalsIndex === -1
+        ? token.slice(2)
+        : token.slice(2, equalsIndex);
+    const inlineValue = isShort || equalsIndex === -1 ? null : token.slice(equalsIndex + 1);
     const name = canonical(rawName);
 
     if (booleans.has(name)) {

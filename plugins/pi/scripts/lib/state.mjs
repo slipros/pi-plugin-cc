@@ -46,8 +46,25 @@ export function resolveJobsDir(workspaceRoot) {
   return path.join(resolveStateDir(workspaceRoot), JOBS_DIR_NAME);
 }
 
+/**
+ * Job state holds transcripts, prompts and full command lines, and it lives in
+ * a world-readable temp directory. 0700 keeps it to its owner; on a shared
+ * machine the default 0755 handed all of it to anyone who could `cat`.
+ */
+const STATE_DIR_MODE = 0o700;
+
 export function ensureStateDir(workspaceRoot) {
-  fs.mkdirSync(resolveJobsDir(workspaceRoot), { recursive: true });
+  fs.mkdirSync(resolveJobsDir(workspaceRoot), { recursive: true, mode: STATE_DIR_MODE });
+  // `mode` only applies to directories this call creates, and umask can trim it
+  // further; tightening explicitly also fixes directories made by older
+  // versions, which were left readable by everyone on the machine.
+  for (const directory of [resolveStateDir(workspaceRoot), resolveJobsDir(workspaceRoot)]) {
+    try {
+      fs.chmodSync(directory, STATE_DIR_MODE);
+    } catch {
+      // Not ours to tighten (someone else created it first) — the run goes on.
+    }
+  }
 }
 
 export function resolveStateFile(workspaceRoot) {

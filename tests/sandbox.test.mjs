@@ -31,10 +31,16 @@ function mounts(args) {
 }
 
 test("no sandbox setting means no sandbox", () => {
-  for (const value of [null, undefined, false, "", "none", "off", "host"]) {
+  for (const value of [null, undefined, false, "", "none", "off"]) {
     assert.equal(normalizeSandbox(value).mode, "none", `for ${JSON.stringify(value)}`);
     assert.equal(isSandboxed(normalizeSandbox(value)), false);
   }
+});
+
+test('"host" is refused rather than read as "no sandbox"', () => {
+  // The obvious reading is host networking; the old behaviour was the opposite
+  // of that, in the one flag whose purpose is isolation.
+  assert.throws(() => normalizeSandbox("host"), /Ambiguous sandbox "host"/);
 });
 
 test('"docker" expands to the full default profile', () => {

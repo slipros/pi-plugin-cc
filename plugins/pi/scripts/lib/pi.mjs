@@ -293,6 +293,15 @@ export function redactArgs(args) {
     if (arg === "--system-prompt" || arg === "--append-system-prompt") {
       const value = args[++index] ?? "";
       redacted.push(`<${String(value).length} chars>`);
+      continue;
+    }
+    // `-e NAME=value` carries whatever a profile puts in the container's
+    // environment, and this line goes to the job log, the status preview and
+    // the --json output. The name is worth keeping, the value never is.
+    if (arg === "-e" || arg === "--env") {
+      const value = String(args[++index] ?? "");
+      const separator = value.indexOf("=");
+      redacted.push(separator === -1 ? value : `${value.slice(0, separator)}=<hidden>`);
     }
   }
   return redacted.join(" ");

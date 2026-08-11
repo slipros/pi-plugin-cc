@@ -153,6 +153,37 @@ const RUN_FLAGS = {
   }
 };
 
+/** Every flag any command understands, for the unknown-flag guard in main(). */
+const KNOWN_FLAGS = new Set([
+  ...RUN_FLAGS.booleans,
+  ...RUN_FLAGS.strings,
+  ...RUN_FLAGS.collect,
+  ...Object.keys(RUN_FLAGS.aliases),
+  ...Object.values(RUN_FLAGS.aliases),
+  "all",
+  "by",
+  "days",
+  "limit",
+  "follow",
+  "follow-up",
+  "for",
+  "since",
+  "tail",
+  "stats",
+  "image",
+  "no-cache",
+  "dockerfile",
+  "pi-version",
+  "job"
+]);
+
+/** `--model`, `-m`, `--model=x` and `-m=x` all name the same flag. */
+function canonicalFlag(token) {
+  const text = String(token).replace(/^--?/, "");
+  const name = text.split("=")[0];
+  return RUN_FLAGS.aliases[name] ?? name;
+}
+
 function usage() {
   return [
     "Usage:",
@@ -223,8 +254,12 @@ function usage() {
  * string, while a real shell passes separate tokens. Both must work.
  */
 function normalizeCommandArgs(argv) {
-  if (argv.length === 1 && /[\s"']/.test(argv[0] ?? "")) {
-    return splitRawArgumentString(argv[0]);
+  // Only re-split when the single argument actually looks like a command line.
+  // A shell has already done the splitting by then, so re-parsing plain prose
+  // ate its punctuation: "fix the user's login flow" came out as "users".
+  const single = argv.length === 1 ? String(argv[0] ?? "") : null;
+  if (single && /(^|\s)(--?[a-zA-Z])/.test(single)) {
+    return splitRawArgumentString(single);
   }
   return argv;
 }
@@ -789,7 +824,12 @@ async function commandSteer(argv, workspaceRoot) {
   });
 
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
-  const explicitId = flags.job ?? (positional[0] && jobs.some((job) => job.id === positional[0]) ? positional.shift() : null);
+  // Match the same way every other command does: an abbreviated id is a job
+  // reference, not the first word of the message. Comparing only full ids left
+  // "4f2a" glued to the front of the text and sent to whichever job was newest.
+  const looksLikeReference =
+    positional[0] && jobs.some((job) => job.id === positional[0] || job.id.endsWith(positional[0]));
+  const explicitId = flags.job ?? (looksLikeReference ? positional.shift() : null);
   const message = positional.join(" ").trim();
 
   if (!message) {
@@ -910,7 +950,15 @@ async function commandWatch(argv, workspaceRoot) {
 
   const initial = readEvents(since);
   if (flags.json) {
-    output("", { job: target, events: initial.events, cursor: initial.nextLine, since }, true);
+    // --tail applied only to the rendered path, so `--json --tail 20` dumped the
+    // entire transcript: on a long run that is megabytes of JSON, and it lands
+    // in the context of whoever asked for twenty lines.
+    const events = tailLimit ? initial.events.slice(-tailLimit) : initial.events;
+    output(
+      "",
+      { job: target, events, cursor: initial.nextLine, since, truncated: events.length < initial.events.length },
+      true
+    );
     return 0;
   }
 
@@ -1206,6 +1254,19 @@ async function main() {
   const handler = COMMANDS[command];
   if (!handler) {
     process.stderr.write(`Unknown command "${command}".\n\n${usage()}\n`);
+    return 2;
+  }
+
+  // A misspelled flag used to be dropped from argv and its value left in the
+  // prompt: `--modle opus fix the bug` ran on the default model with "opus fix
+  // the bug" as the task. Refusing costs one retry; guessing costs a paid run.
+  const unknownFlags = rest.filter((token) => /^--?[a-zA-Z]/.test(String(token)) && !KNOWN_FLAGS.has(canonicalFlag(token)));
+  if (unknownFlags.length && !rest.includes("--")) {
+    process.stderr.write(
+      `Unknown flag(s): ${unknownFlags.join(", ")}.\n` +
+        "Check the spelling, or put `--` before the task text to pass it through.\n\n" +
+        `${usage()}\n`
+    );
     return 2;
   }
 

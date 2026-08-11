@@ -52,7 +52,18 @@ const SANDBOX_DEFAULTS = {
   skills: []
 };
 
-const DISABLED = new Set(["none", "off", "false", "no", "host"]);
+const DISABLED = new Set(["none", "off", "false", "no"]);
+
+/**
+ * Names that read as "some kind of sandbox" but used to disable it.
+ *
+ * `--sandbox host` meant "no container", while the obvious reading is host
+ * networking — the flag whose entire job is isolation would then do the exact
+ * opposite of what it was asked, silently. Refusing is the only safe answer.
+ */
+const AMBIGUOUS = new Map([
+  ["host", 'Use `--sandbox none` to run without a container, or `{"network": "host"}` in the profile for host networking.']
+]);
 
 function asList(value) {
   if (value == null) {
@@ -91,6 +102,9 @@ export function normalizeSandbox(value, profiles = {}, seen = new Set()) {
   if (typeof value === "string") {
     const name = value.trim();
     const mode = name.toLowerCase();
+    if (AMBIGUOUS.has(mode)) {
+      throw new Error(`Ambiguous sandbox "${name}". ${AMBIGUOUS.get(mode)}`);
+    }
     if (DISABLED.has(mode)) {
       return { mode: "none" };
     }

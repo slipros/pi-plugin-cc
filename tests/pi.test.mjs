@@ -206,3 +206,34 @@ test("excluded tools are passed as one comma separated list", () => {
   const args = buildPiArgs({ excludeTools: ["ask_question", "bash"] });
   assert.deepEqual(args.slice(3), ["--exclude-tools", "ask_question,bash"]);
 });
+
+test("timings split a run into model time and tool time, counting overlaps once", async () => {
+  const { applyPiEvent, createTurnState, summarizeTiming } = await import("../plugins/pi/scripts/lib/pi.mjs");
+  const state = createTurnState();
+  const at = (ms, event) => applyPiEvent(state, event, ms);
+
+  at(1000, { type: "agent_start" });
+  // Two tools running at once: the run waits 3s for them, not 5s.
+  at(2000, { type: "tool_execution_start", toolCallId: "a", toolName: "lsp_references" });
+  at(2500, { type: "tool_execution_start", toolCallId: "b", toolName: "lsp_definition" });
+  at(4500, { type: "tool_execution_end", toolCallId: "b" });
+  at(5000, { type: "tool_execution_end", toolCallId: "a" });
+  at(6000, { type: "agent_settled" });
+
+  const timing = summarizeTiming(state.timing);
+  assert.equal(timing.spanMs, 5000);
+  assert.equal(timing.toolMs, 3000, "2000-5000 covered once, not 3000+2000");
+  assert.equal(timing.modelMs, 2000, "the rest of the span is waiting on the model");
+});
+
+test("a tool left open when the run ends does not swallow the run", async () => {
+  const { applyPiEvent, createTurnState, summarizeTiming } = await import("../plugins/pi/scripts/lib/pi.mjs");
+  const state = createTurnState();
+  applyPiEvent(state, { type: "agent_start" }, 0);
+  applyPiEvent(state, { type: "tool_execution_start", toolCallId: "x", toolName: "bash" }, 1000);
+  applyPiEvent(state, { type: "agent_settled" }, 9000);
+
+  const timing = summarizeTiming(state.timing);
+  assert.equal(timing.toolMs, 0);
+  assert.equal(timing.modelMs, 9000);
+});

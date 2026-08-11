@@ -141,7 +141,7 @@ function usage() {
   return [
     "Usage:",
     "  pi-companion.mjs setup [--json]",
-    "  pi-companion.mjs models [search] [--json]",
+    "  pi-companion.mjs models [search] [--stats [--days N]] [--json]",
     "  pi-companion.mjs delegate [flags] <prompt>",
     "  pi-companion.mjs review [flags] [focus text]",
     "  pi-companion.mjs status [job-id] [--all] [--json]",
@@ -149,7 +149,7 @@ function usage() {
     "  pi-companion.mjs cancel [job-id] [--json]",
     "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
     "  pi-companion.mjs watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]",
-    "  pi-companion.mjs stats [--by day|model|preset|workspace|kind] [--days N|--all] [--json]",
+    "  pi-companion.mjs stats [--by day|model|preset|workspace|kind|status] [--days N|--all] [--json]",
     "  pi-companion.mjs sandbox [status|build [name|--all]|clean] [--image <tag>]",
     "                            [--dockerfile <name|path>] [--pi-version <v>]",
     "",
@@ -160,7 +160,7 @@ function usage() {
     "  --preset <name>         preset from .claude/pi/config.json",
     "  --system-prompt <v>     stored prompt name (reviewer, fixer, …), @path/to.md, or inline text",
     "  --append-system-prompt  additive prompt text or file (repeatable)",
-    "  --read-only             restrict pi to read, grep, find, ls",
+    "  --read-only             restrict pi to reading: read, grep, find, ls + LSP navigation",
     "  --write                 allow edit/write/bash even when the preset is read-only",
     "  --session <id>          continue an existing pi session ('last' = latest job)",
     "  --fresh                 ignore --session and start a new pi session",
@@ -583,7 +583,7 @@ async function commandSetup(argv, workspaceRoot) {
 }
 
 async function commandModels(argv, workspaceRoot) {
-  const { flags, positional } = parseArgs(argv, { booleans: ["json"] });
+  const { flags, positional } = parseArgs(argv, { booleans: ["json", "stats"], strings: ["days"] });
   const search = positional.join(" ").trim() || null;
   const { config } = loadConfig(workspaceRoot);
   const models = listModels(PI_BINARY, { cwd: workspaceRoot, search });
@@ -593,11 +593,35 @@ async function commandModels(argv, workspaceRoot) {
     presets: config.presets ?? {},
     prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
     defaults: config.defaults ?? {},
-    search
+    search,
+    // What the catalogue cannot tell you: how these models actually behaved
+    // here. Only gathered when asked for — it opens the journal.
+    measured: flags.stats ? measuredModels({ days: flags.days ? Number(flags.days) : null, search }) : null
   };
 
   output(renderModelsReport(payload), payload, Boolean(flags.json));
   return 0;
+}
+
+/**
+ * Per-model numbers from the journal, filtered by the same search the catalogue
+ * used so the two halves of the report talk about the same models.
+ *
+ * Returns an empty list rather than throwing when the journal cannot be opened:
+ * a missing history is a reason to show less, not to fail the command.
+ */
+function measuredModels({ days = null, search = null } = {}) {
+  const handle = openDatabase();
+  if (!handle) {
+    return [];
+  }
+  try {
+    const rows = queryStats(handle, { by: "model", days, limit: 200 });
+    const needle = search?.toLowerCase() ?? null;
+    return rows.filter((row) => !needle || String(row.bucket).toLowerCase().includes(needle));
+  } finally {
+    handle.close();
+  }
 }
 
 async function commandDelegate(argv, workspaceRoot) {

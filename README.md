@@ -411,10 +411,18 @@ Job files answer "what is running now"; they cannot answer "what did this week c
 
 ```
 pi-companion.mjs stats                       # last 30 days, by day
-pi-companion.mjs stats --by model            # which model burned what
+pi-companion.mjs stats --by model            # how each model behaved
 pi-companion.mjs stats --by preset --days 7
 pi-companion.mjs stats --by workspace --all
+pi-companion.mjs stats --by status           # how runs ended
+pi-companion.mjs models --stats <search>     # the catalogue plus these numbers
 ```
+
+The report is not only tokens: `ok` is the share of runs that finished, `tok/s` the model's speed, `p50`/`p90` run durations, `tools`/`err` tool calls and the errors among them.
+
+**`tok/s` is measured against model time** — the run's span minus the time its tools held it, with concurrent tool calls counted once rather than summed. Generation cannot be timed from the event stream directly: `message_start` arrives once the provider is already answering and the tokens then land in a few large batches, so that interval would report a thousand tokens per second for a model doing forty. Runs recorded before this measurement existed are left out of the rate entirely and show a dash.
+
+Worth knowing before switching to a faster model: on a Go repository with a cold gopls, **89% of a run went to tools**, not to the model.
 
 It uses `node:sqlite`, which ships with Node 22.3+ and needs no dependency; on older Node the journal is simply skipped and everything else works unchanged. Cost is only shown when the provider reports it — `ollama-pro` and `opencode-go` send zero, so there the honest answer is tokens, not money.
 

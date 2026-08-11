@@ -88,7 +88,7 @@ export function renderSetupReport(report) {
   return joinLines(lines);
 }
 
-export function renderModelsReport({ models, presets, prompts, defaults, search }) {
+export function renderModelsReport({ models, presets, prompts, defaults, search, measured = null }) {
   const lines = ["# pi models", ""];
 
   if (!models.length) {
@@ -108,6 +108,32 @@ export function renderModelsReport({ models, presets, prompts, defaults, search 
     lines.push(
       `| \`${model.id}\` | ${model.context ?? "?"} | ${model.maxOutput ?? "?"} | ${model.thinking ? "yes" : "no"} | ${model.images ? "yes" : "no"} |`
     );
+  }
+
+  if (measured) {
+    lines.push("", "## Measured here", "");
+    if (measured.length) {
+      lines.push(
+        "What the catalogue cannot say: how these models behaved on this machine.",
+        "",
+        "| Model | runs | ok | tok/s | p50 | p90 | turns/run | tool err | cost |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+      );
+      for (const row of measured) {
+        const turnsPerRun = row.runs ? (Number(row.turns ?? 0) / row.runs).toFixed(1) : "—";
+        lines.push(
+          `| \`${row.bucket}\` | ${row.runs} | ${formatShare(row.completed, row.runs)} | ` +
+            `${formatRate(row.tokensPerSecond)} | ${formatSeconds(row.p50Seconds)} | ${formatSeconds(row.p90Seconds)} | ` +
+            `${turnsPerRun} | ${formatShare(row.tool_errors, row.tool_calls)} | ${formatCost(row.cost) ?? "—"} |`
+        );
+      }
+      lines.push(
+        "",
+        "`tok/s` counts generated tokens against model time only — runs older than that measurement are left out of it."
+      );
+    } else {
+      lines.push("No runs recorded yet, so there is nothing to compare.");
+    }
   }
 
   const presetNames = Object.keys(presets ?? {});
@@ -396,6 +422,31 @@ function formatTokens(value) {
   return Number(value ?? 0).toLocaleString("en-US");
 }
 
+/** Share of runs that finished cleanly, as a percentage. */
+function formatShare(part, whole) {
+  const total = Number(whole ?? 0);
+  if (!total) {
+    return "—";
+  }
+  return `${Math.round((100 * Number(part ?? 0)) / total)}%`;
+}
+
+/** Tokens per second; null when no run in the bucket carried timings. */
+function formatRate(rate) {
+  if (rate == null || !Number.isFinite(rate) || rate <= 0) {
+    return "—";
+  }
+  return rate >= 100 ? String(Math.round(rate)) : rate.toFixed(1);
+}
+
+function formatSeconds(value) {
+  if (value == null) {
+    return "—";
+  }
+  const seconds = Number(value);
+  return seconds >= 90 ? `${Math.round(seconds / 60)}m` : `${Math.round(seconds)}s`;
+}
+
 function formatDuration(totalSeconds) {
   const seconds = Number(totalSeconds ?? 0);
   if (!seconds) {
@@ -425,13 +476,24 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
     ""
   );
 
-  lines.push(`| ${by} | runs | in | out | cache | time |`, "| --- | ---: | ---: | ---: | ---: | ---: |");
+  lines.push(
+    `| ${by} | runs | ok | in | out | tok/s | p50 | p90 | tools | err | cost |`,
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+  );
   for (const row of rows) {
     lines.push(
-      `| ${row.bucket} | ${row.runs} | ${formatTokens(row.input)} | ${formatTokens(row.output)} | ${formatTokens(row.cache_read)} | ${formatDuration(row.seconds)} |`
+      `| ${row.bucket} | ${row.runs} | ${formatShare(row.completed, row.runs)} | ${formatTokens(row.input)} | ` +
+        `${formatTokens(row.output)} | ${formatRate(row.tokensPerSecond)} | ${formatSeconds(row.p50Seconds)} | ` +
+        `${formatSeconds(row.p90Seconds)} | ${row.tool_calls ?? 0} | ${row.tool_errors ?? 0} | ${formatCost(row.cost) ?? "—"} |`
     );
   }
 
-  lines.push("", `Journal: \`${database}\` · group by \`--by day|model|preset|workspace|kind\` · \`--days N\` or \`--all\`.`);
+  lines.push(
+    "",
+    "`tok/s` is generated tokens over model time — the run minus the time its tools held it; runs recorded before " +
+      "timings existed count as zero and are left out of it. `p50`/`p90` are run durations, tools included.",
+    "",
+    `Journal: \`${database}\` · group by \`--by day|model|preset|workspace|kind|status\` · \`--days N\` or \`--all\`.`
+  );
   return joinLines(lines);
 }

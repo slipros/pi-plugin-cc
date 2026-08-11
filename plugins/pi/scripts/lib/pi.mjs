@@ -84,6 +84,52 @@ function summarizeToolCall(toolName, args) {
   return `${name}: ${text.length > 96 ? `${text.slice(0, 93)}...` : text}`;
 }
 
+/** Tokens the model actually generated: visible output plus hidden reasoning. */
+function producedTokens(usage) {
+  if (!usage || typeof usage !== "object") {
+    return 0;
+  }
+  return (typeof usage.output === "number" ? usage.output : 0) +
+    (typeof usage.reasoning === "number" ? usage.reasoning : 0);
+}
+
+/** Pairs a tool_execution_end with its start; ids differ per pi version. */
+function toolKey(event) {
+  return String(event.toolCallId ?? event.id ?? event.callId ?? event.toolName ?? "tool");
+}
+
+/**
+ * The timings a finished run reports.
+ *
+ * `toolMs` is the wall-clock the tools held, with overlapping calls counted
+ * once; `modelMs` is everything else in the run's span, which is the waiting on
+ * the model. A tool still open when the run ended contributes nothing — its
+ * start would otherwise swallow the rest of the run.
+ */
+export function summarizeTiming(timing) {
+  if (!timing || timing.firstEventAt === null) {
+    return { spanMs: 0, modelMs: 0, toolMs: 0 };
+  }
+  const spanMs = Math.max(0, timing.lastEventAt - timing.firstEventAt);
+  const toolMs = mergeIntervals(timing.toolIntervals);
+  return { spanMs, modelMs: Math.max(0, spanMs - toolMs), toolMs };
+}
+
+/** Total length covered by intervals, counting overlaps once. */
+function mergeIntervals(intervals) {
+  const sorted = [...intervals].sort((left, right) => left[0] - right[0]);
+  let total = 0;
+  let cursor = -Infinity;
+  for (const [start, end] of sorted) {
+    const from = Math.max(start, cursor);
+    if (end > from) {
+      total += end - from;
+      cursor = end;
+    }
+  }
+  return total;
+}
+
 function accumulateUsage(target, usage) {
   if (!usage || typeof usage !== "object") {
     return target;
@@ -221,12 +267,19 @@ export function redactArgs(args) {
   return redacted.join(" ");
 }
 
-export function applyPiEvent(state, event) {
+export function applyPiEvent(state, event, now = Date.now()) {
   if (!event || typeof event !== "object") {
     return null;
   }
+  // Older callers may hand in a state built before timings existed.
+  const timing = (state.timing ??= createTimingState());
+  timing.firstEventAt ??= now;
+  timing.lastEventAt = now;
 
   switch (event.type) {
+    case "message_start": {
+      return null;
+    }
     case "session": {
       if (event.id) {
         state.sessionId = String(event.id);
@@ -240,9 +293,15 @@ export function applyPiEvent(state, event) {
     case "tool_execution_start": {
       const summary = summarizeToolCall(event.toolName, event.args);
       state.toolCalls.push(summary);
+      timing.toolStartedAt.set(toolKey(event), now);
       return { phase: "working", message: summary };
     }
     case "tool_execution_end": {
+      const startedAt = timing.toolStartedAt.get(toolKey(event));
+      if (startedAt !== undefined) {
+        timing.toolIntervals.push([startedAt, now]);
+        timing.toolStartedAt.delete(toolKey(event));
+      }
       if (event.isError) {
         state.toolErrors += 1;
         return { phase: "working", message: `${event.toolName ?? "tool"} reported an error.` };
@@ -300,6 +359,32 @@ export function applyPiEvent(state, event) {
   }
 }
 
+/**
+ * Wall-clock split of a run: time spent waiting on the model versus time spent
+ * inside its tools.
+ *
+ * Model time is measured by subtraction — the span of the run minus the time
+ * tools held it — because the event stream cannot time generation directly.
+ * `message_start` arrives only once the provider starts answering, and the
+ * tokens then land in a few large batches (52 of them within 50ms over the
+ * wire), so the start-to-end interval measures delivery, not decoding: it
+ * would report a thousand tokens per second for a model doing thirty. What
+ * happens before `message_start` — prefill, queueing, the network — is the part
+ * that actually costs time, and subtraction keeps it in.
+ *
+ * Tool intervals are merged rather than summed: an agent that fires three LSP
+ * queries at once holds the run for the longest of them, not for their total,
+ * and summing produced tool time exceeding the run's own duration.
+ */
+function createTimingState() {
+  return {
+    firstEventAt: null,
+    lastEventAt: null,
+    toolIntervals: [],
+    toolStartedAt: new Map()
+  };
+}
+
 export function createTurnState() {
   return {
     sessionId: null,
@@ -308,6 +393,7 @@ export function createTurnState() {
     toolErrors: 0,
     assistantTexts: [],
     usage: {},
+    timing: createTimingState(),
     model: null,
     thinkingLevel: null,
     stopReason: null,
@@ -451,8 +537,10 @@ export async function runPiTurn({
     usage: state.usage,
     model: state.model,
     stopReason: state.stopReason,
+    turns: state.turns,
     toolCalls: state.toolCalls,
     toolErrors: state.toolErrors,
+    timing: summarizeTiming(state.timing),
     exitStatus: errors.length && exitStatus === 0 ? 1 : exitStatus,
     stderr: stderr.trim(),
     errors,

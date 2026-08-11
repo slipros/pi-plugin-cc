@@ -295,6 +295,13 @@ export async function runTrackedJob(job, runner) {
       sessionId: execution.sessionId ?? null,
       model: execution.model ?? running.model ?? null,
       usage: execution.usage ?? null,
+      // Counters and timings the journal has columns for. Without them the
+      // table stored zeroes for every run and could answer nothing about how a
+      // model actually behaves — only how many tokens it moved.
+      turns: execution.turns ?? 0,
+      toolCalls: Array.isArray(execution.toolCalls) ? execution.toolCalls.length : (execution.toolCalls ?? 0),
+      toolErrors: execution.toolErrors ?? 0,
+      timing: execution.timing ?? null,
       summary: execution.summary ?? null,
       rendered: execution.rendered ?? null,
       errors: execution.errors ?? []

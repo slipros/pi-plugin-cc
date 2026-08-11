@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   turns            INTEGER DEFAULT 0,
   tool_calls       INTEGER DEFAULT 0,
   tool_errors      INTEGER DEFAULT 0,
+  model_ms         INTEGER DEFAULT 0,
+  tool_ms          INTEGER DEFAULT 0,
+  span_ms          INTEGER DEFAULT 0,
   session_id       TEXT,
   background       INTEGER DEFAULT 0,
   updated_at       TEXT
@@ -96,10 +99,33 @@ export function openDatabase(file = databasePath()) {
       const db = new (loadSqlite().DatabaseSync)(file);
       db.exec("PRAGMA journal_mode = WAL");
       db.exec(SCHEMA);
+      addMissingColumns(db);
       return { db, close: () => db.close() };
     });
   } catch {
     return null;
+  }
+}
+
+/**
+ * Bring an existing journal up to the current schema.
+ *
+ * `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+ * a column added later would only ever reach fresh databases — every journal
+ * with history in it would keep failing the queries that read the new column.
+ * Old rows get the default, which reads as "this run predates the measurement".
+ */
+function addMissingColumns(db) {
+  const present = new Set(db.prepare("PRAGMA table_info(jobs)").all().map((column) => column.name));
+  const additions = [
+    ["model_ms", "INTEGER DEFAULT 0"],
+    ["tool_ms", "INTEGER DEFAULT 0"],
+    ["span_ms", "INTEGER DEFAULT 0"]
+  ];
+  for (const [name, definition] of additions) {
+    if (!present.has(name)) {
+      db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${definition}`);
+    }
   }
 }
 
@@ -143,6 +169,9 @@ const COLUMNS = [
   "turns",
   "tool_calls",
   "tool_errors",
+  "model_ms",
+  "tool_ms",
+  "span_ms",
   "session_id",
   "background",
   "updated_at"
@@ -184,6 +213,9 @@ export function jobToRow(job) {
     turns: job.turns ?? 0,
     tool_calls: Array.isArray(job.toolCalls) ? job.toolCalls.length : (job.toolCalls ?? 0),
     tool_errors: job.toolErrors ?? 0,
+    model_ms: job.timing?.modelMs ?? 0,
+    tool_ms: job.timing?.toolMs ?? 0,
+    span_ms: job.timing?.spanMs ?? 0,
     session_id: job.sessionId ?? null,
     background: job.background ? 1 : 0,
     updated_at: new Date().toISOString()
@@ -202,7 +234,7 @@ export function recordJob(handle, job) {
   const placeholders = COLUMNS.map((column) => `$${column}`).join(", ");
   const updates = COLUMNS.filter((column) => column !== "id")
     .map((column) =>
-      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors"].includes(
+      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms"].includes(
         column
       )
         ? `${column} = MAX(${column}, excluded.${column})`
@@ -257,21 +289,73 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
     throw new Error(`Unknown grouping "${by}". Use one of: ${Object.keys(GROUPS).join(", ")}.`);
   }
   const where = days ? `WHERE created_at >= datetime('now', '-${Number(days)} days')` : "";
-  return handle.db
+  const rows = handle.db
     .prepare(
       `SELECT ${expression} AS bucket,
               COUNT(*)            AS runs,
+              SUM(status = 'completed') AS completed,
+              SUM(status IN ('failed', 'orphaned', 'cancelled')) AS failed,
               SUM(input)          AS input,
               SUM(output)         AS output,
+              SUM(reasoning)      AS reasoning,
               SUM(cache_read)     AS cache_read,
               SUM(cost)           AS cost,
-              SUM(duration_seconds) AS seconds
+              SUM(duration_seconds) AS seconds,
+              SUM(model_ms)       AS model_ms,
+              SUM(tool_ms)        AS tool_ms,
+              -- Tokens from the same rows the model time came from: mixing the
+              -- output of untimed runs into a rate measured on timed ones
+              -- inflates it without limit.
+              SUM(CASE WHEN model_ms > 0 THEN output + reasoning ELSE 0 END) AS timed_output,
+              SUM(model_ms > 0)   AS timed_runs,
+              SUM(turns)          AS turns,
+              SUM(tool_calls)     AS tool_calls,
+              SUM(tool_errors)    AS tool_errors
        FROM jobs ${where}
        GROUP BY bucket
        ORDER BY (SUM(input) + SUM(output)) DESC, bucket DESC
        LIMIT ${Number(limit)}`
     )
     .all();
+
+  // Percentiles come from the raw durations: SQLite has no percentile function,
+  // and an average hides exactly what the question is about — whether a model is
+  // usually quick with rare disasters, or uniformly slow.
+  const durations = new Map();
+  for (const row of handle.db
+    .prepare(
+      `SELECT ${expression} AS bucket, duration_seconds AS seconds
+       FROM jobs ${where} ${where ? "AND" : "WHERE"} duration_seconds IS NOT NULL
+       ORDER BY duration_seconds`
+    )
+    .all()) {
+    if (!durations.has(row.bucket)) {
+      durations.set(row.bucket, []);
+    }
+    durations.get(row.bucket).push(row.seconds);
+  }
+
+  return rows.map((row) => {
+    const sorted = durations.get(row.bucket) ?? [];
+    return {
+      ...row,
+      // Generated tokens over the time actually spent waiting on the model,
+      // which is the run minus its tools. Runs recorded before timings existed
+      // carry a zero and simply do not contribute.
+      tokensPerSecond: row.model_ms > 0 ? row.timed_output / (row.model_ms / 1000) : null,
+      p50Seconds: percentile(sorted, 0.5),
+      p90Seconds: percentile(sorted, 0.9)
+    };
+  });
+}
+
+/** Nearest-rank percentile of an ascending array; null when there is nothing. */
+function percentile(sorted, fraction) {
+  if (!sorted.length) {
+    return null;
+  }
+  const rank = Math.ceil(fraction * sorted.length);
+  return sorted[Math.min(sorted.length, Math.max(1, rank)) - 1];
 }
 
 export function queryTotals(handle, { days = 30 } = {}) {

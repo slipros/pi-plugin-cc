@@ -74,3 +74,53 @@ test("totals group along whichever axis is asked for", () => {
   handle.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("the rate uses only runs that carry timings, and percentiles come from durations", () => {
+  const { handle, dir } = temporaryDatabase();
+
+  // A timed run: 600 generated tokens in 6s of model time.
+  recordJob(
+    handle,
+    job({
+      id: "timed",
+      model: "m1",
+      usage: { input: 10, output: 500, cost: 0 },
+      timing: { modelMs: 6000, toolMs: 30_000, spanMs: 36_000 },
+      startedAt: new Date(Date.now() - 36_000).toISOString()
+    })
+  );
+  // An untimed run from before the measurement existed: plenty of output, no
+  // model time. Folding its tokens into the rate would inflate it without end.
+  recordJob(handle, job({ id: "untimed", model: "m1", usage: { input: 10, output: 100_000, cost: 0 } }));
+  recordJob(handle, job({ id: "failed", model: "m1", status: "failed", usage: { input: 1, output: 1 } }));
+
+  const [row] = queryStats(handle, { by: "model", days: null });
+  assert.equal(row.runs, 3);
+  assert.equal(row.completed, 2);
+  assert.equal(row.failed, 1);
+  assert.equal(Math.round(row.tokensPerSecond), 83, "500 tokens over 6s, untimed run excluded");
+  assert.equal(row.p50Seconds, 12);
+  assert.equal(row.p90Seconds, 36, "the slow run is what p90 is for");
+
+  handle.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("the models report only queries the journal when stats are asked for", async () => {
+  const { renderModelsReport } = await import("../plugins/pi/scripts/lib/render.mjs");
+  const catalogue = { models: [{ id: "m1" }], presets: {}, prompts: [], defaults: {} };
+
+  assert.ok(!renderModelsReport(catalogue).includes("Measured here"), "no section without --stats");
+  assert.ok(
+    renderModelsReport({ ...catalogue, measured: [] }).includes("nothing to compare"),
+    "an empty history says so instead of showing an empty table"
+  );
+
+  const report = renderModelsReport({
+    ...catalogue,
+    measured: [
+      { bucket: "m1", runs: 4, completed: 3, tokensPerSecond: 40.4, p50Seconds: 12, p90Seconds: 300, turns: 8, tool_calls: 10, tool_errors: 1, cost: 0 }
+    ]
+  });
+  assert.match(report, /\| `m1` \| 4 \| 75% \| 40\.4 \| 12s \| 5m \| 2\.0 \| 10% \|/);
+});

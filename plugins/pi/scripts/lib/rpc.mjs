@@ -4,7 +4,7 @@ import process from "node:process";
 
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
-import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs } from "./pi.mjs";
+import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs, summarizeTiming } from "./pi.mjs";
 import { isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 const SETTLE_GRACE_MS = 1500;
@@ -74,7 +74,10 @@ export async function runPiRpcTurn({
       return;
     }
     try {
-      fs.appendFileSync(eventsFile, `${JSON.stringify(event)}\n`, "utf8");
+      // pi stamps a message with the time it was created, which makes
+      // message_start and message_end carry the same value; the arrival time is
+      // the only thing in the journal that can date an event afterwards.
+      fs.appendFileSync(eventsFile, `${JSON.stringify({ ...event, receivedAt: Date.now() })}\n`, "utf8");
     } catch {
       // A broken transcript must never take the job down.
     }
@@ -253,8 +256,10 @@ export async function runPiRpcTurn({
     usage: state.usage,
     model: state.model,
     stopReason: state.stopReason,
+    turns: state.turns,
     toolCalls: state.toolCalls,
     toolErrors: state.toolErrors,
+    timing: summarizeTiming(state.timing),
     queue: state.queue,
     steering: delivered,
     aborted,

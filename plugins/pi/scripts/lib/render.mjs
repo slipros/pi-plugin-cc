@@ -525,12 +525,12 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
   );
 
   lines.push(
-    `| ${by} | runs | ok | in | out | ctx avg | ctx max | tok/s | p50 | p90 | tools | err | cost |`,
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    `| ${by} | runs | ok | degr | in | out | ctx avg | ctx max | tok/s | p50 | p90 | tools | err | cost |`,
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
   );
   for (const row of rows) {
     lines.push(
-      `| ${row.bucket} | ${row.runs} | ${formatShare(row.completed, row.runs)} | ${formatTokens(row.input)} | ` +
+      `| ${row.bucket} | ${row.runs} | ${formatShare(row.completed, row.runs)} | ${row.degraded ?? 0} | ${formatTokens(row.input)} | ` +
         `${formatTokens(row.output)} | ${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
         `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatSeconds(row.p50Seconds)} | ` +
         `${formatSeconds(row.p90Seconds)} | ${row.tool_calls ?? 0} | ${row.tool_errors ?? 0} | ${formatCost(row.cost) ?? "—"} |`
@@ -541,7 +541,10 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
     "",
     "`tok/s` is generated tokens over model time — the run minus the time its tools held it; runs recorded before " +
       "timings existed count as zero and are left out of it. `p50`/`p90` are run durations, tools included. " +
-      "`ctx` is how much of the context window a run held at its peak — averaged and at its worst — which the `in` " +
+      "`degr` counts runs that finished with an answer but a non-zero exit — a truncated stream, a dropped connection. " +
+      "They are inside `ok`, since the work landed, and worth watching separately when a provider starts misbehaving.",
+    "",
+    "`ctx` is how much of the context window a run held at its peak — averaged and at its worst — which the `in` " +
       "column cannot show, since every turn resends the conversation.",
     "",
     "A `*` on `tok/s` marks a provider that streams hidden reasoning but reports `reasoning = 0`: those tokens cost " +

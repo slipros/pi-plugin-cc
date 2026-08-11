@@ -508,7 +508,10 @@ test("a profile caps how many of its containers run at once", async () => {
 
   // No cap configured: the run must not consult docker at all.
   const uncapped = normalizeSandbox("go", { go: { image: "img" } });
-  assert.deepEqual(await awaitSandboxSlot(uncapped), { waitedMs: 0, slots: null });
+  const unlimited = await awaitSandboxSlot(uncapped);
+  assert.equal(unlimited.slots, null);
+  assert.equal(unlimited.waitedMs, 0);
+  assert.equal(typeof unlimited.release, "function", "callers release unconditionally");
 
   // The profile name survives normalization — the cap and the container name
   // both key on it.
@@ -588,4 +591,30 @@ test("a pool limit comes from the config, and a missing pool is refused", async 
     /concurrency pool "ollama-pro", which is not defined/,
     "a typo in the pool name must not silently mean unlimited"
   );
+});
+
+test("a claimed slot counts before its container exists", async () => {
+  const { awaitSandboxSlot, describeSlotUsage, normalizeSandbox } = await import(
+    "../plugins/pi/scripts/lib/sandbox.mjs"
+  );
+  // A pool nothing else uses, so the count is entirely ours.
+  const pool = `test-pool-${process.pid}-${Date.now()}`;
+  const sandbox = normalizeSandbox({ mode: "docker", image: "img", concurrencyGroup: pool, maxConcurrent: 1 }, {});
+
+  assert.equal(describeSlotUsage(sandbox).used, 0);
+
+  // Claiming without ever starting a container still occupies the slot: this is
+  // the window in which two runs used to both pass the check and both start.
+  const claim = await awaitSandboxSlot(sandbox, { timeoutMs: 1000, pollMs: 10 });
+  try {
+    assert.equal(describeSlotUsage(sandbox).used, 1, "the reservation is visible to the next run");
+    await assert.rejects(
+      () => awaitSandboxSlot(sandbox, { timeoutMs: 0, pollMs: 10 }),
+      /allows 1 container/,
+      "a second run waits instead of racing in"
+    );
+  } finally {
+    claim.release();
+  }
+  assert.equal(describeSlotUsage(sandbox).used, 0, "releasing frees it again");
 });

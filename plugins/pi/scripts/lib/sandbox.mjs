@@ -54,6 +54,14 @@ const SANDBOX_DEFAULTS = {
 
 const DISABLED = new Set(["none", "off", "false", "no"]);
 
+/** How long a slot reservation is trusted before it is treated as abandoned. */
+const RESERVATION_WINDOW_MS = 30_000;
+
+/** File-name-safe key identifying one slot scope (a pool or a profile). */
+function slotScopeKey(label, value) {
+  return `${label}-${value}`.replace(/[^a-zA-Z0-9_.-]+/g, "-");
+}
+
 /**
  * Names that read as "some kind of sandbox" but used to disable it.
  *
@@ -476,6 +484,64 @@ export function countRunningForLabel(label, value) {
  * Returns null when nothing is capped, so callers can skip the docker call and
  * the reporting entirely.
  */
+/** Where slot reservations live: one file per run whose container docker cannot see yet. */
+function reservationDir() {
+  return path.join(os.tmpdir(), "pi-companion", "slots");
+}
+
+/**
+ * Count reservations still inside their window.
+ *
+ * `docker ps` only shows a container about a second after the run starts, so
+ * two runs checking in that gap both see a free slot and both start. A
+ * reservation covers exactly that gap; expired files are deleted rather than
+ * trusted, so a process that died between claiming and starting cannot hold a
+ * slot forever.
+ */
+function countReservations(scopeKey, { now = Date.now(), windowMs = RESERVATION_WINDOW_MS } = {}) {
+  let live = 0;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(reservationDir());
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(`${scopeKey}.`)) {
+      continue;
+    }
+    const file = path.join(reservationDir(), entry);
+    try {
+      if (now - fs.statSync(file).mtimeMs > windowMs) {
+        fs.unlinkSync(file);
+        continue;
+      }
+      live += 1;
+    } catch {
+      // Removed by whoever owned it; not our slot to count.
+    }
+  }
+  return live;
+}
+
+/** Claim a slot for the moment between "docker ps says free" and the container existing. */
+function reserveSlot(scopeKey) {
+  const file = path.join(reservationDir(), `${scopeKey}.${process.pid}.${Date.now()}`);
+  try {
+    fs.mkdirSync(reservationDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, String(process.pid), "utf8");
+    return () => {
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        // Already expired and swept.
+      }
+    };
+  } catch {
+    return () => {};
+  }
+}
+
 export function describeSlotUsage(sandbox) {
   const limit = Number(sandbox?.maxConcurrent ?? 0);
   const group = sandbox?.concurrencyGroup ?? null;
@@ -483,8 +549,9 @@ export function describeSlotUsage(sandbox) {
   if (!isSandboxed(sandbox) || !value || !Number.isFinite(limit) || limit <= 0) {
     return null;
   }
+  const scopeKey = slotScopeKey(group ? "pool" : "profile", value);
   return {
-    used: countRunningForLabel(group ? "pool" : "profile", value),
+    used: countRunningForLabel(group ? "pool" : "profile", value) + countReservations(scopeKey),
     limit,
     scope: group ? `pool \`${group}\`` : `profile \`${sandbox.profileName}\``
   };
@@ -512,15 +579,18 @@ export async function awaitSandboxSlot(sandbox, { timeoutMs = 900_000, onProgres
     : { label: "profile", value: sandbox?.profileName ?? null, what: `profile "${sandbox?.profileName}"` };
 
   if (!isSandboxed(sandbox) || !scope.value || !Number.isFinite(limit) || limit <= 0) {
-    return { waitedMs: 0, slots: null };
+    return { waitedMs: 0, slots: null, release: () => {} };
   }
 
   const startedAt = Date.now();
+  const scopeKey = slotScopeKey(scope.label, scope.value);
   let announced = false;
   for (;;) {
-    const running = countRunningForLabel(scope.label, scope.value);
+    const running = countRunningForLabel(scope.label, scope.value) + countReservations(scopeKey);
     if (running < limit) {
-      return { waitedMs: Date.now() - startedAt, slots: limit - running };
+      // Claimed before returning, so the next run counts this one even though
+      // its container does not exist yet.
+      return { waitedMs: Date.now() - startedAt, slots: limit - running, release: reserveSlot(scopeKey) };
     }
     if (Date.now() - startedAt >= timeoutMs) {
       throw new Error(

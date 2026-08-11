@@ -131,7 +131,6 @@ const RUN_FLAGS = {
     "exclude-tools",
     "session",
     "timeout",
-    "name",
     "base",
     "scope",
     "engine",
@@ -176,6 +175,19 @@ const KNOWN_FLAGS = new Set([
   "pi-version",
   "job"
 ]);
+
+/**
+ * A numeric flag has to be a number: `--timeout 30m` used to become NaN, which
+ * silently removed both the run's time limit and the bound on waiting for a
+ * sandbox slot, leaving the run to hang indefinitely.
+ */
+function positiveNumber(value, flag) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${flag} expects a positive number, got "${value}".`);
+  }
+  return parsed;
+}
 
 /** `--model`, `-m`, `--model=x` and `-m=x` all name the same flag. */
 function canonicalFlag(token) {
@@ -326,7 +338,7 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
       : {}),
     ...(flags["read-only"] ? { readOnly: true } : {}),
     ...(flags.write ? { readOnly: false } : {}),
-    ...(flags.timeout ? { timeoutMs: Number(flags.timeout) * 1000 } : {})
+    ...(flags.timeout ? { timeoutMs: positiveNumber(flags.timeout, "--timeout") * 1000 } : {})
   };
 
   const settings = resolveRunSettings(config, command, overrides);
@@ -612,7 +624,7 @@ async function executeRun({
 async function commandSetup(argv, workspaceRoot) {
   const { flags } = parseArgs(argv, { booleans: ["json"] });
   const availability = getPiAvailability(workspaceRoot);
-  const { config, sources, errors } = loadConfig(workspaceRoot);
+  const { config, sources, errors, warnings: configWarnings } = loadConfig(workspaceRoot);
   const configuredSandbox = normalizeSandbox(config.defaults?.sandbox ?? null, config.sandboxProfiles);
 
   const payload = {
@@ -625,7 +637,7 @@ async function commandSetup(argv, workspaceRoot) {
       ).ok
     },
     configSources: sources,
-    configErrors: errors,
+    configErrors: [...errors, ...(configWarnings ?? [])],
     presets: Object.keys(config.presets ?? {}),
     prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
     stateDir: resolveStateDir(workspaceRoot),
@@ -710,9 +722,12 @@ async function commandDelegate(argv, workspaceRoot) {
     throw new Error("Nothing to delegate. Pass the task text, e.g. `/pi:delegate investigate the flaky test`.");
   }
 
-  const { config } = loadConfig(workspaceRoot);
+  const { config, warnings: configWarnings } = loadConfig(workspaceRoot);
   const runRoot = resolveRunRoot(flags.cwd);
   const settings = buildRunSettings({ command: "delegate", flags, workspaceRoot, runRoot, config });
+  // Anything the project layer was not allowed to set has to be visible: a
+  // silently ignored setting looks exactly like one that did not work.
+  settings.warnings = [...(configWarnings ?? []), ...settings.warnings];
   const sessionId = flags.fresh ? null : resolveSessionReference(workspaceRoot, flags.session);
 
   const title = prompt.split("\n")[0].slice(0, 120);
@@ -1049,9 +1064,9 @@ async function commandStats(argv, workspaceRoot) {
   }
 
   try {
-    const days = flags.all ? null : Number(flags.days ?? 30);
+    const days = flags.all ? null : positiveNumber(flags.days ?? 30, "--days");
     const by = flags.by ?? "day";
-    const rows = queryStats(handle, { by, days, limit: Number(flags.limit ?? 50) });
+    const rows = queryStats(handle, { by, days, limit: positiveNumber(flags.limit ?? 50, "--limit") });
     const totals = queryTotals(handle, { days });
 
     output(
@@ -1136,8 +1151,21 @@ async function commandSandbox(argv, workspaceRoot) {
 
   if (action === "clean") {
     const containers = listSandboxContainers();
+    // A running container belongs to a live run: removing it kills the agent
+    // mid-task, and the job record is left claiming it is still working. Clean
+    // is for leftovers, so live ones need saying so out loud and asking again.
+    const live = containers.filter((container) => /^Up\b/i.test(String(container.status ?? "")));
+    if (live.length && !flags.all) {
+      output(
+        `${live.length} sandbox container(s) are still running: ${live.map((c) => `\`${c.name}\``).join(", ")}.\n` +
+          "Stop them with `/pi:cancel <job-id>`, or re-run `sandbox clean --all` to remove them anyway.\n",
+        { action, live: live.map((container) => container.name), removed: [] },
+        Boolean(flags.json)
+      );
+      return 1;
+    }
     const removed = containers.filter((container) => removeSandboxContainer(container.name));
-    const payload = { action, removed: removed.map((container) => container.name) };
+    const payload = { action, removed: removed.map((container) => container.name), killedLive: flags.all ? live.length : 0 };
     output(
       removed.length
         ? `Removed ${removed.length} sandbox container(s): ${removed.map((c) => `\`${c.name}\``).join(", ")}.\n`

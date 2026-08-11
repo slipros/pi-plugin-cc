@@ -167,26 +167,125 @@ export function mergeConfigLayer(base, layer) {
 }
 
 /**
- * @returns {{ config: object, sources: string[], errors: string[] }}
+ * Settings a repository must not be able to choose for the machine it is
+ * checked out on.
+ *
+ * The project layer is read from the workspace — the same directory a sandboxed
+ * agent has write access to, and the same directory that arrives with an
+ * untrusted repository. Every key here weakens the boundary the sandbox exists
+ * to draw: turning it off, mounting the host into it, running as root, or
+ * putting the agent directory (sessions, credentials) back on the host. A repo
+ * may still describe its own model, prompts and toolchain — that is what the
+ * project layer is for.
+ */
+const PROJECT_FORBIDDEN_SANDBOX_KEYS = ["args", "mounts", "agentDir", "user", "image", "auth", "network"];
+
+function sanitizeUntrustedEntry(entry, path, warnings) {
+  if (!isPlainObject(entry)) {
+    return entry;
+  }
+  const clean = { ...entry };
+
+  if ("mounts" in clean) {
+    warnings.push(`${path}.mounts ignored: the project config cannot mount host directories.`);
+    delete clean.mounts;
+  }
+
+  if ("sandbox" in clean) {
+    const sandbox = clean.sandbox;
+    const disables =
+      sandbox == null || sandbox === false || (typeof sandbox === "string" && /^(none|off|false|no)$/i.test(sandbox.trim()));
+    if (disables) {
+      warnings.push(`${path}.sandbox ignored: the project config cannot turn the sandbox off.`);
+      delete clean.sandbox;
+    } else if (isPlainObject(sandbox)) {
+      const cleanSandbox = { ...sandbox };
+      for (const key of PROJECT_FORBIDDEN_SANDBOX_KEYS) {
+        if (key in cleanSandbox) {
+          warnings.push(`${path}.sandbox.${key} ignored: the project config cannot change container isolation.`);
+          delete cleanSandbox[key];
+        }
+      }
+      clean.sandbox = cleanSandbox;
+    }
+  }
+
+  return clean;
+}
+
+/**
+ * Strip the keys a workspace is not allowed to decide for its host.
+ *
+ * Skipped entirely when the user has marked the workspace as trusted, which is
+ * the normal case for one's own repositories.
+ */
+export function sanitizeProjectLayer(layer, warnings = []) {
+  if (!isPlainObject(layer)) {
+    return layer;
+  }
+  const clean = { ...layer };
+
+  if (isPlainObject(clean.defaults)) {
+    clean.defaults = sanitizeUntrustedEntry(clean.defaults, "defaults", warnings);
+  }
+  for (const section of ["presets", "sandboxProfiles"]) {
+    if (!isPlainObject(clean[section])) {
+      continue;
+    }
+    const entries = {};
+    for (const [name, entry] of Object.entries(clean[section])) {
+      entries[name] =
+        section === "sandboxProfiles"
+          ? sanitizeUntrustedEntry({ sandbox: entry }, `${section}.${name}`, warnings).sandbox ?? entry
+          : sanitizeUntrustedEntry(entry, `${section}.${name}`, warnings);
+    }
+    clean[section] = entries;
+  }
+  return clean;
+}
+
+/** Whether the user has vouched for this workspace's config. */
+function isTrustedWorkspace(userLayer, workspaceRoot) {
+  if (userLayer?.trustProjectConfig === true) {
+    return true;
+  }
+  const trusted = Array.isArray(userLayer?.trustedProjects) ? userLayer.trustedProjects : [];
+  const target = path.resolve(workspaceRoot ?? ".");
+  return trusted.some((entry) => {
+    const root = path.resolve(String(entry).replace(/^~(?=\/|$)/, os.homedir()));
+    return target === root || target.startsWith(`${root}${path.sep}`);
+  });
+}
+
+/**
+ * @returns {{ config: object, sources: string[], errors: string[], warnings: string[] }}
  */
 export function loadConfig(workspaceRoot) {
   const sources = [];
   const errors = [];
+  const warnings = [];
   let config = BUILT_IN;
 
-  for (const filePath of [userConfigPath(), projectConfigPath(workspaceRoot)]) {
-    const { value, error } = readJsonFile(filePath);
-    if (error) {
-      errors.push(error);
-      continue;
-    }
-    if (value) {
-      sources.push(filePath);
-      config = mergeConfigLayer(config, value);
-    }
+  const user = readJsonFile(userConfigPath());
+  if (user.error) {
+    errors.push(user.error);
+  }
+  if (user.value) {
+    sources.push(userConfigPath());
+    config = mergeConfigLayer(config, user.value);
   }
 
-  return { config, sources, errors };
+  const project = readJsonFile(projectConfigPath(workspaceRoot));
+  if (project.error) {
+    errors.push(project.error);
+  }
+  if (project.value) {
+    sources.push(projectConfigPath(workspaceRoot));
+    const trusted = isTrustedWorkspace(user.value, workspaceRoot);
+    config = mergeConfigLayer(config, trusted ? project.value : sanitizeProjectLayer(project.value, warnings));
+  }
+
+  return { config, sources, errors, warnings };
 }
 
 /**

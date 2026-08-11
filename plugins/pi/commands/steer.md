@@ -22,7 +22,7 @@ Notes to relay when relevant:
 
 - A steering message reaches pi after its current assistant turn finishes its tool calls, before the next model call — it redirects work in progress rather than interrupting it mid-tool.
 - `--follow-up` queues the message for after the agent finishes instead.
-- If the job already finished, the message is sent as a new prompt in the same pi session.
+- If the agent has settled but the run is still alive, the message is sent as a new prompt in the same pi session. A job that has already finished cannot be steered: the command refuses and points at `--session <id>` for a fresh run.
 - Jobs started with `--engine json` have no control channel; they must be re-run on the default `rpc` engine to be steerable.
 
 Do not start new pi work in this turn, and do not act on the job's output yourself.

@@ -475,7 +475,7 @@ export async function runPiTurn({
   // A profile may cap how many of its containers run at once, because the
   // provider behind it caps sessions. Queue here, before the container is
   // started, so the wait costs time instead of a failed run.
-  await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
+  const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
   const state = createTurnState();
   const report = (event) => {
@@ -496,6 +496,9 @@ export async function runPiTurn({
   });
 
   onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
+  // The container exists now, so docker ps can see it and the reservation
+  // that covered the gap is no longer needed.
+  slot.release?.();
 
   let stderr = "";
   let stdoutRest = "";

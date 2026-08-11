@@ -53,7 +53,7 @@ Every run command takes the same selection flags:
 /pi:review   --model opencode-go/glm-5.2 --base main
 ```
 
-- `--model` accepts `provider/id`, a bare id, a glob (`anthropic/*`) or a fuzzy substring — pi's own matching rules apply. The plugin checks your local catalogue first and warns when a name does not match anything.
+- `--model` accepts `provider/id`, a bare id, or a substring that matches exactly one catalogue entry (`kimi` → `opencode-go/kimi-k3`). The plugin checks your local catalogue first and warns when a name matches nothing or several things; the name is passed to pi either way, so a model the catalogue does not know about still runs.
 - `--thinking off|minimal|low|medium|high|xhigh|max` sets reasoning effort.
 - `--preset <name>` applies a named bundle from your config (see below).
 - With no flags at all, pi uses its own configured default model.
@@ -158,7 +158,10 @@ Built-in pi tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
 /pi:delegate --tools read,grep,bash reproduce the bug, change nothing
 /pi:delegate --exclude-tools bash   fix the types, do not run commands
 /pi:delegate --no-tools             think out loud about the architecture
+/pi:delegate --write                override a preset's read-only setting
 ```
+
+`--read-only` and `--write` are the top layer: they outrank both the preset and the command's defaults, which is why `review --write` lifts the read-only setting review is configured with. `--stdin` appends piped input to the prompt, for handing over a brief without quoting it.
 
 `--read-only` also keeps the LSP navigation tools — `lsp_definition`, `lsp_references`, `lsp_hover`, `lsp_document_symbols`, `lsp_workspace_symbols`, `lsp_more` — since finding who calls a symbol changes nothing and is exactly what a review needs. `lsp_diagnostics` is left out: gates decide whether code is broken. Note `--tools` is an allow list, so spelling one out drops everything you did not name, LSP included.
 
@@ -170,7 +173,7 @@ Anything beyond the built-ins comes from pi extensions — including MCP servers
 /pi:delegate --no-extensions                  clean run, no third-party tools
 ```
 
-pi itself has **no sandbox** — by default `bash`, `edit` and `write` run with your permissions. `/pi:review` is always read-only; `/pi:delegate` allows writes by default. A delegated run that edited files leaves those edits in your working tree: review them with `git diff` before committing, the plugin never commits anything. For real isolation, see the next section.
+pi itself has **no sandbox** — by default `bash`, `edit` and `write` run with your permissions. `/pi:review` is read-only by configuration and `/pi:delegate` allows writes; either can be flipped for one run with `--read-only` or `--write`, which outrank both the preset and the command's defaults. A delegated run that edited files leaves those edits in your working tree: review them with `git diff` before committing, the plugin never commits anything. For real isolation, see the next section.
 
 ## Sandboxing a run
 
@@ -437,6 +440,7 @@ pi-companion.mjs stats --by model            # how each model behaved
 pi-companion.mjs stats --by preset --days 7
 pi-companion.mjs stats --by workspace --all
 pi-companion.mjs stats --by status           # how runs ended
+pi-companion.mjs stats --by kind             # delegate versus review
 pi-companion.mjs models --stats <search>     # the catalogue plus these numbers
 ```
 

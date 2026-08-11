@@ -23,7 +23,7 @@ Review target:
 
 Model and prompt:
 
-- The review runs read-only (`read`, `grep`, `find`, `ls`) with the `reviewer` system prompt. `--system-prompt adversarial` switches to the design-challenging review.
+- The review runs read-only — `read`, `grep`, `find`, `ls` plus LSP navigation — with the `reviewer` system prompt. `--system-prompt adversarial` switches to the design-challenging review. Read-only here is a default, not a guarantee: `--write` overrides it, so do not pass that flag unless the user asked for a review that also edits.
 - `--preset`, `--model`, `--provider` and `--thinking` select the profile and model, exactly as in `/pi:delegate`.
 
 Execution mode rules:

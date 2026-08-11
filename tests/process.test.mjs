@@ -119,3 +119,47 @@ test("commit identity is read from the directory, so gitdir rules apply", async 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a gitconfig identity outranks the preset one, and flags outrank both", async () => {
+  const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-identity-order-"));
+  const repo = path.join(root, "repo");
+  const gitConfig = path.join(root, "home.gitconfig");
+  fs.writeFileSync(gitConfig, "[user]\n\tname = Personal\n\temail = me@example.dev\n");
+
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_SYSTEM: "/dev/null", HOME: root };
+  execFileSync("git", ["init", "-q", repo], { env });
+
+  // A preset that names an agent identity — the fallback for trees where git
+  // has no answer, not an override of the one the user configured.
+  const config = { presets: { agent: { git: { name: "pi agent", email: "pi@example.dev" } } } };
+  const previous = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = gitConfig;
+  try {
+    assert.deepEqual(
+      buildRunSettings({ command: "delegate", flags: { preset: "agent" }, workspaceRoot: repo, runRoot: repo, config }).git,
+      { name: "Personal", email: "me@example.dev" },
+      "the configured identity wins over the preset"
+    );
+    assert.deepEqual(
+      buildRunSettings({
+        command: "delegate",
+        flags: { preset: "agent", "git-name": "Flag Name", "git-email": "flag@example.dev" },
+        workspaceRoot: repo,
+        runRoot: repo,
+        config
+      }).git,
+      { name: "Flag Name", email: "flag@example.dev" },
+      "an explicit flag is still the last word"
+    );
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previous;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

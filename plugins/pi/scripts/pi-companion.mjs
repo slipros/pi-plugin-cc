@@ -245,7 +245,7 @@ function resolveSessionReference(workspaceRoot, reference) {
 /**
  * Turn parsed flags + config into the concrete settings of one run.
  */
-function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRoot, config }) {
+export function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRoot, config }) {
   const overrides = {
     model: flags.model ?? null,
     provider: flags.provider ?? null,
@@ -273,11 +273,14 @@ function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRo
   };
 
   const settings = resolveRunSettings(config, command, overrides);
-  if (!settings.git) {
-    // Nothing was named explicitly, so inherit whatever git would use in this
-    // directory. In a sandbox that is the only way a per-directory rule can
-    // survive: the container sees /workspace, not the path the rule matches.
-    settings.git = resolveCommitIdentity(runRoot);
+  if (!flags["git-name"] && !flags["git-email"]) {
+    // Identity order is flags, then git's own answer for this directory, then a
+    // preset. Config files outrank presets deliberately: an `includeIf
+    // "gitdir:…"` rule is the decision about who commits in this tree, while a
+    // preset only names a fallback for trees that have no such rule. In a
+    // sandbox this resolution is also the only way such a rule can survive —
+    // the container sees /workspace, not the path the rule matches.
+    settings.git = resolveCommitIdentity(runRoot) ?? settings.git;
   }
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
 
@@ -1100,11 +1103,34 @@ async function main() {
   return handler(rest, workspaceRoot);
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code ?? 0;
-  })
-  .catch((error) => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 1;
-  });
+/**
+ * Whether this file was executed rather than imported.
+ *
+ * Compared through realpath because the skill exposes the script as a symlink
+ * (`~/.claude/skills/pi/scripts` → the plugin directory): argv holds the link,
+ * `import.meta.url` the file it points at, and a plain string compare would
+ * silently turn every CLI invocation into a no-op.
+ */
+function invokedAsScript() {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+// Run the CLI only when this file is the entry point, so tests can import the
+// settings resolution without the module parsing their argv as a command.
+if (invokedAsScript()) {
+  main()
+    .then((code) => {
+      process.exitCode = code ?? 0;
+    })
+    .catch((error) => {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 1;
+    });
+}

@@ -147,7 +147,7 @@ Nested objects merge the same way, so `"sandbox": {"network": "none"}` keeps the
 
 One default is set for you: `excludeTools` is `["ask_question"]`, because a delegated run has nobody at the keyboard and a question tool would burn a turn waiting for an answer that never comes. Set `"excludeTools": []` in any layer to hand it back.
 
-Values resolve layer by layer, highest first: command-line flags → preset → per-command defaults → global defaults. The system prompt is chosen as a unit, so `--system-prompt` on the command line replaces a preset's prompt outright; `appendSystemPrompt`, `extensions`, `skills` and `mounts` stack across layers instead of replacing each other.
+Values resolve layer by layer, highest first: command-line flags → preset → per-command defaults → global defaults. Commit identity is the one exception: your gitconfig sits between the flags and the preset (see "Who the agent commits as"). The system prompt is chosen as a unit, so `--system-prompt` on the command line replaces a preset's prompt outright; `appendSystemPrompt`, `extensions`, `skills` and `mounts` stack across layers instead of replacing each other.
 
 ## Choosing the agent's tools
 
@@ -388,7 +388,9 @@ This sets `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, which git reads ahead of any con
 
 Name and email come as a pair: half an identity is refused before the run starts, since git would refuse the commit anyway. Layers merge field by field, so a global name and a per-preset address work.
 
-**Leave it unset and the identity is inherited from the working directory.** The companion asks git, in the directory the agent will work in, who it would commit as — so `includeIf "gitdir:…"` rules keep working inside the sandbox:
+**Order of precedence: flags, then your gitconfig, then a preset.** A `git` block in a preset or in `defaults` is a *fallback*, used only where git itself has no answer — it does not override the identity you configured for that tree. To make an agent commit as itself in a tree where you have an identity, pass the flags on the run.
+
+**With no flags, the identity is read from the working directory.** The companion asks git, in the directory the agent will work in, who it would commit as — so `includeIf "gitdir:…"` rules keep working inside the sandbox:
 
 ```gitconfig
 [includeIf "gitdir:~/work/"]

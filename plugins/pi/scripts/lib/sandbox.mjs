@@ -268,6 +268,11 @@ export function buildDockerRunArgs({
   if (sandbox.profileName) {
     args.push("--label", `${LABEL}-profile=${sandbox.profileName}`);
   }
+  if (sandbox.credentialProxy) {
+    // The proxy listens on the host's loopback; this is the name that reaches it
+    // from inside on Linux, where it is not resolvable by default.
+    args.push("--add-host", "host.docker.internal:host-gateway");
+  }
   if (sandbox.concurrencyGroup) {
     args.push("--label", `${LABEL}-pool=${sandbox.concurrencyGroup}`);
   }
@@ -320,12 +325,19 @@ export function buildDockerRunArgs({
     // naming one fails with "Unknown provider". It holds no credentials —
     // those are in auth.json, which only comes along when `auth` is on.
     const hostAgentDir = path.join(homeDir, ".pi", "agent");
-    const models = path.join(hostAgentDir, "models.json");
-    if (fs.existsSync(models)) {
+    // With a proxy in front, the container's provider table points at it rather
+    // than at the model host: the run reaches models exactly as before, it just
+    // never learns the address or the key of the real endpoint.
+    const models = sandbox.credentialProxy
+      ? writeProxyModels(hostAgentDir, sandbox)
+      : path.join(hostAgentDir, "models.json");
+    if (models && fs.existsSync(models)) {
       args.push("-v", `${models}:${AGENT_DIR}/models.json:ro`);
     }
     if (sandbox.auth) {
-      const credentials = resolveCredentialsMount(hostAgentDir, sandbox.provider ?? null);
+      const credentials = sandbox.credentialProxy
+        ? writeProxyCredentials(sandbox)
+        : resolveCredentialsMount(hostAgentDir, sandbox.provider ?? null);
       if (credentials) {
         args.push("-v", `${credentials}:${AGENT_DIR}/auth.json:ro`);
       }
@@ -340,6 +352,48 @@ export function buildDockerRunArgs({
   args.push(sandbox.image || DEFAULT_SANDBOX_IMAGE);
   args.push(...piArgs);
   return args;
+}
+
+/** Per-run configuration handed to the container, kept out of the host's own. */
+function runConfigDir() {
+  return path.join(os.tmpdir(), "pi-companion", "auth");
+}
+
+function writeRunConfig(name, contents) {
+  const dir = runConfigDir();
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, `${name}.${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify(contents), { encoding: "utf8", mode: 0o600 });
+  return file;
+}
+
+/** auth.json holding the run token instead of the provider's own credential. */
+function writeProxyCredentials(sandbox) {
+  const provider = String(sandbox.provider);
+  // The shape pi expects for a key-based provider; the value is the run token,
+  // which is only meaningful to this run's proxy.
+  return writeRunConfig(`auth-${provider.replace(/[^a-zA-Z0-9_.-]+/g, "-")}`, {
+    [provider]: { type: "api_key", key: sandbox.credentialProxy.token }
+  });
+}
+
+/** models.json with this provider's base URL redirected to the run's proxy. */
+function writeProxyModels(hostAgentDir, sandbox) {
+  const provider = String(sandbox.provider);
+  let table = { providers: {} };
+  try {
+    table = JSON.parse(fs.readFileSync(path.join(hostAgentDir, "models.json"), "utf8"));
+  } catch {
+    return null;
+  }
+  const entry = table?.providers?.[provider];
+  if (!entry) {
+    return null;
+  }
+  return writeRunConfig(`models-${provider.replace(/[^a-zA-Z0-9_.-]+/g, "-")}`, {
+    ...table,
+    providers: { ...table.providers, [provider]: { ...entry, baseUrl: sandbox.credentialProxy.url } }
+  });
 }
 
 /**

@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
 import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs, summarizeTiming } from "./pi.mjs";
+import { startCredentialProxy } from "./credential-proxy.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 const SETTLE_GRACE_MS = 1500;
@@ -17,6 +20,36 @@ const SHUTDOWN_GRACE_MS = 5000;
  * is what makes mid-flight steering possible: control messages appended to the
  * job inbox are forwarded as `steer` / `follow_up` / `abort` commands.
  */
+/**
+ * Bring up the credential proxy for a sandboxed run, if the provider allows it.
+ *
+ * Never fatal: a proxy that cannot start means the run proceeds the old way,
+ * with the provider's own credential mounted, rather than not running at all.
+ */
+async function openCredentialProxy(sandbox, onProgress) {
+  // `proxyCredentials: false` in a profile opts out — for a provider whose
+  // endpoint does something the plain forwarder here does not reproduce.
+  if (!isSandboxed(sandbox) || !sandbox.auth || !sandbox.provider || sandbox.proxyCredentials === false) {
+    return null;
+  }
+  try {
+    const homeDir = os.homedir();
+    const auth = JSON.parse(fs.readFileSync(path.join(homeDir, ".pi", "agent", "auth.json"), "utf8"));
+    const proxy = await startCredentialProxy({
+      homeDir,
+      provider: sandbox.provider,
+      authEntry: auth?.[sandbox.provider],
+      onWarning: (message) => onProgress?.({ phase: "working", message })
+    });
+    if (proxy) {
+      onProgress?.({ phase: "starting", message: `Credentials stay on the host: ${sandbox.provider} goes through a run-scoped proxy.` });
+    }
+    return proxy;
+  } catch {
+    return null;
+  }
+}
+
 export async function runPiRpcTurn({
   cwd,
   prompt,
@@ -39,6 +72,13 @@ export async function runPiRpcTurn({
   // A profile may cap how many of its containers run at once, because the
   // provider behind it caps sessions. Queue here, before the container is
   // started, so the wait costs time instead of a failed run.
+  // Credentials stay on the host: the container gets a token for a proxy that
+  // lives exactly as long as this run. Falls back to the previous behaviour for
+  // providers whose endpoint cannot be resolved.
+  const proxy = await openCredentialProxy(sandbox, onProgress);
+  if (proxy) {
+    sandbox = { ...sandbox, credentialProxy: { url: proxy.url, token: proxy.token } };
+  }
   const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
   const state = createTurnState();
@@ -265,6 +305,9 @@ export async function runPiRpcTurn({
   if (hardTimer) {
     clearTimeout(hardTimer);
   }
+
+  // The run is over, so the token it was given stops working right here.
+  await proxy?.close();
 
   const text = state.assistantTexts.at(-1) ?? "";
   const errors = [...state.errors];

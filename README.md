@@ -192,7 +192,7 @@ What the container gets:
 | --- | --- |
 | Workspace | bind mounted at `/workspace`, read-write — edits land in your tree as usual |
 | Agent directory | a named docker volume, so host settings, sessions and installed pi packages stay out |
-| Credentials | `~/.pi/agent/auth.json` bind mounted read-only, so providers work without the rest of `~/.pi/agent` |
+| Credentials | Never enter the container: a run-scoped proxy on the host holds the real key and the agent gets a token that dies with the run. Providers without a known base URL fall back to mounting that one provider's entry, not the whole file |
 | Provider definitions | `~/.pi/agent/models.json` bind mounted read-only, so custom providers (a local gateway, ollama, llama.cpp) resolve to the same models as on the host |
 | Identity | your uid/gid, so files written through the mount are not owned by root |
 | Network | on by default, because the model call needs it |

@@ -243,6 +243,9 @@ export function buildDockerRunArgs({
   if (sandbox.profileName) {
     args.push("--label", `${LABEL}-profile=${sandbox.profileName}`);
   }
+  if (sandbox.concurrencyGroup) {
+    args.push("--label", `${LABEL}-pool=${sandbox.concurrencyGroup}`);
+  }
 
   if (containerName) {
     args.push("--name", containerName);
@@ -430,20 +433,20 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
 }
 
 /**
- * How many containers of one profile are running right now.
+ * How many containers a slot label currently has running.
  *
  * Counted from docker rather than from the job journal: a job record can outlive
  * its container (and the other way round during startup), and the thing being
  * rationed is the container.
  */
-export function countRunningForProfile(profileName) {
-  if (!profileName) {
+export function countRunningForLabel(label, value) {
+  if (!value) {
     return 0;
   }
   const result = runCommand("docker", [
     "ps",
     "--filter",
-    `label=${LABEL}-profile=${profileName}`,
+    `label=${LABEL}-${label}=${value}`,
     "--format",
     "{{.Names}}"
   ]);
@@ -451,6 +454,26 @@ export function countRunningForProfile(profileName) {
     return 0;
   }
   return String(result.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean).length;
+}
+
+/**
+ * Which slots this sandbox draws from, and how many are taken right now.
+ *
+ * Returns null when nothing is capped, so callers can skip the docker call and
+ * the reporting entirely.
+ */
+export function describeSlotUsage(sandbox) {
+  const limit = Number(sandbox?.maxConcurrent ?? 0);
+  const group = sandbox?.concurrencyGroup ?? null;
+  const value = group ?? sandbox?.profileName ?? null;
+  if (!isSandboxed(sandbox) || !value || !Number.isFinite(limit) || limit <= 0) {
+    return null;
+  }
+  return {
+    used: countRunningForLabel(group ? "pool" : "profile", value),
+    limit,
+    scope: group ? `pool \`${group}\`` : `profile \`${sandbox.profileName}\``
+  };
 }
 
 /**
@@ -466,28 +489,36 @@ export function countRunningForProfile(profileName) {
  */
 export async function awaitSandboxSlot(sandbox, { timeoutMs = 900_000, onProgress = null, pollMs = 2000 } = {}) {
   const limit = Number(sandbox?.maxConcurrent ?? 0);
-  if (!isSandboxed(sandbox) || !sandbox.profileName || !Number.isFinite(limit) || limit <= 0) {
+  // Slots belong to a pool when the profile names one, and to the profile
+  // otherwise. A pool is what a shared provider needs: several profiles hitting
+  // the same account have to draw from one allowance, while a profile counting
+  // only itself would let them exceed it together.
+  const scope = sandbox?.concurrencyGroup
+    ? { label: "pool", value: String(sandbox.concurrencyGroup), what: `pool "${sandbox.concurrencyGroup}"` }
+    : { label: "profile", value: sandbox?.profileName ?? null, what: `profile "${sandbox?.profileName}"` };
+
+  if (!isSandboxed(sandbox) || !scope.value || !Number.isFinite(limit) || limit <= 0) {
     return { waitedMs: 0, slots: null };
   }
 
   const startedAt = Date.now();
   let announced = false;
   for (;;) {
-    const running = countRunningForProfile(sandbox.profileName);
+    const running = countRunningForLabel(scope.label, scope.value);
     if (running < limit) {
       return { waitedMs: Date.now() - startedAt, slots: limit - running };
     }
     if (Date.now() - startedAt >= timeoutMs) {
       throw new Error(
-        `Profile "${sandbox.profileName}" allows ${limit} container(s) at once and all of them are busy ` +
-          `after ${Math.round(timeoutMs / 1000)}s. Wait for a run to finish, or raise maxConcurrent.`
+        `Sandbox ${scope.what} allows ${limit} container(s) at once and all of them are busy ` +
+          `after ${Math.round(timeoutMs / 1000)}s. Wait for a run to finish, or raise the limit.`
       );
     }
     if (!announced) {
       announced = true;
       onProgress?.({
         phase: "starting",
-        message: `Waiting for a free slot: profile ${sandbox.profileName} is at its limit of ${limit}.`
+        message: `Waiting for a free slot: ${scope.what} is at its limit of ${limit}.`
       });
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs));

@@ -40,6 +40,10 @@ const BUILT_IN = {
   // Named sandbox profiles: the toolchain an agent needs inside the container
   // (mounted binaries, PATH, gate extensions), referenced by `"sandbox": "go"`.
   sandboxProfiles: {},
+  // Named slot pools: `{"ollama-pro": 3}` means every profile that declares
+  // `"concurrencyGroup": "ollama-pro"` draws from the same three slots. Optional
+  // — a profile can also cap itself with `maxConcurrent` and share nothing.
+  concurrencyPools: {},
   commands: {
     delegate: {},
     review: { systemPrompt: "reviewer", readOnly: true }
@@ -157,6 +161,7 @@ export function mergeConfigLayer(base, layer) {
     defaults: mergeEntry(base.defaults, isPlainObject(layer.defaults) ? layer.defaults : {}),
     presets: mergeNamed(base.presets, layer.presets),
     sandboxProfiles: mergeNamed(base.sandboxProfiles, layer.sandboxProfiles),
+    concurrencyPools: { ...base.concurrencyPools, ...(isPlainObject(layer.concurrencyPools) ? layer.concurrencyPools : {}) },
     commands: mergeNamed(base.commands, layer.commands)
   };
 }

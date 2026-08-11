@@ -532,3 +532,54 @@ test("a profile inherits its cap and passes the label docker filters on", async 
   const args = buildDockerRunArgs({ sandbox: derived, piArgs: [], cwd: "/repo", env: {} });
   assert.ok(args.includes("pi-plugin-cc-profile=go-mem"), "the label carries the profile the run actually used");
 });
+
+test("a pool shares slots across profiles, a profile without one counts alone", async () => {
+  const { buildDockerRunArgs, describeSlotUsage, normalizeSandbox } = await import(
+    "../plugins/pi/scripts/lib/sandbox.mjs"
+  );
+  const profiles = {
+    go: { image: "img", concurrencyGroup: "ollama-pro" },
+    "go-mem": { profile: "go" },
+    solo: { image: "img", maxConcurrent: 2 }
+  };
+
+  // Both profiles carry the same pool, so their containers get the same label
+  // and are counted together.
+  for (const name of ["go", "go-mem"]) {
+    const sandbox = normalizeSandbox(name, profiles);
+    assert.equal(sandbox.concurrencyGroup, "ollama-pro");
+    const args = buildDockerRunArgs({ sandbox, piArgs: [], cwd: "/repo", env: {} });
+    assert.ok(args.includes("pi-plugin-cc-pool=ollama-pro"), `${name} joins the pool`);
+    assert.ok(args.includes(`pi-plugin-cc-profile=${name}`), `${name} keeps its own profile label`);
+  }
+
+  // No pool named: slots stay per-profile, exactly as before pools existed.
+  const solo = normalizeSandbox("solo", profiles);
+  assert.equal(solo.concurrencyGroup, undefined);
+  const usage = describeSlotUsage(solo);
+  assert.equal(usage.limit, 2);
+  assert.match(usage.scope, /profile `solo`/);
+
+  // Nothing capped at all: no docker call, no reporting.
+  assert.equal(describeSlotUsage(normalizeSandbox("docker", {})), null);
+});
+
+test("a pool limit comes from the config, and a missing pool is refused", async () => {
+  const { applyConcurrencyPool } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const profiles = { go: { image: "img", concurrencyGroup: "ollama-pro" }, solo: { image: "img", maxConcurrent: 2 } };
+  const config = { concurrencyPools: { "ollama-pro": 3 } };
+
+  const pooled = applyConcurrencyPool(normalizeSandbox("go", profiles), config);
+  assert.equal(pooled.maxConcurrent, 3, "the pool decides, so profiles cannot disagree about it");
+
+  // A profile outside any pool is untouched — pools are opt-in.
+  const solo = normalizeSandbox("solo", profiles);
+  assert.equal(applyConcurrencyPool(solo, config).maxConcurrent, 2);
+
+  assert.throws(
+    () => applyConcurrencyPool(normalizeSandbox("go", profiles), { concurrencyPools: {} }),
+    /concurrency pool "ollama-pro", which is not defined/,
+    "a typo in the pool name must not silently mean unlimited"
+  );
+});

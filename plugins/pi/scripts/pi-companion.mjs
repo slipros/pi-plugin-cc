@@ -48,6 +48,7 @@ import {
   attachMounts,
   buildSandboxImage,
   describeSandbox,
+  describeSlotUsage,
   isSandboxed,
   listSandboxContainers,
   normalizeSandbox,
@@ -312,7 +313,7 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
       `The agent runs in ${runRoot}, outside this workspace. Its edits land there, not in ${workspaceRoot}.`
     );
   }
-  let sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles);
+  let sandbox = applyConcurrencyPool(normalizeSandbox(settings.sandbox, config.sandboxProfiles), config);
   let worktreeMount = null;
   if (settings.mounts.length && !isSandboxed(sandbox)) {
     // Without a container there is nothing to mount into: pi already sees the
@@ -379,6 +380,9 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     runRoot,
     sandbox,
     sandboxLabel: describeSandbox(sandbox),
+    // Occupancy at launch time: a run that has to queue should say so before it
+    // starts, not leave the caller wondering why nothing is happening.
+    slotUsage: describeSlotUsage(sandbox),
     worktreeMount,
     model: selection.model,
     provider: selection.provider,
@@ -615,6 +619,29 @@ async function commandModels(argv, workspaceRoot) {
 
   output(renderModelsReport(payload), payload, Boolean(flags.json));
   return 0;
+}
+
+/**
+ * Resolve a profile's slot allowance from the pool it belongs to.
+ *
+ * The limit lives with the pool rather than with each profile, so profiles
+ * sharing a provider cannot disagree about how many sessions that provider
+ * allows. A profile that names no pool keeps whatever `maxConcurrent` it set
+ * for itself, which is the default and needs no configuration at all.
+ */
+export function applyConcurrencyPool(sandbox, config) {
+  const group = sandbox?.concurrencyGroup;
+  if (!group) {
+    return sandbox;
+  }
+  const limit = Number(config?.concurrencyPools?.[group]);
+  if (!Number.isFinite(limit) || limit <= 0) {
+    throw new Error(
+      `Sandbox profile references concurrency pool "${group}", which is not defined. ` +
+        `Add "concurrencyPools": {"${group}": <slots>} to the config, or drop concurrencyGroup.`
+    );
+  }
+  return { ...sandbox, maxConcurrent: limit };
 }
 
 /**

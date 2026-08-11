@@ -343,6 +343,20 @@ The profile is configurable per preset, in full:
 
 `maxConcurrent` caps how many containers of one profile run at once. A run over the cap **waits for a slot** instead of failing: when the provider behind the profile limits parallel sessions, the extra runs would otherwise be cut off mid-flight. Its log shows `Waiting for a free slot: profile <name> is at its limit of N`, and the wait is bounded by the run's own timeout. Slots are counted from live docker containers, not from job records.
 
+**Several profiles can share one allowance** when the limit belongs to the provider rather than to a profile. The profile names a pool; the pool's size is declared once, at the root of the config:
+
+```json
+"concurrencyPools": { "ollama-pro": 3 },
+"sandboxProfiles": {
+  "go":     { "image": "pi-sandbox-go:latest", "concurrencyGroup": "ollama-pro" },
+  "go-mem": { "profile": "go" }
+}
+```
+
+`go` and `go-mem` now draw from the same three slots instead of three each. Keeping the number with the pool means profiles cannot disagree about how many sessions the provider allows, and a reference to an undefined pool is an error before the run starts rather than a silent "no limit". All of it is optional: without `concurrencyGroup` a profile falls back to its own `maxConcurrent`, and without that there is no cap at all.
+
+The run header shows occupancy at launch — `Slots: 2/3 in use · pool ollama-pro`, and `— this run waits for a free slot` when none is left.
+
 Containers are named `pi-<profile>-<job-id>` (`pi-go-delegate-msonq…`), so `docker ps` shows which profile is holding a slot.
 
 `memory`, `cpus` and `pidsLimit` are optional ceilings — leave them out and docker imposes none, which is how runs behaved before they existed. They earn their place once runs go parallel: a language server indexing a large repository holds several hundred megabytes on its own, so a few containers at once are gigabytes on the host. A profile passes them down to any profile built on it, and `args` still takes any docker flag these three do not cover.

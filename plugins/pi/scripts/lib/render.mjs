@@ -187,6 +187,7 @@ function renderRunHeader(title, { job, settings, execution }) {
     `- Model: ${execution?.model ? `\`${execution.model}\`` : settings.model ? `\`${settings.model}\`` : "pi default"}`,
     thinking ? `- Thinking: \`${thinking}\`` : null,
     settings.sandboxLabel ? `- Sandbox: ${settings.sandboxLabel}` : null,
+    formatSlots(settings.slotUsage),
     settings.presetName ? `- Preset: \`${settings.presetName}\`` : null,
     // Only worth a line when it is not the directory the caller is standing in.
     job.runRoot && job.runRoot !== job.workspaceRoot ? `- Working directory: \`${job.runRoot}\`` : null,
@@ -238,6 +239,7 @@ export function renderBackgroundStart({ job, settings, detachedLog = null }) {
     `- Kind: ${job.kind}`,
     `- Model: ${settings.model ? `\`${settings.model}\`` : "pi default"}`,
     settings.sandboxLabel ? `- Sandbox: ${settings.sandboxLabel}` : null,
+    formatSlots(settings.slotUsage),
     settings.promptName ? `- System prompt: \`${settings.promptName}\`` : null,
     job.runRoot && job.runRoot !== job.workspaceRoot ? `- Working directory: \`${job.runRoot}\`` : null,
     detachedLog ? `- Startup log: ${detachedLog}` : null,
@@ -439,6 +441,18 @@ function formatRate(rate) {
     return "—";
   }
   return rate >= 100 ? String(Math.round(rate)) : rate.toFixed(1);
+}
+
+/**
+ * Slot occupancy at launch. A full pool is worth spelling out: the run is not
+ * broken, it is queued, and that is otherwise indistinguishable from a hang.
+ */
+function formatSlots(usage) {
+  if (!usage) {
+    return null;
+  }
+  const line = `- Slots: ${usage.used}/${usage.limit} in use · ${usage.scope}`;
+  return usage.used >= usage.limit ? `${line} — this run waits for a free slot` : line;
 }
 
 /** Token counts at a glance: 812K rather than 812,431. */

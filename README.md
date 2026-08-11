@@ -13,9 +13,12 @@ Built in the shape of the official [Codex plugin](https://github.com/openai/code
 | `/pi:watch` | Watch what the agent is doing: turns, tool calls, answers. |
 | `/pi:steer` | Redirect a running agent mid-flight. |
 | `/pi:models` | List available models, presets and system prompts. |
-| `/pi:status` | Running and recent pi jobs for this workspace. |
-| `/pi:result` | Stored output of a finished job. |
-| `/pi:cancel` | Stop a running job (soft abort first). |
+| `/pi:status` | Running and recent pi jobs — this workspace, or every one with `--global`. |
+| `/pi:result` | Stored output of a finished job, and `--diff` for what it changed. |
+| `/pi:wait` | Block until background jobs finish. |
+| `/pi:cancel` | Stop a running job (soft abort first), or `--all` of them. |
+| `runs` | The journal as a list: what was run, what it was asked, what it cost. |
+| `rerun` | Run a recorded task again — same settings, or a different model. |
 | `/pi:sandbox` | Build and inspect the container image runs are isolated in. |
 | `stats` | Token usage across every workspace, grouped by day, model, preset or project. |
 | `/pi:setup` | Check that pi is installed, authenticated and configured. |
@@ -117,7 +120,25 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
 }
 ```
 
-**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Define them once and run `--preset dba`.
+**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`, `budget`. Define them once and run `--preset dba`.
+
+### Budgets: stopping a run that costs too much
+
+Time was the only ceiling a run had, and it is a poor proxy for the thing worth bounding — a fast model can spend a dollar in two minutes, a cheap one can idle for an hour for free.
+
+```json
+"presets": {
+  "explorer": { "model": "opencode-go/kimi-k3", "budget": { "maxCostUsd": 2, "maxTurns": 40 } }
+}
+```
+
+```bash
+/pi:delegate --max-cost 0.5 --max-tokens 200000 --max-turns 20   refactor the parser
+```
+
+Each ceiling applies on its own, and the flags add to what a preset already set rather than replacing it. The numbers come from the usage the run already reports, checked after every model answer: on the rpc engine the run is asked to `abort`, so it wraps up and keeps whatever it has produced; on `--engine json` there is no control channel and the process is stopped the way a timeout stops it.
+
+Enforcement is "stop after", never "predict before" — the size of a message is known only once it is paid for, so a budget can be crossed by the last message and no earlier. Set them as ceilings you do not want passed, not as exact allowances. A run stopped this way ends as a failure with `Stopped by the run budget: …` among its problems.
 
 ### Tuning a global preset for one project
 
@@ -200,6 +221,23 @@ What the container gets:
 The rest of your home directory, your SSH keys and everything outside the workspace are simply not there. Sessions live in the volume, so `--session last` keeps working across sandboxed runs — but a session started on the host cannot be continued in the sandbox, and vice versa.
 
 Extensions loaded from host paths (`--extension ~/.pi/agent/extensions/…`) do not exist inside the container; the plugin warns when a run asks for one. `npm:` and `git:` sources are fetched inside the container and work normally.
+
+### Trusted workspaces: what a repository may decide
+
+Two things hang off one list:
+
+```json
+{ "trustedProjects": ["~/github"], "presets": { } }
+```
+
+Entries match by prefix, so one line covers everything under it. For a workspace **not** on the list:
+
+- its `.claude/pi/config.json` is sanitized — it may still choose a model, prompts and a toolchain, but not `mounts`, `env`, `agentDir`, `volume`, `user`, `image`, `network`, `args`, `mode`, `isolateCaches` or `onFinish`. What was stripped is printed with the run.
+- its **caches are not shared**. Named volumes the profile mounts writable — the Go module cache, the build cache, the gopls index — are replaced with anonymous volumes that die with the container, and the agent directory (sessions, model store) becomes one volume per workspace. Read-only mounts and host directories you named yourself are untouched.
+
+The reason is one vector: those volumes outlive the run and are shared by every other one. A module or a build object written by a repository you cloned from the internet would be picked up by the next run, in a different repository. An untrusted run pays for it with a cold build cache — modules still resolve instantly from the host download cache, which is mounted read-only through `GOPROXY=file://`.
+
+Sessions are split per workspace regardless of trust: pi buckets them by working directory, but every container sees the same `/workspace`, so one bucket used to hold the transcripts of every repository this machine had ever touched — and `--session last` could resume a session from a different project.
 
 ### Sandbox profiles: giving an agent its toolchain
 
@@ -402,6 +440,52 @@ Long runs belong in the background:
 
 Token usage is recorded as the run goes, not only at the end: `/pi:status` shows `Usage: in … · out … · $…` for a job that is still working, updated on every model answer. One write per assistant turn, not per tool call.
 
+**Waiting for one, or for all of them.** Nothing used to announce the end of a background run; the answer sat in a job record until somebody thought to look.
+
+```bash
+/pi:wait                       # the newest live job
+/pi:wait <job> <job>           # these ones
+/pi:wait --all --for 600       # everything running, up to ten minutes
+```
+
+`wait` exits non-zero if the deadline passed or a job did not finish cleanly, so a script can branch on it. For a notification instead of a wait, give the run a hook:
+
+```json
+"defaults": { "onFinish": "notify-send \"pi $PI_JOB_STATUS\" \"$PI_JOB_TITLE\"" }
+```
+
+```bash
+/pi:delegate --notify 'echo "$PI_JOB_ID $PI_JOB_STATUS" >> ~/pi-runs.log'   fix the flaky test
+```
+
+The command runs on the host when the job reaches a terminal state — including a failed one, since "it finished" is the moment worth announcing — with `PI_JOB_ID`, `PI_JOB_KIND`, `PI_JOB_STATUS`, `PI_JOB_TITLE`, `PI_JOB_WORKSPACE`, `PI_JOB_RUN_ROOT`, `PI_JOB_MODEL`, `PI_JOB_SUMMARY`, `PI_JOB_ELAPSED` and `PI_JOB_LOG` in its environment. It is given ten seconds and then killed; a hook that fails is a line in the job log and nothing more. It may only come from your own config or the flag — a project config that names `onFinish` has it stripped, because the sandboxed agent can write that file through the mounted workspace.
+
+**A fleet, not one job at a time.** State is bucketed per workspace, so a run started from another repository used to be invisible:
+
+```bash
+/pi:status --global            # every workspace on this machine
+/pi:status --running           # only what is still going
+/pi:status --model glm --preset go-developer
+/pi:cancel --all               # every live job here
+/pi:cancel --all --global      # everywhere
+```
+
+`cancel` now also acts on `pending` and `orphaned` jobs, not only `running` ones: both can still hold a container, and with it a slot of a concurrency pool.
+
+## What the run changed
+
+The report says what the agent *answered*; this says what it *did*. A snapshot of the tree is taken before pi starts, so the two can be told apart:
+
+```bash
+/pi:result                     # the answer, with a Changes section
+/pi:result <job> --diff        # the patch itself
+/pi:review --job <job>         # review exactly what that run changed
+```
+
+The Changes section lists the commits and the files, and — separately — the files that were **already** modified when the run started, so nobody reads their own work-in-progress as the agent's. `--diff` is read from the tree on demand rather than stored, and includes new untracked files, which `git diff` never shows.
+
+One thing it cannot know: edits you make in the same tree while the run is going are counted as the agent's. In a worktree or with `--cwd` that does not happen; in a shared checkout it can.
+
 ## Who the agent commits as
 
 ```json
@@ -448,11 +532,37 @@ The report is not only tokens: `ok` is the share of runs that finished, `ctx avg
 
 **`ctx` answers "does this fit in the window", which the `in` column cannot.** Every turn resends the conversation, so the input total runs far ahead of what the model ever held at once — a four-turn run totalling 30K of input peaked at 10K of context. It is measured as the largest `input + cache + output` of a single exchange.
 
-**`tok/s` is measured against model time** — the run's span minus the time its tools held it, with concurrent tool calls counted once rather than summed. Generation cannot be timed from the event stream directly: `message_start` arrives once the provider is already answering and the tokens then land in a few large batches, so that interval would report a thousand tokens per second for a model doing forty. Runs recorded before this measurement existed are left out of the rate entirely and show a dash.
+**`tok/s` is measured on the generation window itself** — first content frame to last chunk, summed over a run's requests and taken from the credential proxy. It replaced a rate measured against model time (the run minus its tools), whose denominator carried prefill, the provider's queue and the network: on one measured run that read 122 tok/s against a real 259.
 
-Worth knowing before switching to a faster model: on a Go repository with a cold gopls, **89% of a run went to tools**, not to the model.
+Two exclusions, both deliberate. A run **without proxy telemetry** — recorded before this existed, or run without a sandbox — shows a dash instead of being folded in on the old measurement: two definitions of speed in one column is worse than a gap. And an **answer under 1,000 output tokens** does not count at all, because the tokens delivered in the first frame were generated before the window opened, and the shorter the answer the more that inflates the number. The `out/run` column next to the rate is the average answer length behind it — two buckets whose lengths differ several times over are not comparable, whatever the denominator says.
+
+Two things this README used to claim, both since measured and both wrong. Tokens do **not** arrive in a few large batches — checked from both ends of the channel, the median gap between deltas is 11 ms. And **89% of a run does not go to gopls**: across 68 transcripts, tools took 35% of the time, of which gopls was 3.5% and bash 96% — nearly half of that one `go build ./...`. Before switching to a faster model, look at the task brief, not at the language server.
 
 It uses `node:sqlite`, which ships with Node 22.3+ and needs no dependency; on older Node the journal is simply skipped and everything else works unchanged. Cost is only shown when the provider reports it — `ollama-pro` and `opencode-go` send zero, so there the honest answer is tokens, not money.
+
+### Repeating a run, and comparing two
+
+The journal also keeps the task, the answer and the settings a run used, which is what makes a run repeatable:
+
+```bash
+pi-companion.mjs runs                        # this workspace, newest first
+pi-companion.mjs runs --all --days 7         # every workspace
+pi-companion.mjs runs <id>                   # what it was asked, what it answered
+pi-companion.mjs rerun <id>                  # again, same settings
+pi-companion.mjs rerun <id> --model other/m  # same task, different model
+```
+
+`rerun` keeps what you chose — preset, model, thinking level, sandbox, ceilings — and resolves everything else fresh from the config as it is now, so it repeats the run rather than a stale copy of your setup. Flags override the recipe, which is the point: the same task on two models is the only honest way to compare them on work you actually do.
+
+**This is repository content on disk, so it is bounded.** Text is redacted for the shapes secrets announce themselves in (provider keys, bearer tokens, JWTs, `password=` assignments, credentials in URLs), capped at 32 KB a field, and expires after 90 days — `runs --prune [--days N]` sweeps on demand, and a sweep happens by itself at most once a day. Only the text expires: counters, timings and costs are kept forever, so statistics still cover the whole history. A random password with no recognisable shape is not caught by the redaction, and the journal file and its directory are 0600/0700 rather than the world-readable default.
+
+### What the proxy measures
+
+Every model request of a sandboxed run passes through the credential proxy, which is the only place on the host that sees the exchange whole. pi retries HTTP failures internally and carries six usage keys forward, so a run that hit three 429s and one dropped stream simply looked slow.
+
+Each request is recorded as one row: status, `error_kind` (`transport`, `timeout`, `aborted`, `truncated`), time to first byte, time to first **content** frame, the generation window, the longest silence inside it, sizes, rate-limit headers, and the provider's own usage — with the raw blob kept only when it holds a key nobody has mapped. `runs <id>` prints the roll-up: how many requests, how many failed, median time to first token, the generation rate, and the time the run spent queued for a sandbox slot.
+
+What is never recorded: messages, system prompts, tool definitions, response text, or request headers. The body is parsed a few lines away to rewrite the model name, so this is a discipline rather than a limitation — the same line `redactArgs` draws for command lines. Rows expire with the same 90-day retention.
 
 Job state lives outside your repository, bucketed per workspace, and survives Claude Code restarts. Each record keeps the pi session id, so any run can be picked up in pi itself:
 

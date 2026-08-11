@@ -1,6 +1,6 @@
 ---
 description: Hand a task to a pi agent, with a chosen model and system prompt
-argument-hint: '[--background|--wait] [--preset <name>] [--model <id>] [--system-prompt <name|@file|text>] [--thinking <level>] [--read-only] [--sandbox docker] [--cwd <path>] [--mount <h:c:ro>] [--git-name <n> --git-email <e>] [--session last] <task>'
+argument-hint: '[--background|--wait] [--preset <name>] [--model <id>] [--max-cost <usd>] [--notify <cmd>] [--system-prompt <name|@file|text>] [--thinking <level>] [--read-only] [--sandbox docker] [--cwd <path>] [--mount <h:c:ro>] [--git-name <n> --git-email <e>] [--session last] <task>'
 disable-model-invocation: false
 allowed-tools: Bash(node:*), Bash(git:*), Read, Glob, Grep, AskUserQuestion
 ---

@@ -1,6 +1,6 @@
 ---
 description: Run a read-only pi code review of the current git changes
-argument-hint: '[--background|--wait] [--base <ref>] [--scope auto|working-tree|branch] [--preset <name>] [--system-prompt reviewer|adversarial] [--cwd <path>] [focus text]'
+argument-hint: '[--background|--wait] [--job <id>] [--base <ref>] [--scope auto|working-tree|branch] [--preset <name>] [--system-prompt reviewer|adversarial] [--cwd <path>] [focus text]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Bash(git:*), Read, Glob, Grep, AskUserQuestion
 ---
@@ -19,6 +19,7 @@ Review target:
 
 - Default scope is `auto`: the working tree when it is dirty, otherwise the branch diff against the detected default branch.
 - `--base <ref>` reviews `<ref>...HEAD`. `--scope working-tree|branch` forces a scope.
+- `--job <id>` reviews exactly what another pi run changed, measured against the commit that run started from — the natural next step after delegating work. It also picks up that run's working directory, so a review of a `--cwd` or worktree run looks in the right tree.
 - Anything that is not a flag is extra focus text handed to the reviewer.
 
 Model and prompt:

@@ -1,6 +1,6 @@
 ---
 description: Show the stored output of a finished pi job
-argument-hint: '[job-id]'
+argument-hint: '[job-id] [--diff]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Read
 ---
@@ -15,6 +15,8 @@ Run:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" result "$ARGUMENTS"
 ```
+
+The report carries a Changes section: the commits and files the run touched, with files that were already modified before it started listed separately. `--diff` prints the patch itself, including new untracked files.
 
 Return the output verbatim.
 

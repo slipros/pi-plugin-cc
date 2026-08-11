@@ -369,32 +369,31 @@ function writeRunConfig(name, contents) {
 
 /** auth.json holding the run token instead of the provider's own credential. */
 function writeProxyCredentials(sandbox) {
-  const provider = String(sandbox.provider);
-  // The shape pi expects for a key-based provider; the value is the run token,
-  // which is only meaningful to this run's proxy.
-  return writeRunConfig(`auth-${provider.replace(/[^a-zA-Z0-9_.-]+/g, "-")}`, {
+  // Under the masked name, so the container's two files agree with each other
+  // and with the arguments pi was started with. The shape is what pi expects
+  // for a key-based provider; the value is the run token, which means nothing
+  // outside this run's proxy.
+  const provider = String(sandbox.credentialProxy.providerEntry?.name ?? sandbox.provider);
+  return writeRunConfig("auth-run", {
     [provider]: { type: "api_key", key: sandbox.credentialProxy.token }
   });
 }
 
-/** models.json with this provider's base URL redirected to the run's proxy. */
+/**
+ * The provider table the container gets: one generic provider, pointed at the
+ * run's proxy.
+ *
+ * The host's own table is not copied in. The container has no use for providers
+ * this run will not touch, and their names and endpoints are information the
+ * agent has no reason to hold.
+ */
 function writeProxyModels(hostAgentDir, sandbox) {
-  const provider = String(sandbox.provider);
-  let table = { providers: {} };
-  try {
-    table = JSON.parse(fs.readFileSync(path.join(hostAgentDir, "models.json"), "utf8"));
-  } catch {
-    return null;
-  }
-  // A provider pi ships with has no entry here; the proxy supplies one so the
-  // container can be pointed at it like any custom provider.
-  const entry = table?.providers?.[provider] ?? sandbox.credentialProxy.providerEntry;
+  const entry = sandbox.credentialProxy.providerEntry;
   if (!entry) {
     return null;
   }
-  return writeRunConfig(`models-${provider.replace(/[^a-zA-Z0-9_.-]+/g, "-")}`, {
-    ...table,
-    providers: { ...table.providers, [provider]: { ...entry, baseUrl: sandbox.credentialProxy.url } }
+  return writeRunConfig("models-run", {
+    providers: { [entry.name]: { ...entry, baseUrl: sandbox.credentialProxy.url } }
   });
 }
 

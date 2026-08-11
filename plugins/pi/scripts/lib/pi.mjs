@@ -6,7 +6,7 @@ import process from "node:process";
 
 import { listModels } from "./models.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
-import { startCredentialProxy } from "./credential-proxy.mjs";
+import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
@@ -466,7 +466,12 @@ export function createTurnState() {
  * Never fatal: a proxy that cannot start means the run proceeds the old way,
  * with the provider's own credential mounted, rather than not running at all.
  */
-async function openCredentialProxy(sandbox, onProgress) {
+/** Provider the run really used, for records that must not show the mask. */
+function proxyProviderOf(sandbox) {
+  return sandbox?.provider ?? "unknown";
+}
+
+async function openCredentialProxy(sandbox, onProgress, model) {
   // `proxyCredentials: false` in a profile opts out — for a provider whose
   // endpoint does something the plain forwarder here does not reproduce.
   if (!isSandboxed(sandbox) || !sandbox.auth || !sandbox.provider || sandbox.proxyCredentials === false) {
@@ -478,6 +483,7 @@ async function openCredentialProxy(sandbox, onProgress) {
     const proxy = await startCredentialProxy({
       homeDir,
       provider: sandbox.provider,
+      model,
       authEntry: auth?.[sandbox.provider],
       onWarning: (message) => onProgress?.({ phase: "working", message })
     });
@@ -505,17 +511,23 @@ export async function runPiTurn({
     throw new Error("Refusing to start pi with an empty prompt.");
   }
 
-  const piArgs = buildPiArgs(options);
   // A profile may cap how many of its containers run at once, because the
   // provider behind it caps sessions. Queue here, before the container is
   // started, so the wait costs time instead of a failed run.
   // Credentials stay on the host: the container gets a token for a proxy that
   // lives exactly as long as this run. Falls back to the previous behaviour for
   // providers whose endpoint cannot be resolved.
-  const proxy = await openCredentialProxy(sandbox, onProgress);
+  const proxy = await openCredentialProxy(sandbox, onProgress, options.model ?? null);
   if (proxy) {
-    sandbox = { ...sandbox, credentialProxy: { url: proxy.url, token: proxy.token, providerEntry: proxy.providerEntry } };
+    sandbox = {
+      ...sandbox,
+      credentialProxy: { url: proxy.url, token: proxy.token, providerEntry: proxy.providerEntry }
+    };
+    // pi is told to use the masked names; the proxy maps them back. Reported
+    // usage still names the real model, which is what the journal records.
+    options = { ...options, provider: MASKED_PROVIDER, model: MASKED_MODEL };
   }
+  const piArgs = buildPiArgs(options);
   const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
   const state = createTurnState();
@@ -635,8 +647,10 @@ export async function runPiTurn({
     text,
     sessionId: state.sessionId,
     usage: state.usage,
-    model: state.model,
     stopReason: state.stopReason,
+    // The agent was told a masked name, so its reported model is that mask.
+    // Statistics are about what actually answered, and only the host knows it.
+    model: proxy?.realModel ? `${proxyProviderOf(sandbox)}/${proxy.realModel}` : state.model,
     turns: state.turns,
     toolCalls: state.toolCalls,
     toolErrors: state.toolErrors,

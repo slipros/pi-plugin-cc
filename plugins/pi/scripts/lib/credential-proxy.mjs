@@ -166,6 +166,59 @@ function resolveTarget(upstream, requestUrl) {
   return target;
 }
 
+/** Name the container sees instead of the provider's own. */
+export const MASKED_PROVIDER = "sandbox";
+/** Name the container sees instead of the model's own. */
+export const MASKED_MODEL = "agent-model";
+
+/**
+ * The provider table entry handed to the container.
+ *
+ * Everything that changes behaviour is preserved from the real provider; only
+ * the identifying parts are replaced. The agent therefore cannot tell which
+ * model answers it, and — more usefully — cannot ask for a different one: the
+ * name it sends is overwritten on the way out.
+ */
+async function maskedProviderEntry(homeDir, provider, realModel, endpoint) {
+  const real = await findModelDefinition(homeDir, provider, realModel);
+  return {
+    name: MASKED_PROVIDER,
+    api: endpoint.api || real?.api || "openai-completions",
+    ...(real?.compat ? { compat: real.compat } : {}),
+    models: [
+      {
+        id: MASKED_MODEL,
+        reasoning: real?.reasoning ?? true,
+        // Context limits drive compaction: a wrong number makes pi trim too
+        // early or overflow the real window.
+        contextWindow: real?.contextWindow ?? real?.context ?? undefined,
+        maxTokens: real?.maxTokens ?? real?.maxOutput ?? undefined,
+        input: real?.input ?? undefined,
+        cost: real?.cost ?? undefined
+      }
+    ]
+  };
+}
+
+/** The real model's definition, from the user's table or pi's catalogue. */
+async function findModelDefinition(homeDir, provider, model) {
+  if (!model) {
+    return null;
+  }
+  try {
+    const file = path.join(homeDir, ".pi", "agent", "models.json");
+    const entry = JSON.parse(fs.readFileSync(file, "utf8"))?.providers?.[provider];
+    const found = entry?.models?.find((candidate) => candidate?.id === model);
+    if (found) {
+      return { ...found, api: entry.api, compat: entry.compat };
+    }
+  } catch {
+    // Fall through to the built-in catalogue.
+  }
+  const catalogue = await loadBuiltInCatalogue();
+  return catalogue?.[provider]?.[model] ?? null;
+}
+
 /** The credential a provider entry authenticates with, whatever its shape. */
 export function credentialOf(entry) {
   if (!entry || typeof entry !== "object") {
@@ -182,7 +235,7 @@ export function credentialOf(entry) {
  * @returns {Promise<{ url: string, token: string, close: () => Promise<void> } | null>}
  *   null when the provider cannot be proxied and the caller should fall back.
  */
-export async function startCredentialProxy({ homeDir, provider, authEntry, onWarning = null } = {}) {
+export async function startCredentialProxy({ homeDir, provider, model = null, authEntry, onWarning = null } = {}) {
   const endpoint = await resolveProviderEndpoint(homeDir, provider);
   const credential = credentialOf(authEntry);
   if (!endpoint || !credential) {
@@ -190,6 +243,10 @@ export async function startCredentialProxy({ homeDir, provider, authEntry, onWar
   }
 
   const token = `pi-run-${crypto.randomBytes(24).toString("hex")}`;
+  // The container is told it is talking to a generic endpoint. Which model
+  // actually answers is decided here, so an agent cannot quietly move itself to
+  // a bigger one — the bill for that arrives on the host, not in the sandbox.
+  const realModel = model ? String(model).split("/").pop() : null;
   const upstream = new URL(endpoint.baseUrl);
   const transport = upstream.protocol === "http:" ? http : https;
 
@@ -221,27 +278,65 @@ export async function startCredentialProxy({ homeDir, provider, authEntry, onWar
     delete headers["content-length"];
     headers.authorization = `Bearer ${credential}`;
 
-    const proxied = transport.request(
-      target,
-      { method: request.method, headers, timeout: UPSTREAM_TIMEOUT_MS },
-      (upstreamResponse) => {
-        response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-        // Piped rather than buffered: token streams arrive as they are produced,
-        // and buffering would turn a live transcript into one late blob.
-        upstreamResponse.pipe(response);
+    const forward = (body) => {
+      if (body != null) {
+        headers["content-length"] = Buffer.byteLength(body);
       }
-    );
+      const proxied = transport.request(
+        target,
+        { method: request.method, headers, timeout: UPSTREAM_TIMEOUT_MS },
+        (upstreamResponse) => {
+          response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+          // Piped rather than buffered: token streams arrive as they are
+          // produced, and buffering would turn a live transcript into one late
+          // blob. Only the request is ever held whole, and only to rename a
+          // model — responses stay a stream.
+          upstreamResponse.pipe(response);
+        }
+      );
 
-    proxied.on("timeout", () => proxied.destroy(new Error("upstream timed out")));
-    proxied.on("error", (error) => {
-      onWarning?.(`Model request failed: ${error.message}`);
-      if (!response.headersSent) {
-        response.writeHead(502, { "content-type": "application/json" });
+      proxied.on("timeout", () => proxied.destroy(new Error("upstream timed out")));
+      proxied.on("error", (error) => {
+        onWarning?.(`Model request failed: ${error.message}`);
+        if (!response.headersSent) {
+          response.writeHead(502, { "content-type": "application/json" });
+        }
+        response.end(JSON.stringify({ error: { message: `Proxy could not reach ${upstream.host}: ${error.message}` } }));
+      });
+
+      if (body == null) {
+        request.pipe(proxied);
+      } else {
+        proxied.end(body);
       }
-      response.end(JSON.stringify({ error: { message: `Proxy could not reach ${upstream.host}: ${error.message}` } }));
+    };
+
+    if (!realModel) {
+      forward(null);
+      return;
+    }
+
+    // The model name lives in the request body, so the body has to be read
+    // before it can be corrected. Anything that is not the JSON we expect is
+    // passed through untouched rather than rejected: the proxy is not the place
+    // to decide what a provider accepts.
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", () => {
+      const raw = Buffer.concat(chunks);
+      try {
+        const payload = JSON.parse(raw.toString("utf8"));
+        if (payload && typeof payload === "object" && "model" in payload) {
+          payload.model = realModel;
+          forward(Buffer.from(JSON.stringify(payload), "utf8"));
+          return;
+        }
+      } catch {
+        // Not JSON, or not shaped as expected.
+      }
+      forward(raw);
     });
-
-    request.pipe(proxied);
+    request.on("error", () => response.destroy());
   });
 
   await new Promise((resolve, reject) => {
@@ -255,9 +350,12 @@ export async function startCredentialProxy({ homeDir, provider, authEntry, onWar
   return {
     url: `http://host.docker.internal:${port}`,
     token,
-    // Present only for providers the user does not describe: the container's
-    // table has to gain an entry for them, not just a different address.
-    providerEntry: endpoint.source === "models.json" ? null : await describeBuiltInProvider(provider),
+    // What the container is told about its endpoint: a generic provider with a
+    // single model. `api`, `compat` and the limits are copied from the real
+    // entry — those decide how pi talks (whether thinking is sent, when it
+    // compacts), and lying about them would change behaviour, not just names.
+    providerEntry: await maskedProviderEntry(homeDir, provider, realModel, endpoint),
+    realModel,
     async close() {
       await new Promise((resolve) => {
         server.close(() => resolve());

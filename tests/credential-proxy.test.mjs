@@ -166,3 +166,79 @@ test("the request path cannot move the destination, so the key cannot be exfiltr
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("the agent is told a generic model, and cannot choose a different one", async () => {
+  const upstream = await startUpstream();
+  const home = fakeHome(upstream.port);
+
+  const proxy = await startCredentialProxy({
+    homeDir: home,
+    provider: "test-provider",
+    model: "test-provider/real-model-v2",
+    authEntry: { type: "api_key", key: "REAL-SECRET-KEY" }
+  });
+  const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+
+  try {
+    // What the container is handed: no provider name, no model name, no address.
+    assert.equal(proxy.providerEntry.name, "sandbox");
+    assert.deepEqual(proxy.providerEntry.models.map((entry) => entry.id), ["agent-model"]);
+    assert.equal(proxy.realModel, "real-model-v2");
+
+    // An agent asking for something else — a bigger model on the same account —
+    // gets what the host picked: the name is rewritten on the way out.
+    await fetch(`${local}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${proxy.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "expensive-model", messages: [{ role: "user", content: "hi" }] })
+    });
+
+    const [call] = upstream.seen;
+    assert.equal(JSON.parse(call.body).model, "real-model-v2", "the host decides which model answers");
+    assert.match(call.body, /"content":"hi"/, "the rest of the request is untouched");
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("behavioural fields survive the mask, since they change how pi talks", async () => {
+  const upstream = await startUpstream();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-proxy-home-"));
+  const agent = path.join(home, ".pi", "agent");
+  fs.mkdirSync(agent, { recursive: true });
+  fs.writeFileSync(
+    path.join(agent, "models.json"),
+    JSON.stringify({
+      providers: {
+        "test-provider": {
+          baseUrl: `http://127.0.0.1:${upstream.port}/v1`,
+          api: "openai-completions",
+          compat: { supportsReasoningEffort: false },
+          models: [{ id: "real-model-v2", reasoning: true, contextWindow: 123456 }]
+        }
+      }
+    })
+  );
+
+  const proxy = await startCredentialProxy({
+    homeDir: home,
+    provider: "test-provider",
+    model: "real-model-v2",
+    authEntry: { key: "k" }
+  });
+
+  try {
+    // Lying about these would not hide anything — it would change behaviour:
+    // whether thinking is sent, and when pi decides to compact.
+    assert.equal(proxy.providerEntry.api, "openai-completions");
+    assert.deepEqual(proxy.providerEntry.compat, { supportsReasoningEffort: false });
+    assert.equal(proxy.providerEntry.models[0].contextWindow, 123456);
+    assert.equal(proxy.providerEntry.models[0].reasoning, true);
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

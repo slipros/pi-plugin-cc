@@ -230,14 +230,16 @@ Two things hang off one list:
 { "trustedProjects": ["~/github"], "presets": { } }
 ```
 
-Entries match by prefix, so one line covers everything under it. For a workspace **not** on the list:
+Entries match by prefix, so one line covers everything under it — `"trustedProjects": ["~/github"]` vouches for every repository beneath that directory. `"trustProjectConfig": true` is the blunt version: trust every workspace, wherever it is, which restores exactly the behaviour this plugin had before any of this existed.
+
+For a workspace **not** covered by either:
 
 - its `.claude/pi/config.json` is sanitized — it may still choose a model, prompts and a toolchain, but not `mounts`, `env`, `agentDir`, `volume`, `user`, `image`, `network`, `args`, `mode`, `isolateCaches` or `onFinish`. What was stripped is printed with the run.
 - its **caches are not shared**. Named volumes the profile mounts writable — the Go module cache, the build cache, the gopls index — are replaced with anonymous volumes that die with the container, and the agent directory (sessions, model store) becomes one volume per workspace. Read-only mounts and host directories you named yourself are untouched.
 
 The reason is one vector: those volumes outlive the run and are shared by every other one. A module or a build object written by a repository you cloned from the internet would be picked up by the next run, in a different repository. An untrusted run pays for it with a cold build cache — modules still resolve instantly from the host download cache, which is mounted read-only through `GOPROXY=file://`.
 
-Sessions are split per workspace regardless of trust: pi buckets them by working directory, but every container sees the same `/workspace`, so one bucket used to hold the transcripts of every repository this machine had ever touched — and `--session last` could resume a session from a different project.
+Sessions are split per workspace regardless of trust, through `PI_CODING_AGENT_SESSION_DIR`: pi buckets them by working directory, but every container sees the same `/workspace`, so one bucket used to hold the transcripts of every repository this machine had ever touched — and `--session last` could resume a session from a different project. Sessions recorded before this are still in the old shared bucket; nothing migrates them, they simply stop being visible to new runs.
 
 ### Sandbox profiles: giving an agent its toolchain
 

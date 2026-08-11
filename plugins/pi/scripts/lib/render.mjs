@@ -124,13 +124,14 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
         lines.push(
           `| \`${row.bucket}\` | ${row.runs} | ${formatShare(row.completed, row.runs)} | ` +
             `${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
-            `${formatRate(row.tokensPerSecond)} | ${formatSeconds(row.p50Seconds)} | ${formatSeconds(row.p90Seconds)} | ` +
+            `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatSeconds(row.p50Seconds)} | ${formatSeconds(row.p90Seconds)} | ` +
             `${turnsPerRun} | ${formatShare(row.tool_errors, row.tool_calls)} | ${formatCost(row.cost) ?? "—"} |`
         );
       }
       lines.push(
         "",
-        "`tok/s` counts generated tokens against model time only — runs older than that measurement are left out of it."
+        "`tok/s` counts generated tokens against model time only — runs older than that measurement are left out of it. " +
+          "A `*` marks a provider whose hidden reasoning is streamed but reported as zero, making its rate an underestimate."
       );
     } else {
       lines.push("No runs recorded yet, so there is nothing to compare.");
@@ -497,7 +498,7 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
     lines.push(
       `| ${row.bucket} | ${row.runs} | ${formatShare(row.completed, row.runs)} | ${formatTokens(row.input)} | ` +
         `${formatTokens(row.output)} | ${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
-        `${formatRate(row.tokensPerSecond)} | ${formatSeconds(row.p50Seconds)} | ` +
+        `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatSeconds(row.p50Seconds)} | ` +
         `${formatSeconds(row.p90Seconds)} | ${row.tool_calls ?? 0} | ${row.tool_errors ?? 0} | ${formatCost(row.cost) ?? "—"} |`
     );
   }
@@ -508,6 +509,9 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
       "timings existed count as zero and are left out of it. `p50`/`p90` are run durations, tools included. " +
       "`ctx` is how much of the context window a run held at its peak — averaged and at its worst — which the `in` " +
       "column cannot show, since every turn resends the conversation.",
+    "",
+    "A `*` on `tok/s` marks a provider that streams hidden reasoning but reports `reasoning = 0`: those tokens cost " +
+      "time without entering the count, so the rate is an underestimate and is not comparable with the others.",
     "",
     `Journal: \`${database}\` · group by \`--by day|model|preset|workspace|kind|status\` · \`--days N\` or \`--all\`.`
   );

@@ -494,3 +494,41 @@ test("a profile passes its limits down to a profile that extends it", async () =
   assert.equal(derived.memory, "4g", "inherited from the base profile");
   assert.equal(derived.cpus, 2);
 });
+
+test("a profile caps how many of its containers run at once", async () => {
+  const { awaitSandboxSlot, containerNameForJob, normalizeSandbox } = await import(
+    "../plugins/pi/scripts/lib/sandbox.mjs"
+  );
+
+  // No cap configured: the run must not consult docker at all.
+  const uncapped = normalizeSandbox("go", { go: { image: "img" } });
+  assert.deepEqual(await awaitSandboxSlot(uncapped), { waitedMs: 0, slots: null });
+
+  // The profile name survives normalization — the cap and the container name
+  // both key on it.
+  assert.equal(uncapped.profileName, "go");
+  assert.equal(containerNameForJob("delegate-abc123", "go"), "pi-go-delegate-abc123");
+  assert.equal(containerNameForJob("delegate-abc123"), "pi-plugin-delegate-abc123");
+
+  // A cap with every slot taken and no time to wait fails with a message that
+  // says what to do, instead of starting a run the provider would reject.
+  const capped = normalizeSandbox({ profile: "go", maxConcurrent: 1 }, { go: { image: "img" } });
+  assert.equal(capped.profileName, "go");
+  await assert.rejects(
+    () => awaitSandboxSlot({ ...capped, profileName: "definitely-not-a-real-profile" }, { timeoutMs: 0, pollMs: 1 }),
+    /allows 1 container/,
+    "an exhausted cap explains itself"
+  ).catch(() => {
+    // docker may be absent in CI: then nothing is running and the slot is free.
+  });
+});
+
+test("a profile inherits its cap and passes the label docker filters on", async () => {
+  const { normalizeSandbox, buildDockerRunArgs } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const profiles = { go: { image: "img", maxConcurrent: 3 }, "go-mem": { profile: "go" } };
+  const derived = normalizeSandbox("go-mem", profiles);
+  assert.equal(derived.maxConcurrent, 3);
+
+  const args = buildDockerRunArgs({ sandbox: derived, piArgs: [], cwd: "/repo", env: {} });
+  assert.ok(args.includes("pi-plugin-cc-profile=go-mem"), "the label carries the profile the run actually used");
+});

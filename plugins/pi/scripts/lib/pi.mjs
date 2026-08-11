@@ -3,7 +3,7 @@ import process from "node:process";
 
 import { listModels } from "./models.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
-import { isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
+import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
 
@@ -108,6 +108,22 @@ function contextTokens(usage) {
   }
   const value = (key) => (typeof usage[key] === "number" ? usage[key] : 0);
   return value("input") + value("cacheRead") + value("output") + value("reasoning");
+}
+
+/**
+ * Length of the model's hidden reasoning in this message, in characters.
+ *
+ * Not a token count and not a substitute for one — it exists to tell apart
+ * "this model did not reason" from "this provider does not report reasoning".
+ * ollama-pro returns `usage.reasoning = 0` while shipping thinking blocks in
+ * the content, so its generated tokens land in the denominator of a rate and
+ * never in the numerator; without this the two cases look identical.
+ */
+function thinkingLength(message) {
+  const content = Array.isArray(message?.content) ? message.content : [];
+  return content
+    .filter((block) => block?.type === "thinking")
+    .reduce((total, block) => total + String(block.thinking ?? block.text ?? "").length, 0);
 }
 
 /** Pairs a tool_execution_end with its start; ids differ per pi version. */
@@ -333,6 +349,7 @@ export function applyPiEvent(state, event, now = Date.now()) {
           state.assistantTexts.push(text);
         }
         state.peakContext = Math.max(state.peakContext ?? 0, contextTokens(message.usage));
+        state.thinkingChars = (state.thinkingChars ?? 0) + thinkingLength(message);
         state.usage = accumulateUsage(state.usage, message.usage);
         if (message.model) {
           state.model = message.provider ? `${message.provider}/${message.model}` : String(message.model);
@@ -413,6 +430,7 @@ export function createTurnState() {
     usage: {},
     timing: createTimingState(),
     peakContext: 0,
+    thinkingChars: 0,
     model: null,
     thinkingLevel: null,
     stopReason: null,
@@ -447,6 +465,10 @@ export async function runPiTurn({
   }
 
   const piArgs = buildPiArgs(options);
+  // A profile may cap how many of its containers run at once, because the
+  // provider behind it caps sessions. Queue here, before the container is
+  // started, so the wait costs time instead of a failed run.
+  await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
   const state = createTurnState();
   const report = (event) => {
@@ -561,6 +583,7 @@ export async function runPiTurn({
     toolErrors: state.toolErrors,
     timing: summarizeTiming(state.timing),
     peakContext: state.peakContext ?? 0,
+    thinkingChars: state.thinkingChars ?? 0,
     exitStatus: errors.length && exitStatus === 0 ? 1 : exitStatus,
     stderr: stderr.trim(),
     errors,

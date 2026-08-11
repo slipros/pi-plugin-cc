@@ -101,7 +101,9 @@ export function normalizeSandbox(value, profiles = {}, seen = new Set()) {
       if (seen.has(name)) {
         throw new Error(`Sandbox profile "${name}" extends itself: ${[...seen, name].join(" → ")}.`);
       }
-      return normalizeSandbox(profiles[name], profiles, new Set([...seen, name]));
+      // The name is kept so containers and concurrency limits can be told apart
+      // per profile; normalizing to a plain object would otherwise lose it.
+      return { ...normalizeSandbox(profiles[name], profiles, new Set([...seen, name])), profileName: name };
     }
     throw unknownProfile(name, profiles);
   }
@@ -127,8 +129,9 @@ export function normalizeSandbox(value, profiles = {}, seen = new Set()) {
     }
     base = normalizeSandbox(String(value.profile), profiles, seen);
   }
+  const profileName = value.profileName ?? base.profileName ?? (value.profile ? String(value.profile) : null);
 
-  const merged = { ...base, ...value, mode: "docker" };
+  const merged = { ...base, ...value, mode: "docker", profileName };
   delete merged.profile;
   // Equipment adds to the profile instead of replacing it, exactly as config
   // layers do: `{"profile": "go", "env": ["PI_HOOKS=…"]}` means "the go
@@ -179,10 +182,18 @@ export function attachMounts(sandbox, extra = []) {
   return { ...sandbox, mounts: [...merged.values()] };
 }
 
-/** Container names are derived from the job id, which is already docker-safe. */
-export function containerNameForJob(jobId) {
-  const slug = String(jobId ?? "job").replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[^a-zA-Z0-9]+/, "");
-  return `pi-plugin-${slug}`.slice(0, 60);
+/**
+ * Container name: the profile it runs, then the job id (already docker-safe).
+ *
+ * `docker ps` is where you look when something is stuck, and the profile is the
+ * part that says what is inside — a name of only job ids answers "which run"
+ * but never "which toolchain".
+ */
+export function containerNameForJob(jobId, profileName = null) {
+  const safe = (value, fallback) =>
+    String(value ?? fallback).replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[^a-zA-Z0-9]+/, "");
+  const prefix = profileName ? `pi-${safe(profileName, "profile")}` : "pi-plugin";
+  return `${prefix}-${safe(jobId, "job")}`.slice(0, 60);
 }
 
 /** `~/go/bin:/gobin:ro` — only the host side of a mount can be a home path. */
@@ -229,6 +240,9 @@ export function buildDockerRunArgs({
   // --init reaps whatever the agent spawns; -i without -t keeps stdin a pipe,
   // which is what the JSONL control channel needs.
   const args = ["run", "--rm", "-i", "--init", "--label", `${LABEL}=1`];
+  if (sandbox.profileName) {
+    args.push("--label", `${LABEL}-profile=${sandbox.profileName}`);
+  }
 
   if (containerName) {
     args.push("--name", containerName);
@@ -316,7 +330,7 @@ export function resolveLaunch({ sandbox, binary, piArgs, cwd, jobId = null, env 
   if (!isSandboxed(sandbox)) {
     return { command: binary, args: piArgs, containerName: null };
   }
-  const containerName = jobId ? containerNameForJob(jobId) : null;
+  const containerName = jobId ? containerNameForJob(jobId, sandbox?.profileName ?? null) : null;
   return {
     command: "docker",
     args: buildDockerRunArgs({ sandbox, piArgs, cwd, containerName, env }),
@@ -413,6 +427,71 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
   }
 
   return warnings;
+}
+
+/**
+ * How many containers of one profile are running right now.
+ *
+ * Counted from docker rather than from the job journal: a job record can outlive
+ * its container (and the other way round during startup), and the thing being
+ * rationed is the container.
+ */
+export function countRunningForProfile(profileName) {
+  if (!profileName) {
+    return 0;
+  }
+  const result = runCommand("docker", [
+    "ps",
+    "--filter",
+    `label=${LABEL}-profile=${profileName}`,
+    "--format",
+    "{{.Names}}"
+  ]);
+  if (result.status !== 0) {
+    return 0;
+  }
+  return String(result.stdout ?? "").split("\n").map((line) => line.trim()).filter(Boolean).length;
+}
+
+/**
+ * Block until the profile has a free slot, when it caps concurrency.
+ *
+ * The cap exists because a provider may allow only so many sessions at once:
+ * without it the extra runs do not queue, they fail on the provider's side
+ * halfway through. Waiting is therefore the correct behaviour, not an error —
+ * the run is late rather than lost. `timeoutMs` bounds the wait so a stuck
+ * container cannot hold a queue forever.
+ *
+ * @returns {Promise<{waitedMs: number, slots: number|null}>}
+ */
+export async function awaitSandboxSlot(sandbox, { timeoutMs = 900_000, onProgress = null, pollMs = 2000 } = {}) {
+  const limit = Number(sandbox?.maxConcurrent ?? 0);
+  if (!isSandboxed(sandbox) || !sandbox.profileName || !Number.isFinite(limit) || limit <= 0) {
+    return { waitedMs: 0, slots: null };
+  }
+
+  const startedAt = Date.now();
+  let announced = false;
+  for (;;) {
+    const running = countRunningForProfile(sandbox.profileName);
+    if (running < limit) {
+      return { waitedMs: Date.now() - startedAt, slots: limit - running };
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(
+        `Profile "${sandbox.profileName}" allows ${limit} container(s) at once and all of them are busy ` +
+          `after ${Math.round(timeoutMs / 1000)}s. Wait for a run to finish, or raise maxConcurrent.`
+      );
+    }
+    if (!announced) {
+      announced = true;
+      onProgress?.({
+        phase: "starting",
+        message: `Waiting for a free slot: profile ${sandbox.profileName} is at its limit of ${limit}.`
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
 }
 
 /** Killing the `docker run` client leaves the container up; this stops it. */

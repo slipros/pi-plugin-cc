@@ -5,7 +5,7 @@ import process from "node:process";
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
 import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs, summarizeTiming } from "./pi.mjs";
-import { isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
+import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 const SETTLE_GRACE_MS = 1500;
 const SHUTDOWN_GRACE_MS = 5000;
@@ -36,6 +36,10 @@ export async function runPiRpcTurn({
   }
 
   const piArgs = buildPiArgs({ ...options, mode: "rpc" });
+  // A profile may cap how many of its containers run at once, because the
+  // provider behind it caps sessions. Queue here, before the container is
+  // started, so the wait costs time instead of a failed run.
+  await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
   const state = createTurnState();
   const report = (event) => {
@@ -261,6 +265,7 @@ export async function runPiRpcTurn({
     toolErrors: state.toolErrors,
     timing: summarizeTiming(state.timing),
     peakContext: state.peakContext ?? 0,
+    thinkingChars: state.thinkingChars ?? 0,
     queue: state.queue,
     steering: delivered,
     aborted,

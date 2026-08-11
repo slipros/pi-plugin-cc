@@ -284,7 +284,14 @@ export async function runTrackedJob(job, runner) {
 
   try {
     const execution = await runner();
-    const status = execution.exitStatus === 0 ? "completed" : "failed";
+    // A non-zero exit with an answer already produced is not the same failure as
+    // a run that produced nothing: opencode-go ends streams without a
+    // finish_reason and pi exits non-zero, while the agent has delivered a full
+    // response and the tokens are recorded. Counting those as failures put the
+    // provider at 0% success in a comparison it had actually completed.
+    const delivered = Boolean(String(execution.text ?? "").trim()) || Number(execution.usage?.output ?? 0) > 0;
+    const degraded = execution.exitStatus !== 0 && delivered && !execution.timedOut && !execution.aborted;
+    const status = execution.exitStatus === 0 || degraded ? "completed" : "failed";
     const completedAt = nowIso();
     const record = {
       ...running,
@@ -303,6 +310,8 @@ export async function runTrackedJob(job, runner) {
       toolErrors: execution.toolErrors ?? 0,
       timing: execution.timing ?? null,
       peakContext: execution.peakContext ?? 0,
+      thinkingChars: execution.thinkingChars ?? 0,
+      degraded,
       summary: execution.summary ?? null,
       rendered: execution.rendered ?? null,
       errors: execution.errors ?? []

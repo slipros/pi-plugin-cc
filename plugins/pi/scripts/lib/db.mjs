@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   tool_ms          INTEGER DEFAULT 0,
   span_ms          INTEGER DEFAULT 0,
   peak_context     INTEGER DEFAULT 0,
+  thinking_chars   INTEGER DEFAULT 0,
+  degraded         INTEGER DEFAULT 0,
   session_id       TEXT,
   background       INTEGER DEFAULT 0,
   updated_at       TEXT
@@ -122,7 +124,9 @@ function addMissingColumns(db) {
     ["model_ms", "INTEGER DEFAULT 0"],
     ["tool_ms", "INTEGER DEFAULT 0"],
     ["span_ms", "INTEGER DEFAULT 0"],
-    ["peak_context", "INTEGER DEFAULT 0"]
+    ["peak_context", "INTEGER DEFAULT 0"],
+    ["thinking_chars", "INTEGER DEFAULT 0"],
+    ["degraded", "INTEGER DEFAULT 0"]
   ];
   for (const [name, definition] of additions) {
     if (!present.has(name)) {
@@ -175,6 +179,8 @@ const COLUMNS = [
   "tool_ms",
   "span_ms",
   "peak_context",
+  "thinking_chars",
+  "degraded",
   "session_id",
   "background",
   "updated_at"
@@ -220,6 +226,8 @@ export function jobToRow(job) {
     tool_ms: job.timing?.toolMs ?? 0,
     span_ms: job.timing?.spanMs ?? 0,
     peak_context: job.peakContext ?? 0,
+    thinking_chars: job.thinkingChars ?? 0,
+    degraded: job.degraded ? 1 : 0,
     session_id: job.sessionId ?? null,
     background: job.background ? 1 : 0,
     updated_at: new Date().toISOString()
@@ -238,7 +246,7 @@ export function recordJob(handle, job) {
   const placeholders = COLUMNS.map((column) => `$${column}`).join(", ");
   const updates = COLUMNS.filter((column) => column !== "id")
     .map((column) =>
-      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms", "peak_context"].includes(
+      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms", "peak_context", "thinking_chars"].includes(
         column
       )
         ? `${column} = MAX(${column}, excluded.${column})`
@@ -318,7 +326,11 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               -- Context is a high-water mark per run, so it averages and peaks
               -- rather than summing: totals across runs mean nothing here.
               AVG(NULLIF(peak_context, 0)) AS avg_context,
-              MAX(peak_context)   AS max_context
+              MAX(peak_context)   AS max_context,
+              SUM(degraded)       AS degraded,
+              -- A provider that streams thinking but reports reasoning = 0 has
+              -- its generated tokens missing from any rate's numerator.
+              SUM(thinking_chars > 0 AND reasoning = 0) AS unreported_reasoning
        FROM jobs ${where}
        GROUP BY bucket
        ORDER BY (SUM(input) + SUM(output)) DESC, bucket DESC

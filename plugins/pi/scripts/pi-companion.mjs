@@ -91,6 +91,20 @@ const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const DETACHED_ENV = "PI_PLUGIN_DETACHED";
 const DETACHED_JOB_ENV = "PI_PLUGIN_JOB_ID";
 
+/**
+ * Statuses a job never leaves. Everything else — `running`, and `pending` while
+ * the detached child starts up — means the run is still going, which is what
+ * `watch --follow` has to keep waiting on.
+ */
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "orphaned"]);
+
+function isTerminalStatus(status) {
+  return TERMINAL_STATUSES.has(String(status));
+}
+
+/** How long `watch --follow` waits for a job id to appear in the journal. */
+const JOB_APPEARANCE_GRACE_MS = 30_000;
+
 const RUN_FLAGS = {
   booleans: [
     "background",
@@ -811,18 +825,36 @@ async function commandWatch(argv, workspaceRoot) {
     strings: ["tail", "since", "for"]
   });
 
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
-  if (!jobs.length) {
-    throw new Error("No pi jobs recorded for this workspace yet.");
+  const reference = positional[0] ?? null;
+  const findTarget = () => {
+    const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
+    if (!jobs.length) {
+      return null;
+    }
+    return reference
+      ? (jobs.find((job) => job.id === reference || job.id.endsWith(reference)) ?? null)
+      : (jobs.find((job) => job.status === "running") ?? jobs[0]);
+  };
+
+  // `delegate --background` prints the job id before the detached child has
+  // written the record, so a watch fired immediately after it would look for a
+  // job that exists only as an id. Following means waiting for it to show up;
+  // without --follow the caller gets the error straight away, as before.
+  let target = findTarget();
+  if (!target && flags.follow && reference) {
+    const appearBy = Date.now() + JOB_APPEARANCE_GRACE_MS;
+    while (!target && Date.now() < appearBy) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      target = findTarget();
+    }
   }
 
-  const reference = positional[0] ?? null;
-  const target = reference
-    ? jobs.find((job) => job.id === reference || job.id.endsWith(reference))
-    : (jobs.find((job) => job.status === "running") ?? jobs[0]);
-
   if (!target) {
-    throw new Error(`No pi job matches "${reference}".`);
+    throw new Error(
+      reference
+        ? `No pi job matches "${reference}".`
+        : "No pi jobs recorded for this workspace yet."
+    );
   }
 
   const file = target.eventsFile ?? eventsPath(workspaceRoot, target.id);
@@ -902,7 +934,7 @@ async function commandWatch(argv, workspaceRoot) {
       }
     }
     const current = enrichJob(listJobs(workspaceRoot).find((job) => job.id === target.id) ?? target);
-    if (current.status !== "running" && !next.events.length) {
+    if (isTerminalStatus(current.status) && !next.events.length) {
       process.stdout.write(`\n■ job ${current.status}\n`);
       process.stdout.write(cursorHint(cursor, current.status));
       return 0;

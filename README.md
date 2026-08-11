@@ -341,6 +341,10 @@ The profile is configurable per preset, in full:
 
 `"sandbox": "docker"` is shorthand for the defaults, and `--sandbox none` switches a preset's sandbox back off for one run.
 
+`maxConcurrent` caps how many containers of one profile run at once. A run over the cap **waits for a slot** instead of failing: when the provider behind the profile limits parallel sessions, the extra runs would otherwise be cut off mid-flight. Its log shows `Waiting for a free slot: profile <name> is at its limit of N`, and the wait is bounded by the run's own timeout. Slots are counted from live docker containers, not from job records.
+
+Containers are named `pi-<profile>-<job-id>` (`pi-go-delegate-msonq…`), so `docker ps` shows which profile is holding a slot.
+
 `memory`, `cpus` and `pidsLimit` are optional ceilings — leave them out and docker imposes none, which is how runs behaved before they existed. They earn their place once runs go parallel: a language server indexing a large repository holds several hundred megabytes on its own, so a few containers at once are gigabytes on the host. A profile passes them down to any profile built on it, and `args` still takes any docker flag these three do not cover.
 
 Two limits worth knowing: the workspace bind mount is read-write, so a sandboxed agent can still rewrite your checkout (that is the point — the isolation is about the rest of the machine), and the container-local agent directory means the extensions and skills you installed on the host are absent unless the preset asks for them explicitly.

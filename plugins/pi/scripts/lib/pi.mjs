@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
+import { budgetExceeded } from "./budget.mjs";
 import { listModels } from "./models.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
@@ -410,13 +411,21 @@ export function applyPiEvent(state, event, now = Date.now()) {
  * inside its tools.
  *
  * Model time is measured by subtraction — the span of the run minus the time
- * tools held it — because the event stream cannot time generation directly.
- * `message_start` arrives only once the provider starts answering, and the
- * tokens then land in a few large batches (52 of them within 50ms over the
- * wire), so the start-to-end interval measures delivery, not decoding: it
- * would report a thousand tokens per second for a model doing thirty. What
- * happens before `message_start` — prefill, queueing, the network — is the part
- * that actually costs time, and subtraction keeps it in.
+ * tools held it — because the event stream carries no generation window of its
+ * own. An earlier version of this comment claimed tokens arrive "in a few large
+ * batches, 52 within 50ms", and that the interval therefore measures delivery
+ * rather than decoding. That was measured wrong and is not true: checked from
+ * both ends of the channel — on the credential proxy and in the companion's own
+ * events — the median gap between deltas is 11ms, so the stream is as steady as
+ * the model produces it.
+ *
+ * What subtraction really costs is the opposite mistake: `modelMs` includes
+ * prefill, the provider's queue and the network, so a rate computed from it
+ * *understates* generation, by about half on a measured run (122 against 259
+ * tok/s). The honest generation window is `stream_ms` from the proxy, which
+ * starts at the first content frame — see `sse-meter.mjs`. This number stays
+ * what it always was, "everything in the run that was not a tool", so the
+ * history it is compared against keeps meaning the same thing.
  *
  * Tool intervals are merged rather than summed: an agent that fires three LSP
  * queries at once holds the run for the longest of them, not for their total,
@@ -471,7 +480,7 @@ function proxyProviderOf(sandbox) {
   return sandbox?.provider ?? "unknown";
 }
 
-async function openCredentialProxy(sandbox, onProgress, model) {
+async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
   // `proxyCredentials: false` in a profile opts out — for a provider whose
   // endpoint does something the plain forwarder here does not reproduce.
   if (!isSandboxed(sandbox) || !sandbox.auth || !sandbox.provider || sandbox.proxyCredentials === false) {
@@ -485,7 +494,10 @@ async function openCredentialProxy(sandbox, onProgress, model) {
       provider: sandbox.provider,
       model,
       authEntry: auth?.[sandbox.provider],
-      onWarning: (message) => onProgress?.({ phase: "working", message })
+      onWarning: (message) => onProgress?.({ phase: "working", message }),
+      // Ties the per-request telemetry to the run; without it the proxy
+      // measures nothing rather than writing rows nothing can be joined to.
+      jobId
     });
     if (proxy) {
       onProgress?.({ phase: "starting", message: `Credentials stay on the host: ${sandbox.provider} goes through a run-scoped proxy.` });
@@ -518,6 +530,7 @@ export async function runPiTurn({
   env = process.env,
   sandbox = null,
   jobId = null,
+  budget = null,
   ...options
 } = {}) {
   if (!prompt || !String(prompt).trim()) {
@@ -530,7 +543,7 @@ export async function runPiTurn({
   // Credentials stay on the host: the container gets a token for a proxy that
   // lives exactly as long as this run. Falls back to the previous behaviour for
   // providers whose endpoint cannot be resolved.
-  const proxy = await openCredentialProxy(sandbox, onProgress, options.model ?? null);
+  const proxy = await openCredentialProxy(sandbox, onProgress, options.model ?? null, jobId);
   if (proxy) {
     sandbox = {
       ...sandbox,
@@ -586,6 +599,35 @@ export async function runPiTurn({
   let stderr = "";
   let stdoutRest = "";
   let timedOut = false;
+  let budgetStop = null;
+
+  /**
+   * Stop a run that has crossed one of its ceilings.
+   *
+   * The one-shot mode has no control channel, so unlike the rpc engine there is
+   * no way to ask pi to wrap up: the only lever is the one the timeout already
+   * uses. Whatever the agent has written to the workspace stays; the assistant
+   * text of the message in flight is lost.
+   */
+  const enforceBudget = () => {
+    if (budgetStop) {
+      return;
+    }
+    const exceeded = budgetExceeded(budget, { usage: state.usage, turns: state.turns });
+    if (!exceeded) {
+      return;
+    }
+    budgetStop = exceeded;
+    report({ phase: "working", message: `Budget reached: ${exceeded}. Stopping pi.` });
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+    if (isSandboxed(sandbox)) {
+      removeSandboxContainer(launch.containerName);
+    }
+  };
 
   const timer =
     timeoutMs > 0
@@ -614,6 +656,7 @@ export async function runPiTurn({
         try {
           const update = applyPiEvent(state, JSON.parse(line));
           report(update ? { ...update, usage: state.usage } : null);
+          enforceBudget();
         } catch {
           // Non-JSON output on stdout is diagnostic noise, not a fatal error.
         }
@@ -666,6 +709,9 @@ export async function runPiTurn({
   if (timedOut) {
     errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
   }
+  if (budgetStop) {
+    errors.push(`Stopped by the run budget: ${budgetStop}.`);
+  }
   if (!text && !errors.length && exitStatus === 0) {
     errors.push("pi produced no assistant output.");
   }
@@ -687,6 +733,13 @@ export async function runPiTurn({
     timing: summarizeTiming(state.timing),
     peakContext: state.peakContext ?? 0,
     thinkingChars: state.thinkingChars ?? 0,
+    // Already measured by the slot queue and thrown away until now: the time
+    // this run spent waiting for a container of its own pool, which is time no
+    // model spent working.
+    slotWaitMs: slot.waitedMs ?? 0,
+    // Per-request telemetry the proxy collected, rolled up for the job row.
+    proxyStats: proxy?.stats?.() ?? null,
+    budgetStop,
     exitStatus: errors.length && exitStatus === 0 ? 1 : exitStatus,
     stderr: stderr.trim(),
     errors,

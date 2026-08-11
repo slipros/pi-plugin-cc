@@ -15,13 +15,17 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
-import { loadConfig, resolveRunSettings, userConfigPath } from "./lib/config.mjs";
+import { loadConfig, resolveRunSettings, userConfigPath, workspaceIsTrusted } from "./lib/config.mjs";
 import {
+  captureTreeSnapshot,
   collectReviewContext,
+  collectTreeDiff,
   ensureGitRepository,
+  getCurrentBranch,
   resolveCommitIdentity,
   resolveReviewTarget,
-  resolveWorktreeMount
+  resolveWorktreeMount,
+  summarizeTreeChanges
 } from "./lib/git.mjs";
 import {
   appendLogLine,
@@ -30,6 +34,8 @@ import {
   createJobRecord,
   createProgressReporter,
   enrichJob,
+  isCancelable,
+  listCancelableJobs,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -37,6 +43,7 @@ import {
   sortJobsNewestFirst
 } from "./lib/jobs.mjs";
 import { listModels, normalizeThinking, resolveModelSelection } from "./lib/models.mjs";
+import { runFinishHook } from "./lib/notify.mjs";
 import { getPiAvailability, PI_BINARY, runPiTurn } from "./lib/pi.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { buildSystemPrompt, interpolate, listNamedPrompts, loadTaskTemplate } from "./lib/prompts.mjs";
@@ -75,17 +82,31 @@ import {
 } from "./lib/state.mjs";
 import {
   renderBackgroundStart,
+  renderCancelAllReport,
   renderCancelReport,
   renderModelsReport,
+  renderRunDetail,
   renderRunResult,
+  renderRunsReport,
   renderSandboxReport,
   renderSetupReport,
   renderStatsReport,
   renderStatusReport,
-  renderStoredJobResult
+  renderStoredJobResult,
+  renderWaitReport
 } from "./lib/render.mjs";
 import { resolveRunRoot, resolveWorkspaceRoot } from "./lib/workspace.mjs";
-import { databasePath, openDatabase, queryStats, queryTotals, recordJobSafely } from "./lib/db.mjs";
+import {
+  databasePath,
+  openDatabase,
+  pruneJournalText,
+  queryRun,
+  queryRuns,
+  queryStats,
+  queryTotals,
+  recordJobSafely,
+  DEFAULT_TEXT_TTL_DAYS
+} from "./lib/db.mjs";
 
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -194,6 +215,15 @@ function isTerminalStatus(status) {
 /** How long `watch --follow` waits for a job id to appear in the journal. */
 const JOB_APPEARANCE_GRACE_MS = 30_000;
 
+/**
+ * `wait` without `--for`. Long enough to outlast a normal run, short enough
+ * that a caller cannot be blocked forever by a job whose wrapper died silently.
+ */
+const DEFAULT_WAIT_SECONDS = 3600;
+
+/** Job records change at the pace of the filesystem, not of the model. */
+const WAIT_POLL_MS = 500;
+
 const RUN_FLAGS = {
   booleans: [
     "background",
@@ -218,6 +248,12 @@ const RUN_FLAGS = {
     "exclude-tools",
     "session",
     "timeout",
+    "max-cost",
+    "max-tokens",
+    "max-turns",
+    "notify",
+    // `review --job <id>` reviews what that run changed.
+    "job",
     "base",
     "scope",
     "engine",
@@ -247,6 +283,9 @@ const KNOWN_FLAGS = new Set([
   ...Object.keys(RUN_FLAGS.aliases),
   ...Object.values(RUN_FLAGS.aliases),
   "all",
+  "global",
+  "running",
+  "status",
   "by",
   "days",
   "limit",
@@ -260,7 +299,11 @@ const KNOWN_FLAGS = new Set([
   "no-cache",
   "dockerfile",
   "pi-version",
-  "job"
+  "job",
+  "diff",
+  "prune",
+  "full",
+  "kind"
 ]);
 
 /**
@@ -290,9 +333,14 @@ function usage() {
     "  pi-companion.mjs models [search] [--stats [--days N]] [--json]",
     "  pi-companion.mjs delegate [flags] <prompt>",
     "  pi-companion.mjs review [flags] [focus text]",
-    "  pi-companion.mjs status [job-id] [--all] [--json]",
-    "  pi-companion.mjs result [job-id] [--json]",
-    "  pi-companion.mjs cancel [job-id] [--json]",
+    "  pi-companion.mjs status [job-id] [--all] [--global] [--running]",
+    "                          [--status <s,s>] [--preset <name>] [--model <id>] [--json]",
+    "  pi-companion.mjs result [job-id] [--diff] [--json]",
+    "  pi-companion.mjs wait [job-id...] [--all] [--for <seconds>] [--json]",
+    "  pi-companion.mjs runs [run-id] [--all] [--limit N] [--days N] [--model <id>]",
+    "                        [--preset <name>] [--kind delegate|review] [--prune] [--json]",
+    "  pi-companion.mjs rerun <run-id> [run flags]",
+    "  pi-companion.mjs cancel [job-id] [--all [--global]] [--json]",
     "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
     "  pi-companion.mjs watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]",
     "  pi-companion.mjs stats [--by day|model|preset|workspace|kind|status] [--days N|--all] [--json]",
@@ -311,6 +359,10 @@ function usage() {
     "  --session <id>          continue an existing pi session ('last' = latest job)",
     "  --fresh                 ignore --session and start a new pi session",
     "  --timeout <seconds>     hard limit for the run",
+    "  --max-cost <usd>        stop the run once it has cost this much",
+    "  --max-tokens <n>        stop the run once it has used this many tokens",
+    "  --max-turns <n>         stop the run after this many assistant turns",
+    "  --notify <command>      shell command to run when the job finishes",
     "  --stdin                 append piped stdin to the prompt",
     "  --cwd <path>            directory the agent works in (mounted at /workspace,",
     "                          and the tree `review` diffs). Job records stay with",
@@ -401,7 +453,7 @@ function resolveSessionReference(workspaceRoot, reference) {
 /**
  * Turn parsed flags + config into the concrete settings of one run.
  */
-export function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRoot, config }) {
+export function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRoot, config, trusted = true }) {
   const overrides = {
     model: flags.model ?? null,
     provider: flags.provider ?? null,
@@ -425,7 +477,19 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
       : {}),
     ...(flags["read-only"] ? { readOnly: true } : {}),
     ...(flags.write ? { readOnly: false } : {}),
-    ...(flags.timeout ? { timeoutMs: positiveNumber(flags.timeout, "--timeout") * 1000 } : {})
+    ...(flags.timeout ? { timeoutMs: positiveNumber(flags.timeout, "--timeout") * 1000 } : {}),
+    ...(flags.notify ? { onFinish: flags.notify } : {}),
+    // Each flag caps one dimension on its own, so passing one does not clear the
+    // others a preset already set.
+    ...(flags["max-cost"] || flags["max-tokens"] || flags["max-turns"]
+      ? {
+          budget: {
+            ...(flags["max-cost"] ? { maxCostUsd: positiveNumber(flags["max-cost"], "--max-cost") } : {}),
+            ...(flags["max-tokens"] ? { maxTokens: positiveNumber(flags["max-tokens"], "--max-tokens") } : {}),
+            ...(flags["max-turns"] ? { maxTurns: positiveNumber(flags["max-turns"], "--max-turns") } : {})
+          }
+        }
+      : {})
   };
 
   const settings = resolveRunSettings(config, command, overrides);
@@ -461,7 +525,11 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
   if (isSandboxed(sandbox)) {
     // The provider decides which credential the container gets, so it has to
     // travel with the sandbox descriptor rather than only with the pi args.
-    sandbox = { ...sandbox, provider: providerOf(settings) };
+    // `isolateCaches` travels with the descriptor because the answer belongs to
+    // the workspace, not to the profile: the same `go` profile shares its module
+    // cache between one's own repositories and keeps a throwaway one for a
+    // checkout that arrived from outside.
+    sandbox = { ...sandbox, provider: providerOf(settings), isolateCaches: !trusted };
     // A worktree cannot see its own repository through /workspace alone, so the
     // shared .git is mounted for it. Listed before the run's own mounts, which
     // therefore win the deduplication if one names the same target explicitly.
@@ -609,6 +677,30 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, settings }) {
 }
 
 /**
+ * The settings worth repeating a run with.
+ *
+ * Not the whole resolved object: the system prompt text, the merged extension
+ * lists and the sandbox descriptor are derived from the config as it is *now*,
+ * and pinning them would repeat a stale copy of the machine's setup rather than
+ * the run. What is kept is what the caller chose — the preset, the model, the
+ * ceilings — so a rerun resolves everything else fresh.
+ */
+function rerunRecipe(settings) {
+  const recipe = {
+    preset: settings.presetName ?? null,
+    model: settings.model ?? null,
+    provider: settings.provider ?? null,
+    thinking: settings.thinking ?? null,
+    engine: settings.engine ?? null,
+    sandbox: settings.sandbox?.profileName ?? (isSandboxed(settings.sandbox) ? "docker" : null),
+    readOnly: settings.readOnly ? true : null,
+    timeoutMs: settings.timeoutMs ?? null,
+    budget: settings.budget ?? null
+  };
+  return Object.fromEntries(Object.entries(recipe).filter(([, value]) => value !== null));
+}
+
+/**
  * Shared execution path for delegate and review.
  */
 async function executeRun({
@@ -643,6 +735,14 @@ async function executeRun({
     readOnly: settings.readOnly,
     sandbox: settings.sandboxLabel,
     background: Boolean(flags.background),
+    // Taken before pi starts, so what the agent changed can be told apart from
+    // what was already in the tree. Null outside a git repository.
+    treeBefore: captureTreeSnapshot(runRoot),
+    // The task itself, and enough of the settings to run it again. Both go to
+    // the journal (redacted and capped there); the record on disk holds them so
+    // a `rerun` works even for a job whose journal row has aged out.
+    prompt,
+    rerunSettings: rerunRecipe(settings),
     status: "pending",
     createdAt: nowIso()
   });
@@ -665,53 +765,89 @@ async function executeRun({
   }
 
   const startedAt = Date.now();
-  const execution = await runTrackedJob({ ...job, logFile }, async () => {
-    const runner = settings.engine === "json" ? runPiTurn : runPiRpcTurn;
-    const result = await runner({
-      cwd: runRoot,
-      env: { ...process.env, ...gitIdentityEnv(settings.git) },
-      prompt,
-      model: settings.model,
-      provider: settings.provider,
-      thinking: settings.thinking,
-      systemPrompt: settings.systemPromptText,
-      appends: settings.appends,
-      tools: settings.tools,
-      excludeTools: settings.excludeTools,
-      readOnly: settings.readOnly,
-      noTools: settings.noTools,
-      noBuiltinTools: settings.noBuiltinTools,
-      extensions: settings.extensions,
-      skills: settings.skills,
-      noExtensions: settings.noExtensions,
-      noSkills: settings.noSkills,
-      sessionId,
-      sessionName: title.slice(0, 80),
-      timeoutMs: settings.timeoutMs,
-      eventsFile,
-      inboxFile,
-      sandbox: settings.sandbox,
-      jobId,
-      onProgress,
-      onSpawn: ({ pid: piPid, containerName }) => {
-        // Recorded so /pi:cancel can signal pi itself, not just this wrapper —
-        // and, in a sandbox, remove the container the signal cannot reach.
-        upsertJob(workspaceRoot, { id: jobId, piPid, containerName: containerName ?? null });
-      }
+  /**
+   * The hook fires for every terminal outcome, including a failed run: "it
+   * finished" is exactly the moment worth announcing, and a notification that
+   * only arrives on success is the one you cannot rely on.
+   */
+  const fireFinishHook = (status, execution = null) => {
+    if (!settings.onFinish) {
+      return;
+    }
+    const outcome = runFinishHook(settings.onFinish, {
+      ...job,
+      status,
+      logFile,
+      model: execution?.model ?? settings.model,
+      summary: execution?.summary ?? null,
+      elapsed: execution?.elapsed ?? null
     });
+    if (outcome.error) {
+      appendLogLine(logFile, `onFinish hook failed: ${outcome.error}`);
+    }
+  };
 
-    const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
-    const enriched = {
-      ...result,
-      elapsed: elapsedSeconds < 60 ? `${elapsedSeconds}s` : `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-    };
+  let execution;
+  try {
+    execution = await runTrackedJob({ ...job, logFile }, async () => {
+      const runner = settings.engine === "json" ? runPiTurn : runPiRpcTurn;
+      const result = await runner({
+        cwd: runRoot,
+        env: { ...process.env, ...gitIdentityEnv(settings.git) },
+        prompt,
+        model: settings.model,
+        provider: settings.provider,
+        thinking: settings.thinking,
+        systemPrompt: settings.systemPromptText,
+        appends: settings.appends,
+        tools: settings.tools,
+        excludeTools: settings.excludeTools,
+        readOnly: settings.readOnly,
+        noTools: settings.noTools,
+        noBuiltinTools: settings.noBuiltinTools,
+        extensions: settings.extensions,
+        skills: settings.skills,
+        noExtensions: settings.noExtensions,
+        noSkills: settings.noSkills,
+        sessionId,
+        sessionName: title.slice(0, 80),
+        timeoutMs: settings.timeoutMs,
+        budget: settings.budget,
+        eventsFile,
+        inboxFile,
+        sandbox: settings.sandbox,
+        jobId,
+        onProgress,
+        onSpawn: ({ pid: piPid, containerName }) => {
+          // Recorded so /pi:cancel can signal pi itself, not just this wrapper —
+          // and, in a sandbox, remove the container the signal cannot reach.
+          upsertJob(workspaceRoot, { id: jobId, piPid, containerName: containerName ?? null });
+        }
+      });
 
-    return {
-      ...enriched,
-      summary: (result.text ?? "").split("\n").find((line) => line.trim())?.slice(0, 160) ?? null,
-      rendered: renderRunResult({ title: resultTitle, job, settings, execution: enriched })
-    };
-  });
+      const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
+      const enriched = {
+        ...result,
+        elapsed: elapsedSeconds < 60 ? `${elapsedSeconds}s` : `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`,
+        // Read here, while the tree is still as the agent left it: asking later
+        // would measure whatever has happened since the run ended.
+        changes: summarizeTreeChanges(runRoot, job.treeBefore)
+      };
+
+      return {
+        ...enriched,
+        summary: (result.text ?? "").split("\n").find((line) => line.trim())?.slice(0, 160) ?? null,
+        rendered: renderRunResult({ title: resultTitle, job, settings, execution: enriched })
+      };
+    });
+  } catch (error) {
+    // `runTrackedJob` has already recorded the failure; the hook only announces
+    // it. Rethrown untouched afterwards so the command still reports it.
+    fireFinishHook("failed");
+    throw error;
+  }
+
+  fireFinishHook(execution.aborted ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed", execution);
 
   return { job, execution };
 }
@@ -835,7 +971,14 @@ async function commandDelegate(argv, workspaceRoot) {
 
   const { config, warnings: configWarnings } = loadConfig(workspaceRoot);
   const runRoot = resolveRunRoot(flags.cwd);
-  const settings = buildRunSettings({ command: "delegate", flags, workspaceRoot, runRoot, config });
+  const settings = buildRunSettings({
+    command: "delegate",
+    flags,
+    workspaceRoot,
+    runRoot,
+    config,
+    trusted: workspaceIsTrusted(runRoot)
+  });
   // Anything the project layer was not allowed to set has to be visible: a
   // silently ignored setting looks exactly like one that did not work.
   settings.warnings = [...(configWarnings ?? []), ...settings.warnings];
@@ -869,20 +1012,56 @@ async function commandReview(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
   // The diff under review belongs to the tree the agent will read, so every git
   // question is asked of the run root.
-  const runRoot = resolveRunRoot(flags.cwd);
+  let runRoot = resolveRunRoot(flags.cwd);
+
+  // `--job <id>` reviews exactly what another run changed: the natural next
+  // step after delegating work, and the one that used to need the base commit
+  // to be looked up by hand.
+  const reviewed = flags.job ? resolveResultJob(workspaceRoot, flags.job) : null;
+  if (reviewed) {
+    const before = reviewed.stored?.treeBefore ?? reviewed.job.treeBefore ?? null;
+    if (!before?.head) {
+      throw new Error(
+        `Job ${reviewed.job.id} has no tree snapshot to review — it ran outside a git repository, or before snapshots existed.`
+      );
+    }
+    // The run may have worked in another tree (--cwd, or a worktree), and that
+    // is the tree its changes live in.
+    runRoot = reviewed.stored?.runRoot ?? reviewed.job.runRoot ?? runRoot;
+  }
   ensureGitRepository(runRoot);
 
-  const target = resolveReviewTarget(runRoot, {
-    scope: flags.scope ?? "auto",
-    base: flags.base ?? null
-  });
-  const context = collectReviewContext(runRoot, target);
+  const target = reviewed
+    ? {
+        scope: "job",
+        base: (reviewed.stored?.treeBefore ?? reviewed.job.treeBefore).head,
+        branch: getCurrentBranch(runRoot),
+        description: `the changes made by job ${reviewed.job.id}${reviewed.job.title ? ` (${reviewed.job.title})` : ""}`
+      }
+    : resolveReviewTarget(runRoot, {
+        scope: flags.scope ?? "auto",
+        base: flags.base ?? null
+      });
+  const context = reviewed
+    ? collectTreeDiff(runRoot, reviewed.stored?.treeBefore ?? reviewed.job.treeBefore)
+    : collectReviewContext(runRoot, target);
   if (!context.text.trim()) {
-    throw new Error("Nothing to review: the resolved diff is empty.");
+    throw new Error(
+      reviewed
+        ? `Job ${reviewed.job.id} left the tree unchanged; there is nothing to review.`
+        : "Nothing to review: the resolved diff is empty."
+    );
   }
 
   const { config } = loadConfig(workspaceRoot);
-  const settings = buildRunSettings({ command: "review", flags, workspaceRoot, runRoot, config });
+  const settings = buildRunSettings({
+    command: "review",
+    flags,
+    workspaceRoot,
+    runRoot,
+    config,
+    trusted: workspaceIsTrusted(runRoot)
+  });
 
   const focus = positional.join(" ").trim();
   const prompt = interpolate(loadTaskTemplate(PLUGIN_ROOT, "review"), {
@@ -920,18 +1099,55 @@ async function commandReview(argv, workspaceRoot) {
 }
 
 async function commandStatus(argv, workspaceRoot) {
-  const { flags, positional } = parseArgs(argv, { booleans: ["json", "all"] });
+  const { flags, positional } = parseArgs(argv, {
+    booleans: ["json", "all", "global", "running"],
+    strings: ["status", "preset", "model"]
+  });
   const snapshot = buildStatusSnapshot(workspaceRoot, {
     jobId: positional[0] ?? null,
-    all: Boolean(flags.all)
+    all: Boolean(flags.all),
+    // The fleet view: every workspace on this machine, not just this checkout.
+    global: Boolean(flags.global),
+    // `--running` is the shorthand for the only filter anyone types by hand.
+    status: flags.running ? "running,pending" : (flags.status ?? null),
+    preset: flags.preset ?? null,
+    model: flags.model ?? null
   });
   output(renderStatusReport(snapshot), snapshot, Boolean(flags.json));
   return 0;
 }
 
 async function commandResult(argv, workspaceRoot) {
-  const { flags, positional } = parseArgs(argv, { booleans: ["json"] });
+  const { flags, positional } = parseArgs(argv, { booleans: ["json", "diff"] });
   const { job, stored } = resolveResultJob(workspaceRoot, positional[0] ?? null);
+
+  // The patch is read from the tree on demand rather than stored with the job:
+  // it can be megabytes, and the answer to "show me what it wrote" is only
+  // wanted for a run in a handful of cases.
+  if (flags.diff) {
+    const before = stored?.treeBefore ?? job.treeBefore ?? null;
+    if (!before?.head) {
+      throw new Error(
+        `Job ${job.id} has no tree snapshot to diff against — it ran outside a git repository, or before snapshots existed.`
+      );
+    }
+    const runRoot = stored?.runRoot ?? job.runRoot ?? workspaceRoot;
+    const diff = collectTreeDiff(runRoot, before);
+    // A diff against a commit cannot separate the agent's work from anything
+    // else that happened in the same tree since. Naming those files is the
+    // honest version: dropping them would hide edits the agent also made.
+    const alsoMine = (before.dirty ?? []).length
+      ? `\n\nAlready modified when the run started, so anything here is not necessarily the agent's: ${before.dirty
+          .slice(0, 20)
+          .join(", ")}${before.dirty.length > 20 ? `, and ${before.dirty.length - 20} more` : ""}.`
+      : "";
+    const rendered = diff.text.trim()
+      ? `# pi result — \`${job.id}\` diff\n\nAgainst \`${before.head.slice(0, 12)}\`, the commit the run started from.${alsoMine}\n\n${diff.text}`
+      : `# pi result — \`${job.id}\` diff\n\nThe tree is unchanged since the run started.`;
+    output(rendered, { job: job.id, base: before.head, diff: diff.text, truncated: diff.truncated }, Boolean(flags.json));
+    return 0;
+  }
+
   output(renderStoredJobResult(job, stored), { job, stored }, Boolean(flags.json));
   return 0;
 }
@@ -1297,71 +1513,326 @@ async function commandSandbox(argv, workspaceRoot) {
   return 0;
 }
 
-async function commandCancel(argv, workspaceRoot) {
-  const { flags, positional } = parseArgs(argv, { booleans: ["json"] });
-  const job = resolveCancelableJob(workspaceRoot, positional[0] ?? null);
-
+/**
+ * Stop one job: ask pi to abort, then signal, then take the container down.
+ *
+ * Each step is a fallback for the one before: the control channel keeps the
+ * session and the partial work, a signal reaches a run with no channel, and
+ * removing the container is the only thing that helps a job whose wrapper is
+ * already gone. Records live in the job's own workspace, which is not
+ * necessarily the one the command was typed in.
+ */
+async function cancelJob(job, { wait = true } = {}) {
+  const workspaceRoot = job.workspaceRoot;
   let cancelled = false;
-  // `pending` is a job whose detached child has not reached runTrackedJob yet,
-  // and `orphaned` one whose wrapper died with the container still up. Both
-  // used to fall through this block untouched while the command reported
-  // success — a pending run kept going after "cancelled", and an orphaned one
-  // held its container, and with it a slot of the concurrency pool, forever.
-  const stoppable = job.status === "running" || job.status === "pending" || job.status === "orphaned";
-  if (stoppable) {
-    // Ask pi to stop through the control channel first: an abort keeps the
-    // session intact and lets the run record its partial work.
-    if (job.engine !== "json" && job.status === "running") {
-      pushControlMessage(workspaceRoot, job.id, { kind: "abort" });
-      appendLogLine(job.logFile, "Abort requested from Claude Code.");
-      for (let waited = 0; waited < 4000; waited += 250) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        const current = listJobs(workspaceRoot).find((entry) => entry.id === job.id);
-        if (current && current.status !== "running") {
-          cancelled = true;
-          break;
-        }
+
+  if (job.engine !== "json" && job.status === "running") {
+    pushControlMessage(workspaceRoot, job.id, { kind: "abort" });
+    appendLogLine(job.logFile, "Abort requested from Claude Code.");
+    // Skipped when cancelling a fleet: four seconds per job turns "stop
+    // everything" into a minute of waiting, and the signal below is what
+    // actually stops a run that ignores the channel.
+    for (let waited = 0; wait && waited < 4000; waited += 250) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const current = listJobs(workspaceRoot).find((entry) => entry.id === job.id);
+      if (current && current.status !== "running") {
+        cancelled = true;
+        break;
       }
     }
-
-    if (!cancelled) {
-      // pi runs in its own process group; the companion wrapper does not.
-      const piStopped = job.piPid ? await terminateProcessTree(job.piPid, { group: true }) : false;
-      const wrapperStopped = job.pid ? await terminateProcessTree(job.pid, { group: false }) : false;
-      cancelled = piStopped || wrapperStopped;
-    }
-
-    // Signals reach the `docker run` client, never the container behind it, so
-    // a sandboxed job is only really stopped once the container is gone. This
-    // is the only thing that helps an orphaned job, whose wrapper is already
-    // dead, and a pending one, whose container may have started before the
-    // record caught up.
-    // A run with no sandbox has no container to remove; only guess a name when
-    // the job actually had one.
-    const containerName =
-      job.containerName ?? (job.sandbox || job.sandboxProfile ? containerNameForJob(job.id, job.sandboxProfile ?? null) : null);
-    if (containerName) {
-      const removed = removeSandboxContainer(containerName);
-      cancelled = cancelled || removed;
-    }
-
-    const record = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() };
-    upsertJob(workspaceRoot, record);
-    // The journal only ever heard about a job from runTrackedJob, so a cancelled
-    // or orphaned run stayed `running` there for good: it counted against the
-    // success rate of every report and could never be corrected.
-    recordJobSafely({ ...job, ...(readStoredJob(workspaceRoot, job.id) ?? {}), ...record });
-    // Keep whatever the run already stored (partial output, session id) and
-    // only overlay the cancellation.
-    writeJobFile(workspaceRoot, job.id, {
-      ...job,
-      ...(readStoredJob(workspaceRoot, job.id) ?? {}),
-      ...record
-    });
   }
+
+  if (!cancelled) {
+    // pi runs in its own process group; the companion wrapper does not.
+    const piStopped = job.piPid ? await terminateProcessTree(job.piPid, { group: true }) : false;
+    const wrapperStopped = job.pid ? await terminateProcessTree(job.pid, { group: false }) : false;
+    cancelled = piStopped || wrapperStopped;
+  }
+
+  // Signals reach the `docker run` client, never the container behind it, so a
+  // sandboxed job is only really stopped once the container is gone.
+  // A run with no sandbox has no container to remove; only guess a name when
+  // the job actually had one.
+  const containerName =
+    job.containerName ?? (job.sandbox || job.sandboxProfile ? containerNameForJob(job.id, job.sandboxProfile ?? null) : null);
+  if (containerName) {
+    const removed = removeSandboxContainer(containerName);
+    cancelled = cancelled || removed;
+  }
+
+  const record = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() };
+  upsertJob(workspaceRoot, record);
+  // The journal only ever heard about a job from runTrackedJob, so a cancelled
+  // or orphaned run stayed `running` there for good: it counted against the
+  // success rate of every report and could never be corrected.
+  recordJobSafely({ ...job, ...(readStoredJob(workspaceRoot, job.id) ?? {}), ...record });
+  // Keep whatever the run already stored (partial output, session id) and only
+  // overlay the cancellation.
+  writeJobFile(workspaceRoot, job.id, {
+    ...job,
+    ...(readStoredJob(workspaceRoot, job.id) ?? {}),
+    ...record
+  });
+
+  return cancelled;
+}
+
+async function commandCancel(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, { booleans: ["json", "all", "global"] });
+
+  // `--all` is the fleet lever: several repositories delegating at once used to
+  // mean one `cancel <id>` per run, with the ids looked up by hand first.
+  if (flags.all || flags.global) {
+    const targets = listCancelableJobs(workspaceRoot, { global: Boolean(flags.global) });
+    if (!targets.length) {
+      throw new Error(
+        flags.global ? "No pi jobs are running on this machine." : "No running pi job to cancel in this workspace."
+      );
+    }
+    const results = [];
+    for (const job of targets) {
+      results.push({ job, cancelled: await cancelJob(job, { wait: false }) });
+    }
+    output(
+      renderCancelAllReport(results, { global: Boolean(flags.global) }),
+      { cancelled: results.map(({ job, cancelled }) => ({ id: job.id, workspace: job.workspaceRoot, cancelled })) },
+      Boolean(flags.json)
+    );
+    return results.every(({ cancelled }) => cancelled) ? 0 : 1;
+  }
+
+  const job = resolveCancelableJob(workspaceRoot, positional[0] ?? null);
+  const stoppable = isCancelable(job);
+  const cancelled = stoppable ? await cancelJob({ ...job, workspaceRoot: job.workspaceRoot ?? workspaceRoot }) : false;
 
   output(renderCancelReport(job, cancelled), { job, cancelled }, Boolean(flags.json));
   return cancelled || !stoppable ? 0 : 1;
+}
+
+/**
+ * Block until background jobs finish.
+ *
+ * `delegate --background` hands the run to a detached process and returns
+ * immediately, which is the point — but a caller that has nothing else to do
+ * until the answer exists had only polling `status` to work with. This waits on
+ * the job records and returns once every target has reached a terminal state.
+ */
+async function commandWait(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, { booleans: ["json", "all"], strings: ["for"] });
+
+  const waitSeconds = flags.for ? Number(flags.for) : DEFAULT_WAIT_SECONDS;
+  if (!Number.isFinite(waitSeconds) || waitSeconds <= 0) {
+    throw new Error(`--for expects a number of seconds, got "${flags.for}".`);
+  }
+  const deadline = Date.now() + waitSeconds * 1000;
+
+  const snapshot = () => sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
+  const targetsOf = (jobs) => {
+    if (positional.length) {
+      return positional.map((reference) => {
+        const job = jobs.find((entry) => entry.id === reference || entry.id.endsWith(reference));
+        if (!job) {
+          throw new Error(`No pi job matches "${reference}".`);
+        }
+        return job.id;
+      });
+    }
+    const live = jobs.filter((job) => !isTerminalStatus(job.status));
+    if (!live.length) {
+      throw new Error(
+        flags.all ? "No pi jobs are running in this workspace." : "No running pi job to wait for."
+      );
+    }
+    return flags.all ? live.map((job) => job.id) : [live[0].id];
+  };
+
+  // A job id printed by `delegate --background` can reach this command before
+  // the detached child has written its record, exactly as with `watch --follow`.
+  let jobs = snapshot();
+  if (positional.length && !jobs.length) {
+    const appearBy = Date.now() + JOB_APPEARANCE_GRACE_MS;
+    while (!jobs.length && Date.now() < appearBy) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      jobs = snapshot();
+    }
+  }
+
+  const ids = targetsOf(jobs);
+  let waited = [];
+  let timedOut = false;
+  for (;;) {
+    waited = snapshot().filter((job) => ids.includes(job.id));
+    if (waited.length === ids.length && waited.every((job) => isTerminalStatus(job.status))) {
+      break;
+    }
+    if (Date.now() >= deadline) {
+      timedOut = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS));
+  }
+
+  const failed = waited.filter((job) => job.status !== "completed");
+  output(
+    renderWaitReport(waited, { timedOut, waitSeconds }),
+    { jobs: waited, timedOut },
+    Boolean(flags.json)
+  );
+  return timedOut || failed.length ? 1 : 0;
+}
+
+/**
+ * The journal as a list: what was run, where, at what cost.
+ *
+ * `status` answers for this workspace and only while the records survive;
+ * this reads the durable journal, which is the only thing that remembers a run
+ * from last week or from a repository one has since deleted.
+ */
+async function commandRuns(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, {
+    booleans: ["json", "all", "prune", "full"],
+    strings: ["limit", "days", "model", "preset", "kind"]
+  });
+
+  const handle = openDatabase();
+  if (!handle) {
+    throw new Error(`The journal could not be opened (${databasePath()}). Node 22.3+ is needed for node:sqlite.`);
+  }
+
+  try {
+    if (flags.prune) {
+      const days = flags.days ? positiveNumber(flags.days, "--days") : DEFAULT_TEXT_TTL_DAYS;
+      const cleared = pruneJournalText(handle, { days });
+      output(
+        joinReport([
+          `# pi runs — pruned`,
+          "",
+          `Cleared the stored task and answer of ${cleared} run${cleared === 1 ? "" : "s"} older than ${days} days.`,
+          "",
+          "Counters, timings and costs are kept: statistics still cover the whole history."
+        ]),
+        { pruned: cleared, days },
+        Boolean(flags.json)
+      );
+      return 0;
+    }
+
+    if (positional[0]) {
+      const run = queryRun(handle, positional[0]);
+      if (!run) {
+        throw new Error(`No run matches "${positional[0]}" in the journal.`);
+      }
+      output(renderRunDetail(run), run, Boolean(flags.json));
+      return 0;
+    }
+
+    const runs = queryRuns(handle, {
+      limit: flags.limit ? positiveNumber(flags.limit, "--limit") : 20,
+      days: flags.days ? positiveNumber(flags.days, "--days") : null,
+      // The journal is machine-wide; `--all` opts into that, the default stays
+      // with the workspace the caller is standing in.
+      workspace: flags.all ? null : workspaceRoot,
+      model: flags.model ?? null,
+      preset: flags.preset ?? null,
+      kind: flags.kind ?? null
+    });
+    output(renderRunsReport(runs, { workspace: flags.all ? null : workspaceRoot }), { runs }, Boolean(flags.json));
+    return 0;
+  } finally {
+    handle.close();
+  }
+}
+
+/**
+ * Run a recorded task again.
+ *
+ * The point is comparison as much as repetition: `rerun <id> --model other` is
+ * the same task, the same settings and a different model, which is the only
+ * honest way to tell two models apart on work one actually does.
+ */
+async function commandRerun(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, RUN_FLAGS);
+  const reference = positional.join(" ").trim();
+  if (!reference) {
+    throw new Error("Which run? Usage: rerun <job-id> [--model <id>] [--preset <name>] [--background].");
+  }
+
+  const handle = openDatabase();
+  const stored = handle ? queryRun(handle, reference) : null;
+  handle?.close();
+
+  // The job file is consulted too: a run whose journal text has aged out, or
+  // one recorded before the journal kept prompts, can still be repeated from
+  // the record in its own workspace.
+  const local = (() => {
+    try {
+      return resolveResultJob(workspaceRoot, reference).stored;
+    } catch {
+      return null;
+    }
+  })();
+
+  const prompt = local?.prompt ?? stored?.prompt ?? null;
+  if (!prompt) {
+    throw new Error(
+      `Run "${reference}" has no stored task text — it predates prompt journalling, or its text has passed the ${DEFAULT_TEXT_TTL_DAYS}-day retention.`
+    );
+  }
+
+  const recipe = local?.rerunSettings ?? (stored?.settings ? JSON.parse(stored.settings) : {});
+  const runRoot = resolveRunRoot(flags.cwd ?? local?.runRoot ?? stored?.run_root ?? null);
+  const { config, warnings: configWarnings } = loadConfig(workspaceRoot);
+
+  // The recipe is the floor, the flags are the override: `--model` on a rerun
+  // is the whole point of the command.
+  const merged = {
+    ...flags,
+    preset: flags.preset ?? recipe.preset,
+    model: flags.model ?? recipe.model,
+    provider: flags.provider ?? recipe.provider,
+    thinking: flags.thinking ?? recipe.thinking,
+    engine: flags.engine ?? recipe.engine,
+    sandbox: flags.sandbox ?? recipe.sandbox,
+    ...(recipe.readOnly && !flags.write ? { "read-only": true } : {}),
+    timeout: flags.timeout ?? (recipe.timeoutMs ? String(Math.round(recipe.timeoutMs / 1000)) : undefined)
+  };
+
+  const settings = buildRunSettings({
+    command: "delegate",
+    flags: merged,
+    workspaceRoot,
+    runRoot,
+    config,
+    trusted: workspaceIsTrusted(runRoot)
+  });
+  // Ceilings the original run carried survive unless the caller names new ones.
+  settings.budget = settings.budget ?? recipe.budget ?? null;
+  settings.warnings = [...(configWarnings ?? []), ...settings.warnings];
+
+  const title = `Rerun of ${stored?.id ?? local?.id ?? reference}: ${prompt.split("\n")[0].slice(0, 100)}`;
+  const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("delegate");
+  if (flags.background && process.env[DETACHED_ENV] !== "1") {
+    // The detached copy re-runs this same command line, so it resolves the
+    // recorded task itself; nothing needs to travel with it.
+    detachBackgroundRun({ kind: "delegate", workspaceRoot, jobId, title, settings });
+    return 0;
+  }
+
+  const { job, execution } = await executeRun({
+    kind: "delegate",
+    jobId,
+    title,
+    prompt,
+    settings,
+    workspaceRoot,
+    runRoot,
+    flags,
+    resultTitle: "pi rerun",
+    sessionId: null
+  });
+
+  output(execution.rendered, { job: job.id, ...execution }, Boolean(flags.json));
+  return execution.exitStatus === 0 ? 0 : 1;
 }
 
 const COMMANDS = {
@@ -1371,6 +1842,9 @@ const COMMANDS = {
   review: commandReview,
   status: commandStatus,
   result: commandResult,
+  runs: commandRuns,
+  rerun: commandRerun,
+  wait: commandWait,
   cancel: commandCancel,
   steer: commandSteer,
   watch: commandWatch,

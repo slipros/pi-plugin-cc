@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
+import { budgetExceeded } from "./budget.mjs";
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
 import { runCommand } from "./process.mjs";
@@ -32,7 +33,7 @@ function proxyProviderOf(sandbox) {
   return sandbox?.provider ?? "unknown";
 }
 
-async function openCredentialProxy(sandbox, onProgress, model) {
+async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
   // `proxyCredentials: false` in a profile opts out — for a provider whose
   // endpoint does something the plain forwarder here does not reproduce.
   if (!isSandboxed(sandbox) || !sandbox.auth || !sandbox.provider || sandbox.proxyCredentials === false) {
@@ -46,7 +47,10 @@ async function openCredentialProxy(sandbox, onProgress, model) {
       provider: sandbox.provider,
       model,
       authEntry: auth?.[sandbox.provider],
-      onWarning: (message) => onProgress?.({ phase: "working", message })
+      onWarning: (message) => onProgress?.({ phase: "working", message }),
+      // Ties the per-request telemetry to the run; without it the proxy
+      // measures nothing rather than writing rows nothing can be joined to.
+      jobId
     });
     if (proxy) {
       onProgress?.({ phase: "starting", message: `Credentials stay on the host: ${sandbox.provider} goes through a run-scoped proxy.` });
@@ -82,6 +86,7 @@ export async function runPiRpcTurn({
   env = process.env,
   sandbox = null,
   jobId = null,
+  budget = null,
   ...options
 } = {}) {
   if (!prompt || !String(prompt).trim()) {
@@ -94,7 +99,7 @@ export async function runPiRpcTurn({
   // Credentials stay on the host: the container gets a token for a proxy that
   // lives exactly as long as this run. Falls back to the previous behaviour for
   // providers whose endpoint cannot be resolved.
-  const proxy = await openCredentialProxy(sandbox, onProgress, options.model ?? null);
+  const proxy = await openCredentialProxy(sandbox, onProgress, options.model ?? null, jobId);
   if (proxy) {
     sandbox = {
       ...sandbox,
@@ -147,6 +152,7 @@ export async function runPiRpcTurn({
   let stderr = "";
   let settledAt = null;
   let aborted = false;
+  let budgetStop = null;
   let closing = false;
   let lastControlAt = 0;
   const delivered = [];
@@ -211,6 +217,20 @@ export async function runPiRpcTurn({
     // that is still running can report what it has spent so far — until now
     // the number only existed in this process and landed on disk at the end.
     report(update ? { ...update, usage: state.usage } : null);
+
+    // Checked on the same numbers the caller sees, right after they change: the
+    // ceiling can only be enforced once the message that crossed it is paid for,
+    // so the earliest useful moment is here. `abort` is the same command
+    // steering uses — pi wraps up the turn instead of being killed, which keeps
+    // whatever the agent has already produced.
+    if (!budgetStop && !aborted) {
+      const exceeded = budgetExceeded(budget, { usage: state.usage, turns: state.turns });
+      if (exceeded) {
+        budgetStop = exceeded;
+        send({ type: "abort" });
+        report({ phase: "working", message: `Budget reached: ${exceeded}. Stopping pi.` });
+      }
+    }
   });
 
   child.stderr.setEncoding("utf8");
@@ -309,7 +329,7 @@ export async function runPiRpcTurn({
       }
       inbox?.drain();
       const quietFor = Date.now() - Math.max(settledAt ?? 0, lastControlAt);
-      if (settledAt !== null && (aborted || quietFor >= settleGraceMs)) {
+      if (settledAt !== null && (aborted || budgetStop || quietFor >= settleGraceMs)) {
         clearInterval(poll);
         resolve();
       }
@@ -363,6 +383,9 @@ export async function runPiRpcTurn({
   if (aborted) {
     errors.push("The run was aborted before pi finished.");
   }
+  if (budgetStop) {
+    errors.push(`Stopped by the run budget: ${budgetStop}.`);
+  }
   if (!text && !errors.length) {
     errors.push("pi produced no assistant output.");
   }
@@ -384,9 +407,16 @@ export async function runPiRpcTurn({
     timing: summarizeTiming(state.timing),
     peakContext: state.peakContext ?? 0,
     thinkingChars: state.thinkingChars ?? 0,
+    // Already measured by the slot queue and thrown away until now: the time
+    // this run spent waiting for a container of its own pool, which is time no
+    // model spent working.
+    slotWaitMs: slot.waitedMs ?? 0,
+    // Per-request telemetry the proxy collected, rolled up for the job row.
+    proxyStats: proxy?.stats?.() ?? null,
     queue: state.queue,
     steering: delivered,
     aborted,
+    budgetStop,
     thinkingLevel: state.thinkingLevel ?? null,
     exitStatus: errors.length ? 1 : (exitStatus ?? 0),
     stderr: stderr.trim(),

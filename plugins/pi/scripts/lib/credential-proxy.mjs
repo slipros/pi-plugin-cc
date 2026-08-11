@@ -6,6 +6,8 @@ import path from "node:path";
 import { pathToFileURL, URL } from "node:url";
 
 import { runCommand } from "./process.mjs";
+import { createStreamMeter } from "./sse-meter.mjs";
+import { createRequestRecorder } from "./telemetry.mjs";
 
 /**
  * Keeps provider credentials on the host while a sandboxed run talks to models.
@@ -32,6 +34,24 @@ const UPSTREAM_TIMEOUT_MS = 600_000;
 
 /** Ceiling on a buffered request body; prompts are large, but not this large. */
 const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+
+function parseInteger(value) {
+  const number = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(number) ? number : null;
+}
+
+/** `Retry-After` is either a delay in seconds or an HTTP date. */
+function parseRetryAfter(value) {
+  if (value == null) {
+    return null;
+  }
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) {
+    return Math.round(seconds * 1000);
+  }
+  const when = Date.parse(String(value));
+  return Number.isFinite(when) ? Math.max(0, when - Date.now()) : null;
+}
 
 /**
  * Read the provider table the host uses.
@@ -300,13 +320,23 @@ export function credentialOf(entry) {
  * @returns {Promise<{ url: string, token: string, close: () => Promise<void> } | null>}
  *   null when the provider cannot be proxied and the caller should fall back.
  */
-export async function startCredentialProxy({ homeDir, provider, model = null, authEntry, onWarning = null } = {}) {
+export async function startCredentialProxy({
+  homeDir,
+  provider,
+  model = null,
+  authEntry,
+  onWarning = null,
+  // Telemetry is written per run, so the proxy has to know which run it serves.
+  // Without an id nothing is recorded rather than orphaned rows accumulating.
+  jobId = null
+} = {}) {
   const endpoint = await resolveProviderEndpoint(homeDir, provider);
   const credential = credentialOf(authEntry);
   if (!endpoint || !credential) {
     return null;
   }
 
+  const recorder = createRequestRecorder(jobId);
   const token = `pi-run-${crypto.randomBytes(24).toString("hex")}`;
   // The container is told it is talking to a generic endpoint. Which model
   // actually answers is decided here, so an agent cannot quietly move itself to
@@ -346,32 +376,104 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
     }
     headers.authorization = `Bearer ${credential}`;
 
-    const forward = (body) => {
+    const forward = (body, streaming = false) => {
       if (body != null) {
         headers["content-length"] = Buffer.byteLength(body);
       }
+      // One measured exchange. Nothing here holds content: the meter counts SSE
+      // frames and drops them, and only the envelope reaches the journal.
+      const measured = recorder
+        ? {
+            started_at: new Date().toISOString(),
+            provider,
+            model: realModel,
+            api: endpoint.api ?? null,
+            path: target.pathname ?? null,
+            stream: streaming,
+            request_bytes: body != null ? Buffer.byteLength(body) : null
+          }
+        : null;
+      const startedAt = Date.now();
+      let meter = null;
+      let nonStreamBody = "";
+
+      const finish = (extra = {}) => {
+        if (!measured || measured.done) {
+          return;
+        }
+        measured.done = true;
+        recorder.record({
+          ...measured,
+          total_ms: Date.now() - startedAt,
+          ...(meter ? meter.summary() : {}),
+          ...extra
+        });
+      };
+
       const proxied = transport.request(
         target,
         { method: request.method, headers, timeout: UPSTREAM_TIMEOUT_MS },
         (upstreamResponse) => {
-          response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+          const status = upstreamResponse.statusCode ?? 502;
+          if (measured) {
+            measured.status = status;
+            measured.ttfb_ms = Date.now() - startedAt;
+            // A whitelist, never the headers themselves: `authorization` here is
+            // the provider's real key. These three say how close the run is to a
+            // rate limit before the first 429 arrives.
+            measured.retry_after_ms = parseRetryAfter(upstreamResponse.headers["retry-after"]);
+            measured.rl_remaining = parseInteger(
+              upstreamResponse.headers["x-ratelimit-remaining-requests"] ??
+                upstreamResponse.headers["x-ratelimit-remaining"] ??
+                upstreamResponse.headers["anthropic-ratelimit-requests-remaining"]
+            );
+            meter = createStreamMeter();
+          }
+          response.writeHead(status, upstreamResponse.headers);
           // Piped rather than buffered: token streams arrive as they are
           // produced, and buffering would turn a live transcript into one late
           // blob. Only the request is ever held whole, and only to rename a
           // model — responses stay a stream.
+          upstreamResponse.on("data", (chunk) => {
+            meter?.push(chunk);
+            // A non-streaming answer carries its usage in one JSON body, so a
+            // bounded head of it is kept — long enough to reach `usage`, short
+            // enough not to be a copy of the answer.
+            if (measured && !measured.stream && nonStreamBody.length < 64 * 1024) {
+              nonStreamBody += chunk.toString("utf8");
+            }
+          });
           upstreamResponse.pipe(response);
+          upstreamResponse.on("end", () => {
+            if (measured && !measured.stream) {
+              meter?.finishNonStream(nonStreamBody);
+            }
+            finish();
+          });
           // pipe() detaches on a source error without closing the destination,
           // so a provider that drops mid-stream left the agent waiting for a
           // response that would never end — until the run's own timeout, half
           // an hour later. Ending the socket makes it a read error it can retry.
-          upstreamResponse.on("error", () => response.destroy());
-          upstreamResponse.on("aborted", () => response.destroy());
+          upstreamResponse.on("error", () => {
+            finish({ error_kind: "truncated" });
+            response.destroy();
+          });
+          upstreamResponse.on("aborted", () => {
+            finish({ error_kind: "aborted" });
+            response.destroy();
+          });
         }
       );
 
-      proxied.on("timeout", () => proxied.destroy(new Error("upstream timed out")));
+      proxied.on("timeout", () => {
+        finish({ status: 0, error_kind: "timeout" });
+        proxied.destroy(new Error("upstream timed out"));
+      });
       proxied.on("error", (error) => {
         onWarning?.(`Model request failed: ${error.message}`);
+        // Status 0, not 502: the provider never answered, and folding a
+        // transport failure into its error rate would be a lie about it.
+        finish({ status: 0, error_kind: "transport" });
         if (!response.headersSent) {
           response.writeHead(502, { "content-type": "application/json" });
         }
@@ -422,7 +524,10 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
         if (payload && typeof payload === "object" && "model" in payload) {
           payload.model = realModel;
           restorePromptCacheKey(payload, upstream, token);
-          forward(Buffer.from(JSON.stringify(payload), "utf8"));
+          // `stream` is read from the payload and nothing else is: without it
+          // `ttfb_ms` cannot be read at all, since for a non-streaming request
+          // it equals the whole generation.
+          forward(Buffer.from(JSON.stringify(payload), "utf8"), payload.stream === true);
           return;
         }
       } catch {
@@ -453,6 +558,10 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
     // compacts), and lying about them would change behaviour, not just names.
     providerEntry: await maskedProviderEntry(homeDir, provider, realModel, endpoint),
     realModel,
+    /** Roll-up for the job row; zeroes when nothing was recorded. */
+    stats() {
+      return recorder?.stats() ?? null;
+    },
     async close() {
       await new Promise((resolve) => {
         server.close(() => resolve());
@@ -460,6 +569,9 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
         // wait for them.
         server.closeAllConnections?.();
       });
+      // Flushed after the sockets are gone, so requests that finished during
+      // shutdown are in the batch.
+      recorder?.close();
     }
   };
 }

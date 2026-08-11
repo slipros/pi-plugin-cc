@@ -87,6 +87,108 @@ export function resolveReviewTarget(cwd, { scope = "auto", base = null } = {}) {
   };
 }
 
+/**
+ * What the tree looked like before the agent touched it.
+ *
+ * A run reports what the agent *said*, and until now nothing recorded what it
+ * *did*: the answer arrived with no way to see the edits short of running git
+ * by hand and guessing which changes were the agent's. The snapshot is two
+ * cheap facts — the commit the run started from and the files that were already
+ * modified — which is enough to subtract the caller's own work-in-progress from
+ * whatever the tree looks like afterwards.
+ *
+ * @returns {{head: string|null, branch: string, dirty: string[]}|null} null when
+ *   the run root is not a git repository, which is a normal case here.
+ */
+export function captureTreeSnapshot(cwd) {
+  if (git(cwd, ["rev-parse", "--is-inside-work-tree"]).status !== 0) {
+    return null;
+  }
+  return {
+    head: gitOutput(cwd, ["rev-parse", "HEAD"]).trim() || null,
+    branch: getCurrentBranch(cwd),
+    // Paths only: the exact status letters change as work continues, and all
+    // this has to answer later is "was this file already dirty before the run".
+    dirty: parseStatusPaths(gitOutput(cwd, ["status", "--porcelain", "--untracked-files=all"]))
+  };
+}
+
+function parseStatusPaths(text) {
+  return String(text ?? "")
+    .split("\n")
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean)
+    // A rename is reported as `old -> new`; the new path is the one that exists.
+    .map((entry) => (entry.includes(" -> ") ? entry.split(" -> ").pop().trim() : entry));
+}
+
+/**
+ * What changed in the tree while the run was going.
+ *
+ * Commits made by the agent, files it touched, and the files that were already
+ * dirty when it started — kept apart, because "the agent wrote this" and "this
+ * was already like that" are different claims and only the first one is the
+ * run's doing.
+ *
+ * Note what this cannot know: anything the caller edited in the same tree while
+ * the run was going shows up as the agent's work. In a worktree or a sandbox
+ * that does not happen; in a shared checkout it can.
+ */
+export function summarizeTreeChanges(cwd, before) {
+  if (!before) {
+    return null;
+  }
+  const head = gitOutput(cwd, ["rev-parse", "HEAD"]).trim() || null;
+  const commits = before.head && head && before.head !== head
+    ? gitOutput(cwd, ["log", "--oneline", "--no-decorate", `${before.head}..HEAD`])
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+    : [];
+
+  const now = parseStatusPaths(gitOutput(cwd, ["status", "--porcelain", "--untracked-files=all"]));
+  const wasDirty = new Set(before.dirty ?? []);
+  const committed = before.head && head && before.head !== head
+    ? gitOutput(cwd, ["diff", "--name-only", `${before.head}..HEAD`]).split("\n").map((line) => line.trim()).filter(Boolean)
+    : [];
+
+  const files = [...new Set([...committed, ...now.filter((file) => !wasDirty.has(file))])].sort();
+  const stat = before.head ? gitOutput(cwd, ["diff", "--shortstat", before.head]).trim() : "";
+
+  return {
+    base: before.head,
+    head,
+    branch: getCurrentBranch(cwd),
+    commits,
+    files,
+    // Files the caller had already changed before the run started. Listed
+    // separately so a reader is never told the agent wrote them.
+    preexisting: [...wasDirty].filter((file) => now.includes(file)).sort(),
+    stat,
+    // Everything since the run started, commits and working tree together.
+    diffCommand: before.head ? `git diff ${before.head.slice(0, 12)}` : null
+  };
+}
+
+/** The actual patch for what the run changed, bounded so it cannot flood a reply. */
+export function collectTreeDiff(cwd, before, { maxBytes = DEFAULT_MAX_CONTEXT_BYTES } = {}) {
+  if (!before?.head) {
+    return { text: "", truncated: false };
+  }
+  const parts = [
+    section("Commits", gitOutput(cwd, ["log", "--oneline", "--no-decorate", `${before.head}..HEAD`])),
+    section("Diff stat", gitOutput(cwd, ["diff", "--stat", before.head])),
+    section("Diff", gitOutput(cwd, ["diff", before.head]))
+  ];
+  const untracked = listUntrackedFiles(cwd).filter((file) => !(before.dirty ?? []).includes(file));
+  if (untracked.length) {
+    // Untracked files are invisible to `git diff`, and a new file is exactly
+    // what an agent writing code produces most of.
+    parts.push(section("New untracked files", untracked.join("\n")));
+  }
+  return truncate(parts.filter(Boolean).join("\n\n"), maxBytes);
+}
+
 function truncate(text, limit) {
   if (text.length <= limit) {
     return { text, truncated: false };

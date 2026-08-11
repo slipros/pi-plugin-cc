@@ -5,6 +5,7 @@ import { recordJobSafely } from "./db.mjs";
 import {
   ensureStateDir,
   listJobs,
+  listJobsEverywhere,
   nowIso,
   readJobFile,
   resolveJobFile,
@@ -190,19 +191,54 @@ function matchJob(jobs, reference) {
   );
 }
 
-export function buildStatusSnapshot(workspaceRoot, { jobId = null, all = false } = {}) {
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
+/**
+ * Narrow a job list the way the status flags describe.
+ *
+ * `--running` is the one that matters for a fleet: with several repositories
+ * delegating at once, the answer to "what is still going" was buried under
+ * whatever each workspace had finished earlier that day.
+ */
+export function filterJobs(jobs, { status = null, preset = null, model = null } = {}) {
+  const wanted = status ? new Set(String(status).split(",").map((entry) => entry.trim()).filter(Boolean)) : null;
+  return jobs.filter((job) => {
+    if (wanted && !wanted.has(String(job.status))) {
+      return false;
+    }
+    if (preset && String(job.preset ?? "") !== String(preset)) {
+      return false;
+    }
+    // Substring, because a model is recorded as `provider/model` and nobody
+    // wants to type the provider to filter by the model.
+    if (model && !String(job.model ?? "").includes(String(model))) {
+      return false;
+    }
+    return true;
+  });
+}
+
+export function buildStatusSnapshot(
+  workspaceRoot,
+  { jobId = null, all = false, global: everywhere = false, status = null, preset = null, model = null } = {}
+) {
+  const source = everywhere ? listJobsEverywhere() : listJobs(workspaceRoot);
+  const jobs = sortJobsNewestFirst(source).map(enrichJob);
 
   if (jobId) {
     const job = matchJob(jobs, jobId);
     if (!job) {
       throw new Error(`No pi job matches "${jobId}".`);
     }
-    return { jobs: [job], filtered: false, total: jobs.length };
+    return { jobs: [job], filtered: false, total: jobs.length, global: everywhere };
   }
 
-  const visible = all ? jobs : jobs.slice(0, DEFAULT_MAX_STATUS_JOBS);
-  return { jobs: visible, filtered: visible.length < jobs.length, total: jobs.length };
+  const matching = filterJobs(jobs, { status, preset, model });
+  const visible = all ? matching : matching.slice(0, DEFAULT_MAX_STATUS_JOBS);
+  return {
+    jobs: visible,
+    filtered: visible.length < matching.length,
+    total: matching.length,
+    global: everywhere
+  };
 }
 
 export function resolveResultJob(workspaceRoot, jobId = null) {
@@ -229,9 +265,30 @@ export function resolveResultJob(workspaceRoot, jobId = null) {
   return { job: finished, stored: readStoredJob(workspaceRoot, finished.id) };
 }
 
+/**
+ * Statuses `cancel` can still act on.
+ *
+ * `pending` is a background run whose detached child has not taken over yet,
+ * and `orphaned` one whose wrapper died with the container still up — both are
+ * live from the machine's point of view, and leaving them out meant `cancel`
+ * with no argument said "nothing to cancel" while a container kept running and
+ * held its slot in the pool.
+ */
+const CANCELABLE_STATUSES = new Set(["running", "pending", "orphaned"]);
+
+export function isCancelable(job) {
+  return CANCELABLE_STATUSES.has(String(job?.status));
+}
+
+/** Every job that could be stopped, in this workspace or across all of them. */
+export function listCancelableJobs(workspaceRoot, { global: everywhere = false } = {}) {
+  const source = everywhere ? listJobsEverywhere() : listJobs(workspaceRoot);
+  return sortJobsNewestFirst(source).map(enrichJob).filter(isCancelable);
+}
+
 export function resolveCancelableJob(workspaceRoot, jobId = null) {
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
-  const cancelable = jobs.filter((job) => job.status === "running");
+  const cancelable = jobs.filter(isCancelable);
 
   if (jobId) {
     const job = matchJob(jobs, jobId);
@@ -321,6 +378,9 @@ export async function runTrackedJob(job, runner) {
       peakContext: execution.peakContext ?? 0,
       thinkingChars: execution.thinkingChars ?? 0,
       degraded,
+      // What the run did to the working tree, measured while it still looked
+      // the way the agent left it.
+      changes: execution.changes ?? null,
       summary: execution.summary ?? null,
       rendered: execution.rendered ?? null,
       errors: execution.errors ?? []
@@ -336,7 +396,16 @@ export async function runTrackedJob(job, runner) {
       model: record.model,
       summary: record.summary
     });
-    recordJobSafely(record);
+    // The answer goes to the journal but not into the job file: the rendered
+    // report there already contains it, and storing both doubles every record.
+    // Same for the proxy roll-up and the slot wait — numbers for the reports,
+    // not state anyone reads back from a job file.
+    recordJobSafely({
+      ...record,
+      text: execution.text ?? null,
+      proxyStats: execution.proxyStats ?? null,
+      slotWaitMs: execution.slotWaitMs ?? 0
+    });
     appendLogBlock(job.logFile, "Final output", execution.rendered);
     return execution;
   } catch (error) {

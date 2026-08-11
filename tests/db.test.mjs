@@ -75,32 +75,67 @@ test("totals group along whichever axis is asked for", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("the rate uses only runs that carry timings, and percentiles come from durations", () => {
+test("the rate uses only generation windows, and percentiles come from durations", () => {
   const { handle, dir } = temporaryDatabase();
 
-  // A timed run: 600 generated tokens in 6s of model time.
+  // A run the proxy measured: 2000 generated tokens over 20s of generation.
   recordJob(
     handle,
     job({
-      id: "timed",
+      id: "measured",
       model: "m1",
-      usage: { input: 10, output: 500, cost: 0 },
+      usage: { input: 10, output: 2000, cost: 0 },
       timing: { modelMs: 6000, toolMs: 30_000, spanMs: 36_000 },
+      proxyStats: { count: 4, failed: 0, ttftP50Ms: 300, genMs: 20_000, genOutTokens: 2000 },
       startedAt: new Date(Date.now() - 36_000).toISOString()
     })
   );
-  // An untimed run from before the measurement existed: plenty of output, no
-  // model time. Folding its tokens into the rate would inflate it without end.
-  recordJob(handle, job({ id: "untimed", model: "m1", usage: { input: 10, output: 100_000, cost: 0 } }));
+  // Model time but no proxy telemetry — an unsandboxed run, or one from before
+  // the measurement existed. Folding it in would mix two definitions of speed
+  // in one column, which is worse than leaving a gap.
+  recordJob(
+    handle,
+    job({
+      id: "untimed",
+      model: "m1",
+      usage: { input: 10, output: 100_000, cost: 0 },
+      timing: { modelMs: 1000, toolMs: 0, spanMs: 1000 }
+    })
+  );
   recordJob(handle, job({ id: "failed", model: "m1", status: "failed", usage: { input: 1, output: 1 } }));
 
   const [row] = queryStats(handle, { by: "model", days: null });
   assert.equal(row.runs, 3);
   assert.equal(row.completed, 2);
   assert.equal(row.failed, 1);
-  assert.equal(Math.round(row.tokensPerSecond), 83, "500 tokens over 6s, untimed run excluded");
+  assert.equal(Math.round(row.tokensPerSecond), 100, "2000 tokens over 20s of generation, untimed run excluded");
+  assert.equal(row.outputPerRun, 2000, "the answer length the rate was measured on");
   assert.equal(row.p50Seconds, 12);
   assert.equal(row.p90Seconds, 36, "the slow run is what p90 is for");
+
+  handle.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("a short answer carries no rate at all", () => {
+  const { handle, dir } = temporaryDatabase();
+
+  // The tokens delivered in the first frame were generated before the window
+  // opened, so a one-word answer would report an arbitrarily large rate.
+  recordJob(
+    handle,
+    job({
+      id: "one-word",
+      model: "m2",
+      usage: { input: 5000, output: 6, cost: 0 },
+      proxyStats: { count: 1, failed: 0, ttftP50Ms: 90, genMs: 5, genOutTokens: 6 }
+    })
+  );
+
+  const [row] = queryStats(handle, { by: "model", days: null });
+  assert.equal(row.runs, 1);
+  assert.equal(row.tokensPerSecond, null);
+  assert.equal(row.outputPerRun, null);
 
   handle.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -126,6 +161,7 @@ test("the models report only queries the journal when stats are asked for", asyn
         avg_context: 812_431,
         max_context: 1_004_000,
         tokensPerSecond: 40.4,
+        outputPerRun: 2400,
         p50Seconds: 12,
         p90Seconds: 300,
         turns: 8,
@@ -136,5 +172,5 @@ test("the models report only queries the journal when stats are asked for", asyn
       }
     ]
   });
-  assert.match(report, /\| `m1` \| 4 \| 75% \| 812K \| 1\.0M \| 40\.4 \| 12s \| 5\.0m \| 2\.0 \| 10% \|/);
+  assert.match(report, /\| `m1` \| 4 \| 75% \| 812K \| 1\.0M \| 40\.4 \| 2K \| 12s \| 5\.0m \| 2\.0 \| 10% \|/);
 });

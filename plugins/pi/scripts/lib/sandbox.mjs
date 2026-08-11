@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { concatAdditive } from "./config.mjs";
@@ -267,9 +268,74 @@ function resolveMountSource(mount, homeDir, cwd) {
   return `${relative ? path.resolve(cwd, source) : source}${rest}`;
 }
 
-function resolveAgentMount(sandbox, homeDir) {
+/**
+ * A stable, filesystem-safe key for one workspace.
+ *
+ * The basename is there so a human going through volumes or session buckets can
+ * tell them apart; the digest is what actually keeps two checkouts of the same
+ * name separate. Only ever used inside the container or as a volume suffix.
+ */
+export function workspaceKey(cwd) {
+  const absolute = path.resolve(String(cwd ?? "."));
+  const digest = createHash("sha256").update(absolute).digest("hex").slice(0, 12);
+  const name = path.basename(absolute).replace(/[^a-zA-Z0-9_.-]+/g, "-").replace(/^[.-]+/, "").slice(0, 24);
+  return name ? `${name}-${digest}` : digest;
+}
+
+/**
+ * Where this run keeps pi's sessions inside the container.
+ *
+ * pi buckets sessions by the working directory, but every run sees the same
+ * `/workspace` — so one bucket held the transcripts of every repository the
+ * plugin had ever touched, and `--session last` could resume a session from a
+ * different project. Naming the directory per workspace restores the split pi
+ * intended; the directory stays inside the agent volume, so resuming a session
+ * within one repository keeps working.
+ */
+export function sessionDirFor(cwd) {
+  return `${AGENT_DIR}/sessions/${workspaceKey(cwd)}`;
+}
+
+/**
+ * Whether this run must not share writable state with runs in other workspaces.
+ *
+ * Set for workspaces the user has not vouched for: their code runs with write
+ * access to whatever the profile mounts, and a named volume outlives the
+ * container. A poisoned module or build object dropped into a shared cache is
+ * picked up by the next run — in a different repository.
+ */
+function isolatesState(sandbox) {
+  return sandbox?.isolateCaches === true;
+}
+
+/**
+ * Replace a shared writable cache with one that dies with the container.
+ *
+ * Only named volumes qualify: a bind mount is the user pointing at a host
+ * directory on purpose, and a read-only mount cannot carry anything into the
+ * next run. Docker reads `-v /path` with no source as "give this container its
+ * own anonymous volume here", and `--rm` removes it afterwards — so the module
+ * and build caches stay warm for the length of the run and vanish with it.
+ *
+ * @returns {string|null} the replacement `-v` value, or null to mount as written
+ */
+function anonymousVolumeFor(mount, homeDir) {
+  const { source, target, options } = parseMount(mount);
+  const expanded = expandHome(source, homeDir);
+  const isPath = expanded.startsWith("/") || expanded.startsWith("./") || expanded.startsWith("../") || expanded === "." || expanded === "..";
+  if (isPath || options.includes("ro")) {
+    return null;
+  }
+  return target;
+}
+
+function resolveAgentMount(sandbox, homeDir, cwd) {
   if (sandbox.agentDir === "volume") {
-    return { source: sandbox.volume || DEFAULT_SANDBOX_VOLUME, isolated: true };
+    const volume = sandbox.volume || DEFAULT_SANDBOX_VOLUME;
+    // Small enough to keep per workspace (sessions, the model store, LSP state),
+    // and keeping it means an untrusted repository can still resume its own
+    // sessions — it just cannot leave anything behind for anyone else's run.
+    return { source: isolatesState(sandbox) ? `${volume}-${workspaceKey(cwd)}` : volume, isolated: true };
   }
   if (sandbox.agentDir === "host") {
     return { source: path.join(homeDir, ".pi", "agent"), isolated: false };
@@ -333,6 +399,9 @@ export function buildDockerRunArgs({
 
   args.push("-e", `HOME=${CONTAINER_HOME}`);
   args.push("-e", `PI_CODING_AGENT_DIR=${AGENT_DIR}`);
+  // Set before the profile's own env so a profile that names the variable — or
+  // a `--session-dir` in its args — still wins; this is the default, not a law.
+  args.push("-e", `PI_CODING_AGENT_SESSION_DIR=${sessionDirFor(cwd)}`);
   for (const entry of sandbox.env ?? []) {
     // `NAME` forwards the host value, `NAME=value` sets one for the container.
     if (entry.includes("=") || env[entry] != null) {
@@ -342,7 +411,7 @@ export function buildDockerRunArgs({
 
   args.push("-v", `${cwd}:${WORKDIR}`, "-w", WORKDIR);
 
-  const agent = resolveAgentMount(sandbox, homeDir);
+  const agent = resolveAgentMount(sandbox, homeDir, cwd);
   args.push("-v", `${agent.source}:${AGENT_DIR}`);
   if (sandbox.credentialProxy) {
     // pi is started with the masked provider, so the files describing it have to
@@ -390,6 +459,13 @@ export function buildDockerRunArgs({
   }
 
   for (const mount of sandbox.mounts ?? []) {
+    if (isolatesState(sandbox)) {
+      const anonymous = anonymousVolumeFor(mount, homeDir);
+      if (anonymous) {
+        args.push("-v", anonymous);
+        continue;
+      }
+    }
     args.push("-v", resolveMountSource(mount, homeDir, cwd));
   }
   args.push(...(sandbox.args ?? []));
@@ -1006,6 +1082,11 @@ export function describeSandbox(sandbox) {
   ].filter(Boolean);
   if (limits.length) {
     parts.push(`limits: ${limits.join(" · ")}`);
+  }
+  if (isolatesState(sandbox)) {
+    // Worth saying out loud: it explains both the cold build cache and why the
+    // run cannot see the sessions of everything else on this machine.
+    parts.push("caches: isolated (workspace not trusted)");
   }
   return parts.join(", ");
 }

@@ -37,13 +37,54 @@ export function resolveStateDir(workspaceRoot) {
       .replace(/[^a-zA-Z0-9._-]+/g, "-")
       .replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 16);
-  const dataDir = process.env.CLAUDE_PLUGIN_DATA;
-  const stateRoot = dataDir ? path.join(dataDir, "state") : path.join(os.tmpdir(), "pi-companion");
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(stateRoot(), `${slug}-${hash}`);
 }
 
 export function resolveJobsDir(workspaceRoot) {
   return path.join(resolveStateDir(workspaceRoot), JOBS_DIR_NAME);
+}
+
+/** The directory every workspace bucket lives under. */
+function stateRoot() {
+  const dataDir = process.env.CLAUDE_PLUGIN_DATA;
+  return dataDir ? path.join(dataDir, "state") : path.join(os.tmpdir(), "pi-companion");
+}
+
+/**
+ * Every job this machine knows about, across workspaces.
+ *
+ * State is bucketed per workspace so two checkouts never share history, which
+ * also means no single command could ever see the whole fleet: a run started
+ * from another repository was invisible here, and the only way to find a
+ * forgotten background job was to remember where it was launched from. Each
+ * record carries its own `workspaceRoot`, so the buckets can be read as one
+ * list without losing where each job belongs.
+ *
+ * Unreadable buckets are skipped rather than fatal — a half-written state file
+ * in some other workspace must not break a status call in this one.
+ */
+export function listJobsEverywhere() {
+  const root = stateRoot();
+  let buckets = [];
+  try {
+    buckets = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  } catch {
+    return [];
+  }
+
+  const jobs = [];
+  for (const bucket of buckets) {
+    const stateFile = path.join(root, bucket.name, STATE_FILE_NAME);
+    try {
+      const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      for (const job of Array.isArray(parsed.jobs) ? parsed.jobs : []) {
+        jobs.push({ ...job, bucket: bucket.name });
+      }
+    } catch {
+      continue;
+    }
+  }
+  return jobs;
 }
 
 /**

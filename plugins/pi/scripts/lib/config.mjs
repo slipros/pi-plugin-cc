@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { normalizeBudget } from "./budget.mjs";
+
 /**
  * Plugin configuration.
  *
@@ -189,7 +191,12 @@ const PROJECT_FORBIDDEN_SANDBOX_KEYS = [
   // `{"mode": "none"}` disables the sandbox exactly like the string form does.
   "mode",
   "env",
-  "proxyCredentials"
+  "proxyCredentials",
+  // Both decide whether this run shares state with the next one. `volume` names
+  // the agent directory an untrusted repository would otherwise put back on the
+  // shared one, and `isolateCaches` is the switch that separates them at all.
+  "volume",
+  "isolateCaches"
 ];
 
 function sanitizeUntrustedEntry(entry, path, warnings) {
@@ -208,6 +215,16 @@ function sanitizeUntrustedEntry(entry, path, warnings) {
     // controls, so the repository would be choosing which host variables leak.
     warnings.push(`${path}.env ignored: the project config cannot pass host environment into the container.`);
     delete clean.env;
+  }
+
+  if ("onFinish" in clean) {
+    // The hook runs on the host, outside the container, with the caller's own
+    // permissions — the exact thing the sandbox exists to prevent. Worse, the
+    // agent inside the sandbox can write `.claude/pi/config.json` through the
+    // mounted workspace, so without this a run could hand itself host execution
+    // on the *next* run.
+    warnings.push(`${path}.onFinish ignored: the project config cannot run commands on the host.`);
+    delete clean.onFinish;
   }
 
   if ("sandbox" in clean) {
@@ -273,7 +290,15 @@ export function sanitizeProjectLayer(layer, warnings = []) {
   return clean;
 }
 
-/** Whether the user has vouched for this workspace's config. */
+/**
+ * Whether the user has vouched for this workspace.
+ *
+ * Two things hang off this answer: whether the project layer is read as written
+ * (below) and whether the run shares build caches and an agent directory with
+ * every other run (`sandbox.mjs`). Both ask the same question — is the code in
+ * this checkout allowed to affect the next run — so both read the same list.
+ * Entries match by prefix, so `~/github` vouches for everything under it.
+ */
 function isTrustedWorkspace(userLayer, workspaceRoot) {
   if (userLayer?.trustProjectConfig === true) {
     return true;
@@ -284,6 +309,18 @@ function isTrustedWorkspace(userLayer, workspaceRoot) {
     const root = path.resolve(String(entry).replace(/^~(?=\/|$)/, os.homedir()));
     return target === root || target.startsWith(`${root}${path.sep}`);
   });
+}
+
+/**
+ * The same question asked about a directory the caller names.
+ *
+ * The run root is not always the workspace — `--cwd` points the agent at another
+ * tree, and it is that tree's code which decides whether sharing a build cache
+ * is safe. Reads the user layer itself so the answer never depends on which
+ * directory the config happened to be loaded for.
+ */
+export function workspaceIsTrusted(workspaceRoot) {
+  return isTrustedWorkspace(readJsonFile(userConfigPath()).value, workspaceRoot);
 }
 
 /**
@@ -304,13 +341,14 @@ export function loadConfig(workspaceRoot) {
     config = mergeConfigLayer(config, user.value);
   }
 
+  const trusted = isTrustedWorkspace(user.value, workspaceRoot);
+
   const project = readJsonFile(projectConfigPath(workspaceRoot));
   if (project.error) {
     errors.push(project.error);
   }
   if (project.value) {
     sources.push(projectConfigPath(workspaceRoot));
-    const trusted = isTrustedWorkspace(user.value, workspaceRoot);
     config = mergeConfigLayer(config, trusted ? project.value : sanitizeProjectLayer(project.value, warnings));
   }
 
@@ -413,7 +451,15 @@ export function resolveRunSettings(config, command, overrides = {}) {
     // having to restate the profile.
     mounts: mergeLists("mounts"),
     engine: pick("engine") ?? "rpc",
-    timeoutMs: Number(pick("timeoutMs") ?? BUILT_IN.defaults.timeoutMs)
+    // Runs on the host when the job ends. Only ever from the user layer or a
+    // flag — `sanitizeUntrustedEntry` strips it from a project config.
+    onFinish: pick("onFinish"),
+    timeoutMs: Number(pick("timeoutMs") ?? BUILT_IN.defaults.timeoutMs),
+    // Merged like `git` rather than picked: a preset can cap the cost while the
+    // command line adds a turn limit, and neither erases the other.
+    budget: normalizeBudget(
+      layers.reduce((acc, layer) => (isPlainObject(layer?.budget) ? { ...acc, ...layer.budget } : acc), {})
+    )
   };
 }
 

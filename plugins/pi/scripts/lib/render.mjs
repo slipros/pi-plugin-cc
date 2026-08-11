@@ -1,3 +1,4 @@
+import { describeBudget } from "./budget.mjs";
 import { groupByProvider } from "./models.mjs";
 import { READ_ONLY_TOOLS } from "./pi.mjs";
 
@@ -116,8 +117,8 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
       lines.push(
         "What the catalogue cannot say: how these models behaved on this machine.",
         "",
-        "| Model | runs | ok | ctx avg | ctx max | tok/s | p50 | p90 | turns/run | tool err | cost |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| Model | runs | ok | ctx avg | ctx max | tok/s | out/run | p50 | p90 | turns/run | tool err | cost |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
       );
       for (const row of measured) {
         const counted = Number(row.counted_runs ?? 0);
@@ -125,14 +126,15 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
         lines.push(
           `| \`${row.bucket}\` | ${row.runs} | ${formatShare(row.completed, row.runs)} | ` +
             `${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
-            `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatSeconds(row.p50Seconds)} | ${formatSeconds(row.p90Seconds)} | ` +
+            `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatCompact(row.outputPerRun)} | ${formatSeconds(row.p50Seconds)} | ${formatSeconds(row.p90Seconds)} | ` +
             `${turnsPerRun} | ${formatShare(row.tool_errors, row.tool_calls)} | ${formatCost(row.cost) ?? "—"} |`
         );
       }
       lines.push(
         "",
-        "`tok/s` counts generated tokens against model time only — runs older than that measurement are left out of it. " +
-          "A `*` marks a provider whose hidden reasoning is streamed but reported as zero, making its rate an underestimate."
+        "`tok/s` counts generated tokens against the generation window measured on the proxy, so runs without that " +
+          "telemetry and answers under 1,000 output tokens are left out; `out/run` is the average answer length behind " +
+          "the rate. A `*` marks a provider whose hidden reasoning is streamed but reported as zero, making its rate an underestimate."
       );
     } else {
       lines.push("No runs recorded yet, so there is nothing to compare.");
@@ -199,14 +201,56 @@ function renderRunHeader(title, { job, settings, execution }) {
     settings.git ? `- Commits as: ${settings.git.name} <${settings.git.email}>` : null,
     execution?.sessionId ? `- pi session: \`${execution.sessionId}\` (resume with \`pi --session ${execution.sessionId}\`)` : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,
+    // Printed whether or not it was reached: a run that stopped early is easier
+    // to read when the ceiling it was given is on the same page.
+    describeBudget(settings.budget) ? `- Budget: ${describeBudget(settings.budget)}` : null,
     execution?.elapsed ? `- Duration: ${execution.elapsed}` : null
   ].filter(Boolean);
 
   return [`# ${title}`, "", ...meta, ""];
 }
 
+/**
+ * What the run did to the tree, as opposed to what it said about it.
+ *
+ * Kept to names and counts: the patch itself is what `result --diff` is for,
+ * and pasting it here would bury the answer under it.
+ */
+export function renderChangesSection(changes) {
+  if (!changes || (!changes.commits?.length && !changes.files?.length)) {
+    return [];
+  }
+  const lines = ["## Changes", ""];
+
+  if (changes.stat) {
+    lines.push(`- ${changes.stat}`);
+  }
+  for (const commit of changes.commits ?? []) {
+    lines.push(`- commit ${commit}`);
+  }
+  const files = changes.files ?? [];
+  const shown = files.slice(0, 20);
+  for (const file of shown) {
+    lines.push(`  - ${file}`);
+  }
+  if (files.length > shown.length) {
+    lines.push(`  - … and ${files.length - shown.length} more`);
+  }
+  if (changes.preexisting?.length) {
+    // Said out loud so nobody reads someone else's work-in-progress as the
+    // agent's: these files were already modified when the run started.
+    lines.push(`- Already modified before the run (not the agent's): ${changes.preexisting.join(", ")}`);
+  }
+  if (changes.diffCommand) {
+    lines.push(`- Read the patch: \`${changes.diffCommand}\` — or \`result --diff\``);
+  }
+  lines.push("");
+  return lines;
+}
+
 export function renderRunResult({ title, job, settings, execution }) {
   const lines = renderRunHeader(title, { job, settings, execution });
+  lines.push(...renderChangesSection(execution.changes));
 
   // Setup problems that did not stop the run — a model the catalogue does not
   // know, an extension the sandbox cannot see — belong in the report, not only
@@ -270,11 +314,47 @@ function jobLine(job) {
   return `- ${parts.join(" · ")}`;
 }
 
+/**
+ * What `wait` prints once it stops waiting.
+ *
+ * The point of the command is to be the last thing between starting a run and
+ * reading it, so the report says where each job landed and how to read it —
+ * not the whole transcript, which `result` already prints.
+ */
+export function renderWaitReport(jobs, { timedOut = false, waitSeconds = null } = {}) {
+  const lines = [timedOut ? `# pi wait — still running after ${waitSeconds}s` : "# pi wait — done", ""];
+
+  for (const job of jobs) {
+    lines.push(jobLine(job));
+    if (job.title) {
+      lines.push(`  - Task: ${job.title}`);
+    }
+    if (job.summary) {
+      lines.push(`  - ${job.summary}`);
+    }
+    if (job.errorMessage) {
+      lines.push(`  - Error: ${job.errorMessage}`);
+    }
+  }
+
+  lines.push("");
+  lines.push(
+    timedOut
+      ? "Still going. Wait again with a longer `--for`, follow it with `watch --follow`, or stop it with `cancel`."
+      : `Read the full answer with \`result${jobs.length > 1 ? " <job-id>" : ""}\`.`
+  );
+  return joinLines(lines);
+}
+
 export function renderStatusReport(snapshot) {
-  const lines = ["# pi jobs", ""];
+  const lines = [snapshot.global ? "# pi jobs — every workspace" : "# pi jobs", ""];
 
   if (!snapshot.jobs.length) {
-    lines.push("No pi jobs recorded for this workspace yet.");
+    lines.push(
+      snapshot.global
+        ? "No pi jobs match on this machine."
+        : "No pi jobs recorded for this workspace yet."
+    );
     return joinLines(lines);
   }
 
@@ -282,6 +362,11 @@ export function renderStatusReport(snapshot) {
     lines.push(jobLine(job));
     if (job.title) {
       lines.push(`  - Task: ${job.title}`);
+    }
+    // Which repository a job belongs to is the whole point of the fleet view,
+    // and it is the one thing the per-workspace listing never has to say.
+    if (snapshot.global && job.workspaceRoot) {
+      lines.push(`  - Workspace: ${job.workspaceRoot}`);
     }
     if (job.runRoot && job.runRoot !== job.workspaceRoot) {
       lines.push(`  - Working directory: ${job.runRoot}`);
@@ -349,6 +434,11 @@ export function renderStoredJobResult(job, stored) {
       lines.push(`- ${error}`);
     }
     lines.push("");
+  }
+  // `rendered` below already carries a Changes section for runs recorded after
+  // this existed; this is the one a background job reads back on its own.
+  if (!stored?.rendered && stored?.changes) {
+    lines.push(...renderChangesSection(stored.changes));
   }
 
   lines.push("---", "");
@@ -419,6 +509,104 @@ export function renderCancelReport(job, cancelled) {
       : `Nothing to cancel: the job is ${job.status}.`,
     job.sessionId ? `\npi session \`${job.sessionId}\` is preserved; resume it with \`pi --session ${job.sessionId}\`.` : null
   ]);
+}
+
+function shortId(id) {
+  return String(id ?? "").slice(-8);
+}
+
+/** One line of the `runs` table: what it was, what it cost, how it ended. */
+function runRow(run) {
+  const created = String(run.created_at ?? "").replace("T", " ").slice(0, 16);
+  const tokens = Number(run.input ?? 0) + Number(run.output ?? 0) + Number(run.cache_read ?? 0);
+  return (
+    `| \`${run.id}\` | ${created} | ${run.status ?? "?"} | ${run.model ?? "—"} | ${run.preset ?? "—"} | ` +
+    `${formatTokens(tokens)} | ${formatCost(run.cost) ?? "—"} | ${formatSeconds(run.duration_seconds)} | ` +
+    `${String(run.title ?? "").replace(/\|/g, "\\|").slice(0, 60)} |`
+  );
+}
+
+export function renderRunsReport(runs, { workspace = null } = {}) {
+  if (!runs.length) {
+    return joinLines([
+      "# pi runs",
+      "",
+      workspace
+        ? `Nothing recorded for \`${workspace}\` yet. Use \`--all\` to look across every workspace.`
+        : "The journal is empty."
+    ]);
+  }
+
+  return joinLines([
+    workspace ? `# pi runs — \`${workspace}\`` : "# pi runs — every workspace",
+    "",
+    "| id | when | status | model | preset | tokens | cost | time | task |",
+    "|---|---|---|---|---|---|---|---|---|",
+    ...runs.map(runRow),
+    "",
+    `Repeat one with \`rerun ${shortId(runs[0].id)}\`, or on another model with \`rerun ${shortId(runs[0].id)} --model <id>\`.`,
+    "Read what one was given and answered with `runs <id>`."
+  ]);
+}
+
+/** One recorded run in full: the task it was given and what it answered. */
+export function renderRunDetail(run) {
+  const lines = [`# pi run — \`${run.id}\``, ""];
+  const meta = [
+    `- Status: ${run.status ?? "unknown"}`,
+    run.created_at ? `- Started: ${String(run.created_at).replace("T", " ").slice(0, 19)}` : null,
+    run.model ? `- Model: \`${run.model}\`` : null,
+    run.preset ? `- Preset: \`${run.preset}\`` : null,
+    run.workspace ? `- Workspace: ${run.workspace}` : null,
+    run.sandbox ? `- Sandbox: ${run.sandbox}` : null,
+    `- Usage: ${formatTokens(Number(run.input ?? 0) + Number(run.output ?? 0) + Number(run.cache_read ?? 0))} tokens${
+      formatCost(run.cost) ? ` · ${formatCost(run.cost)}` : ""
+    }${run.duration_seconds ? ` · ${formatSeconds(run.duration_seconds)}` : ""}`
+  ].filter(Boolean);
+  lines.push(...meta, "");
+
+  // Only the proxy sees these: pi retries HTTP failures internally, so a run
+  // that hit three 429s and one dropped stream looked merely slow before.
+  if (Number(run.req_count ?? 0) > 0) {
+    const rate =
+      Number(run.gen_ms ?? 0) > 0 && Number(run.gen_out_tokens ?? 0) > 0
+        ? `${(Number(run.gen_out_tokens) / (Number(run.gen_ms) / 1000)).toFixed(1)} tok/s while generating`
+        : null;
+    lines.push(
+      "## Requests",
+      "",
+      `- ${run.req_count} request${Number(run.req_count) === 1 ? "" : "s"} to the model, ${run.req_failed ?? 0} failed`,
+      Number(run.ttft_p50_ms ?? 0) > 0 ? `- Time to first token, median: ${run.ttft_p50_ms} ms` : null,
+      rate ? `- ${rate}` : null,
+      Number(run.slot_wait_ms ?? 0) > 0 ? `- Queued for a sandbox slot: ${formatSeconds(Math.round(Number(run.slot_wait_ms) / 1000))}` : null,
+      ""
+    );
+  }
+
+  if (run.settings) {
+    lines.push("## Settings", "", "```json", String(run.settings), "```", "");
+  }
+  // Absent means the retention window has passed, not that the run had no task.
+  lines.push("## Task", "", run.prompt ? String(run.prompt) : "_Not stored, or past the retention window._", "");
+  lines.push("## Answer", "", run.result_text ? String(run.result_text) : "_Not stored, or past the retention window._");
+  return joinLines(lines);
+}
+
+/** What `cancel --all` printed for, one line per job it went after. */
+export function renderCancelAllReport(results, { global: everywhere = false } = {}) {
+  const lines = [`# pi cancel — ${everywhere ? "every workspace" : "this workspace"}`, ""];
+  for (const { job, cancelled } of results) {
+    const where = everywhere && job.workspaceRoot ? ` · ${job.workspaceRoot}` : "";
+    lines.push(`- ${cancelled ? "🚫" : "⚠️"} \`${job.id}\` (was ${job.status})${where}`);
+  }
+  const stuck = results.filter(({ cancelled }) => !cancelled);
+  lines.push("");
+  lines.push(
+    stuck.length
+      ? `${results.length - stuck.length} of ${results.length} stopped. The rest left no process to signal and no container to remove; they are recorded as cancelled.`
+      : `Stopped ${results.length} job${results.length === 1 ? "" : "s"}.`
+  );
+  return joinLines(lines);
 }
 
 export { formatUsage, formatCost };
@@ -525,22 +713,26 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
   );
 
   lines.push(
-    `| ${by} | runs | ok | degr | in | out | ctx avg | ctx max | tok/s | p50 | p90 | tools | err | cost |`,
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    `| ${by} | runs | ok | degr | in | out | ctx avg | ctx max | tok/s | out/run | p50 | p90 | tools | err | cost |`,
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
   );
   for (const row of rows) {
     lines.push(
       `| ${row.bucket} | ${row.runs} | ${formatShare(row.completed, row.runs)} | ${row.degraded ?? 0} | ${formatTokens(row.input)} | ` +
         `${formatTokens(row.output)} | ${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
-        `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatSeconds(row.p50Seconds)} | ` +
+        `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatCompact(row.outputPerRun)} | ${formatSeconds(row.p50Seconds)} | ` +
         `${formatSeconds(row.p90Seconds)} | ${row.tool_calls ?? 0} | ${row.tool_errors ?? 0} | ${formatCost(row.cost) ?? "—"} |`
     );
   }
 
   lines.push(
     "",
-    "`tok/s` is generated tokens over model time — the run minus the time its tools held it; runs recorded before " +
-      "timings existed count as zero and are left out of it. `p50`/`p90` are run durations, tools included. " +
+    "`tok/s` is generated tokens over the generation window measured on the credential proxy: first content frame to " +
+      "last chunk, which is the only span carrying neither prefill nor the provider's queue. Runs without that " +
+      "telemetry — recorded before it existed, or run without a sandbox — are left out rather than folded in on a " +
+      "different measurement, and so are answers under 1,000 output tokens, whose first frame was generated before the " +
+      "window opened. `out/run` is the average answer length behind the rate: two buckets whose lengths differ several " +
+      "times over are not comparable, whatever the denominator says. `p50`/`p90` are run durations, tools included. " +
       "`degr` counts runs that finished with an answer but a non-zero exit — a truncated stream, a dropped connection. " +
       "They are inside `ok`, since the work landed, and worth watching separately when a provider starts misbehaving.",
     "",

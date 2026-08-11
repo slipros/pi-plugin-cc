@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
+import { forJournal } from "./redact.mjs";
+
 /**
  * Durable journal of pi runs.
  *
@@ -50,8 +52,55 @@ CREATE TABLE IF NOT EXISTS jobs (
   degraded         INTEGER DEFAULT 0,
   session_id       TEXT,
   background       INTEGER DEFAULT 0,
-  updated_at       TEXT
+  updated_at       TEXT,
+  prompt           TEXT,
+  result_text      TEXT,
+  settings         TEXT
 );
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+-- One row per request the run made to the model, recorded on the credential
+-- proxy — the only place on the host that sees the exchange whole. The relation
+-- to a run is honestly 1:N, and rolling it up on write would throw away the
+-- distribution, which is the entire point: one degraded request out of forty,
+-- the p90 of time-to-first-token, the longest silence inside a stream.
+--
+-- No foreign key on purpose: SQLite leaves them off by default, so it would be
+-- a formality. Rows with no job id are not written at all instead.
+CREATE TABLE IF NOT EXISTS requests (
+  id               INTEGER PRIMARY KEY,
+  job_id           TEXT    NOT NULL,
+  seq              INTEGER NOT NULL,
+  started_at       TEXT    NOT NULL,
+  provider         TEXT,
+  model            TEXT,
+  api              TEXT,
+  path             TEXT,
+  stream           INTEGER DEFAULT 0,
+  status           INTEGER,
+  error_kind       TEXT,
+  ttfb_ms          INTEGER,
+  ttft_ms          INTEGER,
+  stream_ms        INTEGER,
+  total_ms         INTEGER,
+  max_gap_ms       INTEGER,
+  chunks           INTEGER,
+  request_bytes    INTEGER,
+  response_bytes   INTEGER,
+  in_tokens        INTEGER,
+  out_tokens       INTEGER,
+  reasoning_tokens INTEGER,
+  cached_tokens    INTEGER,
+  finish_reason    TEXT,
+  retry_after_ms   INTEGER,
+  rl_remaining     INTEGER,
+  usage_json       TEXT
+);
+CREATE INDEX IF NOT EXISTS requests_job     ON requests(job_id);
+CREATE INDEX IF NOT EXISTS requests_started ON requests(started_at);
+CREATE INDEX IF NOT EXISTS requests_model   ON requests(model, started_at);
 CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs(created_at);
 CREATE INDEX IF NOT EXISTS jobs_model      ON jobs(model);
 CREATE INDEX IF NOT EXISTS jobs_workspace  ON jobs(workspace);
@@ -93,10 +142,38 @@ function withoutSqliteWarning(fn) {
  * @returns {{db: object, close: () => void} | null} null when SQLite is
  *   unavailable — recording is a bonus, never a reason for a run to fail.
  */
+/**
+ * The journal holds prompts and answers — the contents of whatever repositories
+ * this machine has delegated work on. `~/.local/share` is world-readable by
+ * default, and so was the database in it; on a shared machine that handed every
+ * task and every answer to anyone who could read the home directory.
+ *
+ * WAL means two more files (`-wal`, `-shm`) with the same contents, so the
+ * directory is tightened rather than the file alone, and the file is chmod'ed
+ * on every open to fix journals created by older versions.
+ */
+const JOURNAL_DIR_MODE = 0o700;
+const JOURNAL_FILE_MODE = 0o600;
+
+function tighten(file) {
+  try {
+    fs.chmodSync(path.dirname(file), JOURNAL_DIR_MODE);
+  } catch {
+    // Not ours to tighten; the run goes on.
+  }
+  for (const candidate of [file, `${file}-wal`, `${file}-shm`]) {
+    try {
+      fs.chmodSync(candidate, JOURNAL_FILE_MODE);
+    } catch {
+      // Missing (WAL files appear on first write) or not ours.
+    }
+  }
+}
+
 export function openDatabase(file = databasePath()) {
   try {
     if (file !== ":memory:") {
-      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: JOURNAL_DIR_MODE });
     }
     return withoutSqliteWarning(() => {
       const db = new (loadSqlite().DatabaseSync)(file);
@@ -108,6 +185,9 @@ export function openDatabase(file = databasePath()) {
       db.exec("PRAGMA busy_timeout = 5000");
       db.exec(SCHEMA);
       addMissingColumns(db);
+      if (file !== ":memory:") {
+        tighten(file);
+      }
       return { db, close: () => db.close() };
     });
   } catch {
@@ -131,7 +211,24 @@ function addMissingColumns(db) {
     ["span_ms", "INTEGER DEFAULT 0"],
     ["peak_context", "INTEGER DEFAULT 0"],
     ["thinking_chars", "INTEGER DEFAULT 0"],
-    ["degraded", "INTEGER DEFAULT 0"]
+    ["degraded", "INTEGER DEFAULT 0"],
+    // What a run actually was, so it can be repeated or compared: the task it
+    // was given, what it answered, and the settings it ran under.
+    ["prompt", "TEXT"],
+    ["result_text", "TEXT"],
+    ["settings", "TEXT"],
+    // Rolled up from `requests` when the run ends, so the reports keep reading
+    // one table instead of joining per row.
+    ["req_count", "INTEGER DEFAULT 0"],
+    ["req_failed", "INTEGER DEFAULT 0"],
+    ["ttft_p50_ms", "INTEGER DEFAULT 0"],
+    // Generation windows only: the denominator `model_ms` never was, since it
+    // carries prefill and the provider's queue with it.
+    ["gen_ms", "INTEGER DEFAULT 0"],
+    ["gen_out_tokens", "INTEGER DEFAULT 0"],
+    // Time this run spent queued for a slot of its own pool — already measured
+    // by `awaitSandboxSlot` and thrown away until now.
+    ["slot_wait_ms", "INTEGER DEFAULT 0"]
   ];
   for (const [name, definition] of additions) {
     if (!present.has(name)) {
@@ -188,8 +285,30 @@ const COLUMNS = [
   "degraded",
   "session_id",
   "background",
-  "updated_at"
+  "updated_at",
+  "prompt",
+  "result_text",
+  "settings",
+  "req_count",
+  "req_failed",
+  "ttft_p50_ms",
+  "gen_ms",
+  "gen_out_tokens",
+  "slot_wait_ms"
 ];
+
+/** Ceiling on any single stored text field. */
+const MAX_TEXT_CHARS = 32 * 1024;
+
+/**
+ * How long the journal keeps the text of a run.
+ *
+ * Counters are history and stay forever — they are what the statistics are
+ * built from. Prompts and answers are repository content, so they expire: long
+ * enough to repeat or compare a run one still remembers, short enough that the
+ * file is not an archive of everything this machine has ever been asked.
+ */
+export const DEFAULT_TEXT_TTL_DAYS = 90;
 
 function seconds(from, to) {
   const start = Date.parse(from ?? "");
@@ -235,7 +354,18 @@ export function jobToRow(job) {
     degraded: job.degraded ? 1 : 0,
     session_id: job.sessionId ?? null,
     background: job.background ? 1 : 0,
-    updated_at: new Date().toISOString()
+    updated_at: new Date().toISOString(),
+    // Redacted and capped: this is repository content on its way to a file that
+    // outlives the run, the temp directory and the reboot.
+    prompt: forJournal(job.prompt ?? null, MAX_TEXT_CHARS),
+    result_text: forJournal(job.text ?? null, MAX_TEXT_CHARS),
+    settings: job.rerunSettings ? forJournal(JSON.stringify(job.rerunSettings), MAX_TEXT_CHARS) : null,
+    req_count: job.proxyStats?.count ?? 0,
+    req_failed: job.proxyStats?.failed ?? 0,
+    ttft_p50_ms: job.proxyStats?.ttftP50Ms ?? 0,
+    gen_ms: job.proxyStats?.genMs ?? 0,
+    gen_out_tokens: job.proxyStats?.genOutTokens ?? 0,
+    slot_wait_ms: job.slotWaitMs ?? 0
   };
 }
 
@@ -251,7 +381,7 @@ export function recordJob(handle, job) {
   const placeholders = COLUMNS.map((column) => `$${column}`).join(", ");
   const updates = COLUMNS.filter((column) => column !== "id")
     .map((column) =>
-      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms", "peak_context", "thinking_chars"].includes(
+      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms", "peak_context", "thinking_chars", "req_count", "req_failed", "ttft_p50_ms", "gen_ms", "gen_out_tokens", "slot_wait_ms"].includes(
         column
       )
         ? `${column} = MAX(${column}, excluded.${column})`
@@ -279,7 +409,11 @@ export function recordJobSafely(job) {
     return false;
   }
   try {
-    return recordJob(handle, job);
+    const recorded = recordJob(handle, job);
+    // Retention rides along with the writes rather than waiting for someone to
+    // run `runs --prune`; at most one sweep a day, and never fatal.
+    pruneJournalTextIfDue(handle);
+    return recorded;
   } finally {
     handle.close();
   }
@@ -337,19 +471,23 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               SUM(duration_seconds) AS seconds,
               SUM(model_ms)       AS model_ms,
               SUM(tool_ms)        AS tool_ms,
-              -- Tokens from the same rows the model time came from: mixing the
-              -- output of untimed runs into a rate measured on timed ones
-              -- inflates it without limit. A run that spent model time and
-              -- produced nothing is excluded from both sides for the same
-              -- reason — one 300s timeout would otherwise halve a bucket.
+              -- The rate is measured on generation windows from the proxy: first
+              -- content frame to last chunk, summed over the run's requests. That
+              -- is the only span with neither prefill nor the provider's queue in
+              -- it, both of which model_ms carries and which made the old rate
+              -- understate generation by about half.
+              --
+              -- Short answers are excluded, because the tokens delivered in the
+              -- first frame were generated *before* the window opened: the
+              -- shorter the answer, the more that inflates the result. Below the
+              -- threshold the honest answer is no number at all.
               --
               -- reasoning is not added to output: providers report it as a
-              -- subset of output, so summing them counted hidden reasoning
-              -- twice and inflated the rate by up to 59% for the providers
-              -- that report it at all.
-              SUM(CASE WHEN model_ms > 0 AND output > 0 THEN output ELSE 0 END) AS timed_output,
-              SUM(CASE WHEN model_ms > 0 AND output > 0 THEN model_ms ELSE 0 END) AS timed_model_ms,
-              SUM(model_ms > 0 AND output > 0) AS timed_runs,
+              -- subset of output, so summing them counted hidden reasoning twice
+              -- and inflated the rate by up to 59% where it is reported at all.
+              SUM(CASE WHEN gen_ms > 0 AND gen_out_tokens >= 1000 THEN gen_out_tokens ELSE 0 END) AS gen_output,
+              SUM(CASE WHEN gen_ms > 0 AND gen_out_tokens >= 1000 THEN gen_ms ELSE 0 END) AS gen_time_ms,
+              SUM(gen_ms > 0 AND gen_out_tokens >= 1000) AS gen_runs,
               SUM(turns)          AS turns,
               -- Denominator for per-run averages: runs recorded before the
               -- counters existed carry zeroes, and dividing by COUNT(*) halved
@@ -393,10 +531,15 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
     const sorted = durations.get(row.bucket) ?? [];
     return {
       ...row,
-      // Generated tokens over the time actually spent waiting on the model,
-      // which is the run minus its tools. Runs recorded before timings existed
-      // carry a zero and simply do not contribute.
-      tokensPerSecond: row.timed_model_ms > 0 ? row.timed_output / (row.timed_model_ms / 1000) : null,
+      // Generated tokens over the generation window itself. Runs without proxy
+      // telemetry — every run recorded before it existed, and every unsandboxed
+      // one — contribute nothing rather than being folded in on a different
+      // measurement: two definitions of speed in one column is worse than a gap.
+      tokensPerSecond: row.gen_time_ms > 0 ? row.gen_output / (row.gen_time_ms / 1000) : null,
+      // Kept alongside so a bucket can be told apart from one it should not be
+      // compared with: rates over answers of very different lengths are not
+      // comparable, whatever the denominator.
+      outputPerRun: row.gen_runs > 0 ? Math.round(row.gen_output / row.gen_runs) : null,
       p50Seconds: percentile(sorted, 0.5),
       p90Seconds: percentile(sorted, 0.9)
     };
@@ -424,4 +567,136 @@ export function queryTotals(handle, { days = 30 } = {}) {
       )
       .get() ?? {}
   );
+}
+
+/**
+ * The most recent runs, with what they were asked and what they answered.
+ *
+ * The per-workspace job records answer "what is happening here, now"; this
+ * answers "what have I run, anywhere, and what did it cost" — the list `rerun`
+ * picks from.
+ */
+export function queryRuns(handle, { limit = 20, days = null, workspace = null, model = null, preset = null, kind = null } = {}) {
+  const conditions = [];
+  const params = {};
+  if (days) {
+    conditions.push(`created_at >= datetime('now', $window)`);
+    params.window = `-${Math.max(1, Math.floor(days))} days`;
+  }
+  for (const [column, value] of [["workspace", workspace], ["preset", preset], ["kind", kind]]) {
+    if (value) {
+      conditions.push(`${column} = $${column}`);
+      params[column] = value;
+    }
+  }
+  if (model) {
+    conditions.push("model LIKE $model");
+    params.model = `%${model}%`;
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  return handle.db
+    .prepare(
+      `SELECT id, kind, title, workspace, run_root, preset, model, sandbox, status, created_at,
+              duration_seconds, input, output, cache_read, cost, turns,
+              prompt, result_text, settings
+       FROM jobs ${where}
+       ORDER BY created_at DESC
+       LIMIT $limit`
+    )
+    .all({ ...params, limit: Math.max(1, Math.floor(limit)) });
+}
+
+/** One run in full, by id or by the tail of one. */
+export function queryRun(handle, reference) {
+  const needle = String(reference ?? "").trim();
+  if (!needle) {
+    return null;
+  }
+  return (
+    handle.db.prepare("SELECT * FROM jobs WHERE id = $id").get({ id: needle }) ??
+    handle.db
+      .prepare("SELECT * FROM jobs WHERE id LIKE $suffix ORDER BY created_at DESC LIMIT 1")
+      .get({ suffix: `%${needle}` }) ??
+    null
+  );
+}
+
+/**
+ * Drop the stored text of runs older than the retention window.
+ *
+ * Only the text: counters, timings and costs stay, because every statistic is
+ * built from them and a run that has aged out should still count towards "what
+ * does this model cost me". What expires is the repository content — the task,
+ * the answer, and the settings blob that may quote either.
+ *
+ * @returns {number} rows whose text was cleared
+ */
+export function pruneJournalText(handle, { days = DEFAULT_TEXT_TTL_DAYS } = {}) {
+  if (!handle) {
+    return 0;
+  }
+  try {
+    const result = handle.db
+      .prepare(
+        `UPDATE jobs SET prompt = NULL, result_text = NULL, settings = NULL
+         WHERE created_at < datetime('now', $window)
+           AND (prompt IS NOT NULL OR result_text IS NOT NULL OR settings IS NOT NULL)`
+      )
+      .run({ window: `-${Math.max(1, Math.floor(days))} days` });
+    return Number(result.changes ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Delete request rows older than the retention window.
+ *
+ * `jobs` is history and is never dropped; `requests` is roughly a hundred times
+ * the volume, for a question ("how did this one run behave") that stops being
+ * asked within days.
+ */
+export function pruneRequests(handle, { days = DEFAULT_TEXT_TTL_DAYS } = {}) {
+  if (!handle) {
+    return 0;
+  }
+  try {
+    const result = handle.db
+      .prepare("DELETE FROM requests WHERE started_at < datetime('now', $window)")
+      .run({ window: `-${Math.max(1, Math.floor(days))} days` });
+    return Number(result.changes ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+/** How often the automatic prune bothers to look. */
+const PRUNE_INTERVAL_MS = 24 * 3600 * 1000;
+
+/**
+ * Prune on a schedule without a scheduler.
+ *
+ * Retention that only happens when someone remembers to ask for it is not
+ * retention, and there is no daemon here to run it — so the check rides along
+ * with the writes that already happen, at most once a day.
+ */
+export function pruneJournalTextIfDue(handle, { days = DEFAULT_TEXT_TTL_DAYS, now = Date.now() } = {}) {
+  if (!handle) {
+    return 0;
+  }
+  try {
+    const last = Number(handle.db.prepare("SELECT value FROM meta WHERE key = 'text_pruned_at'").get()?.value ?? 0);
+    if (Number.isFinite(last) && now - last < PRUNE_INTERVAL_MS) {
+      return 0;
+    }
+    const cleared = pruneJournalText(handle, { days });
+    // Same sweep, same schedule: per-request rows are the bulk of the file.
+    pruneRequests(handle, { days });
+    handle.db
+      .prepare("INSERT INTO meta (key, value) VALUES ('text_pruned_at', $now) ON CONFLICT(key) DO UPDATE SET value = $now")
+      .run({ now: String(now) });
+    return cleared;
+  } catch {
+    return 0;
+  }
 }

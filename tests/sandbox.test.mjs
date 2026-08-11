@@ -14,6 +14,7 @@ import {
   parseMount,
   resolveLaunch,
   sandboxRunWarnings,
+  sessionDirFor,
   DEFAULT_SANDBOX_IMAGE,
   DEFAULT_SANDBOX_VOLUME
 } from "../plugins/pi/scripts/lib/sandbox.mjs";
@@ -648,4 +649,80 @@ test("a zero slot limit is refused rather than read as unlimited", async () => {
   // "Allow zero containers" can only be a mistake, and silently meaning the
   // opposite is worse than saying so.
   await assert.rejects(() => awaitSandboxSlot(sandbox, { timeoutMs: 0 }), /positive number of containers/);
+});
+
+test("sessions are bucketed per workspace instead of landing in one shared pile", () => {
+  const one = buildDockerRunArgs({
+    sandbox: normalizeSandbox(true),
+    cwd: "/home/me/github/alpha",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  const two = buildDockerRunArgs({
+    sandbox: normalizeSandbox(true),
+    cwd: "/home/me/github/beta",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+
+  const sessionDir = (args) =>
+    args.filter((arg, index) => args[index - 1] === "-e").find((arg) => arg.startsWith("PI_CODING_AGENT_SESSION_DIR="));
+
+  assert.equal(sessionDir(one), `PI_CODING_AGENT_SESSION_DIR=${sessionDirFor("/home/me/github/alpha")}`);
+  assert.notEqual(sessionDir(one), sessionDir(two), "pi buckets by cwd, and every run sees the same /workspace");
+  // Two checkouts of the same name are different workspaces; only the digest
+  // keeps them apart.
+  assert.notEqual(sessionDirFor("/a/repo"), sessionDirFor("/b/repo"));
+});
+
+test("an untrusted workspace gets throwaway caches and its own agent volume", () => {
+  const profiles = { go: { mounts: ["~/go/bin:/gobin:ro", "cache-vol:/home/pi/.cache", "shared-ro:/ro-vol:ro"] } };
+  const args = buildDockerRunArgs({
+    sandbox: { ...normalizeSandbox("go", profiles), isolateCaches: true },
+    cwd: "/tmp/cloned/untrusted",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  const mounted = mounts(args);
+
+  assert.ok(
+    mounted.includes("/home/pi/.cache"),
+    "a writable named volume becomes anonymous, so a poisoned build object dies with the container"
+  );
+  assert.ok(!mounted.includes("cache-vol:/home/pi/.cache"), "the shared cache volume must not be attached");
+  assert.ok(mounted.includes("/home/me/go/bin:/gobin:ro"), "bind mounts are the user's own decision and stay");
+  assert.ok(mounted.includes("shared-ro:/ro-vol:ro"), "a read-only volume carries nothing into the next run");
+  assert.ok(
+    mounted.some((mount) => mount.startsWith(`${DEFAULT_SANDBOX_VOLUME}-untrusted-`) && mount.endsWith(":/pi-agent")),
+    "the agent directory is per workspace too: sessions and the model store are writable state"
+  );
+});
+
+test("a trusted workspace keeps sharing the warm caches", () => {
+  const profiles = { go: { mounts: ["cache-vol:/home/pi/.cache"] } };
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("go", profiles),
+    cwd: "/home/me/github/alpha",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+
+  assert.ok(mounts(args).includes("cache-vol:/home/pi/.cache"));
+  assert.ok(mounts(args).includes(`${DEFAULT_SANDBOX_VOLUME}:/pi-agent`));
+});
+
+test("the project layer cannot hand itself back the shared volumes", async () => {
+  const { sanitizeProjectLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  const warnings = [];
+  const clean = sanitizeProjectLayer(
+    { defaults: { sandbox: { profile: "go", volume: "pi-plugin-agent", isolateCaches: false } } },
+    warnings
+  );
+
+  assert.deepEqual(clean.defaults.sandbox, { profile: "go" });
+  assert.equal(warnings.length, 2, `expected both keys refused, got: ${warnings.join(" | ")}`);
 });

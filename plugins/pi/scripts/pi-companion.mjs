@@ -252,6 +252,8 @@ const RUN_FLAGS = {
     "max-tokens",
     "max-turns",
     "notify",
+    // `rerun <id> --prompt "…"` replaces the recorded task and keeps its settings.
+    "prompt",
     // `review --job <id>` reviews what that run changed.
     "job",
     "base",
@@ -262,7 +264,7 @@ const RUN_FLAGS = {
     "git-name",
     "git-email"
   ],
-  collect: ["append-system-prompt", "extension", "skill", "mount"],
+  collect: ["append-system-prompt", "extension", "skill", "mount", "append"],
   aliases: {
     m: "model",
     p: "provider",
@@ -339,7 +341,7 @@ function usage() {
     "  pi-companion.mjs wait [job-id...] [--all] [--for <seconds>] [--json]",
     "  pi-companion.mjs runs [run-id] [--all] [--limit N] [--days N] [--model <id>]",
     "                        [--preset <name>] [--kind delegate|review] [--prune] [--json]",
-    "  pi-companion.mjs rerun <run-id> [run flags]",
+    "  pi-companion.mjs rerun <run-id> [--append <text>] [--prompt <text>|--stdin] [run flags]",
     "  pi-companion.mjs cancel [job-id] [--all [--global]] [--json]",
     "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
     "  pi-companion.mjs watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]",
@@ -1750,11 +1752,40 @@ async function commandRuns(argv, workspaceRoot) {
  * the same task, the same settings and a different model, which is the only
  * honest way to tell two models apart on work one actually does.
  */
+/**
+ * The task a rerun actually sends.
+ *
+ * Repeating a run verbatim is the rare case; the useful one is "that, but with
+ * one thing changed" — which used to mean copying the text out of the journal
+ * by hand and rebuilding every flag around it. `--prompt`/`--stdin` replace the
+ * task and keep the settings, `--append` adds to it.
+ *
+ * Exported for the tests: the composition is the part worth pinning down, and
+ * the command around it needs a model to exercise.
+ *
+ * @returns {string|null} null when there is no text at all — neither recorded
+ *   nor supplied — which is the one case the caller has to refuse.
+ */
+export function composeRerunPrompt(recorded, { replacement = null, append = [] } = {}) {
+  const base = String(replacement ?? recorded ?? "").trim();
+  const extra = (Array.isArray(append) ? append : [append])
+    .map((entry) => String(entry ?? "").trim())
+    .filter(Boolean);
+  if (!base && !extra.length) {
+    return null;
+  }
+  // Blank line between the parts: the addition is a separate instruction, not
+  // a continuation of the last sentence of the original task.
+  return [base, ...extra].filter(Boolean).join("\n\n");
+}
+
 async function commandRerun(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
   const reference = positional.join(" ").trim();
   if (!reference) {
-    throw new Error("Which run? Usage: rerun <job-id> [--model <id>] [--preset <name>] [--background].");
+    throw new Error(
+      "Which run? Usage: rerun <job-id> [--append <text>] [--prompt <text>|--stdin] [--model <id>] [--preset <name>] [--background]."
+    );
   }
 
   const handle = openDatabase();
@@ -1772,10 +1803,17 @@ async function commandRerun(argv, workspaceRoot) {
     }
   })();
 
-  const prompt = local?.prompt ?? stored?.prompt ?? null;
+  // The job file wins over the journal: the journal's copy is redacted and
+  // capped, which is right for storage and wrong as the text to send again.
+  const recorded = local?.prompt ?? stored?.prompt ?? null;
+  const prompt = composeRerunPrompt(recorded, {
+    replacement: flags.prompt ?? (flags.stdin ? readStdin().trim() : null),
+    append: flags.append ?? []
+  });
   if (!prompt) {
     throw new Error(
-      `Run "${reference}" has no stored task text — it predates prompt journalling, or its text has passed the ${DEFAULT_TEXT_TTL_DAYS}-day retention.`
+      `Run "${reference}" has no stored task text — it predates prompt journalling, or its text has passed the ${DEFAULT_TEXT_TTL_DAYS}-day retention. ` +
+        "Pass --prompt (or --stdin) to supply the task and keep the run's settings."
     );
   }
 

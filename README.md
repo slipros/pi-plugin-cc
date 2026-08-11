@@ -550,9 +550,15 @@ pi-companion.mjs runs --all --days 7         # every workspace
 pi-companion.mjs runs <id>                   # what it was asked, what it answered
 pi-companion.mjs rerun <id>                  # again, same settings
 pi-companion.mjs rerun <id> --model other/m  # same task, different model
+pi-companion.mjs rerun <id> --append "and leave the migrations alone"
+pi-companion.mjs rerun <id> --prompt "the task, rewritten"
+pi-companion.mjs runs <id> --json | jq -r .prompt > task.md   # edit it yourself…
+pi-companion.mjs rerun <id> --stdin < task.md                 # …and send it back
 ```
 
 `rerun` keeps what you chose — preset, model, thinking level, sandbox, ceilings — and resolves everything else fresh from the config as it is now, so it repeats the run rather than a stale copy of your setup. Flags override the recipe, which is the point: the same task on two models is the only honest way to compare them on work you actually do.
+
+The task is editable as well, since "that, but with one thing changed" is the common case: `--append` adds an instruction, `--prompt`/`--stdin` replaces the text and keeps everything else. Getting the text out to edit it by hand works too — `runs <id> --json` carries the journal's copy (redacted, capped at 32 KB), and `result <job> --json` the original in full while the job file survives. A replacement also revives a run whose stored text has aged out: the settings outlive the prompt.
 
 **This is repository content on disk, so it is bounded.** Text is redacted for the shapes secrets announce themselves in (provider keys, bearer tokens, JWTs, `password=` assignments, credentials in URLs), capped at 32 KB a field, and expires after 90 days — `runs --prune [--days N]` sweeps on demand, and a sweep happens by itself at most once a day. Only the text expires: counters, timings and costs are kept forever, so statistics still cover the whole history. A random password with no recognisable shape is not caught by the redaction, and the journal file and its directory are 0600/0700 rather than the world-readable default.
 

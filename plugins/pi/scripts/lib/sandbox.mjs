@@ -317,6 +317,14 @@ export function buildDockerRunArgs({
   const agent = resolveAgentMount(sandbox, homeDir);
   args.push("-v", `${agent.source}:${AGENT_DIR}`);
   if (agent.isolated) {
+    // pi resolves `fd` and `rg` from its own tools directory before PATH, and
+    // that directory is in a volume every run shares. Left writable, one run can
+    // replace the binary and the next run executes it — over whatever repository
+    // that run happens to touch. An empty read-only mount here makes the lookup
+    // fall through to the copies baked into the image.
+    args.push("-v", `${ensureEmptyDir(path.join(os.tmpdir(), "pi-companion", "no-tools"))}:${AGENT_DIR}/bin:ro`);
+  }
+  if (agent.isolated) {
     // Nested mounts: docker applies the longer target path after the volume, so
     // these land inside the otherwise container-local agent directory.
     //
@@ -352,6 +360,12 @@ export function buildDockerRunArgs({
   args.push(sandbox.image || DEFAULT_SANDBOX_IMAGE);
   args.push(...piArgs);
   return args;
+}
+
+/** An empty directory that exists, for mounting over something that must not be written. */
+function ensureEmptyDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+  return dir;
 }
 
 /** Per-run configuration handed to the container, kept out of the host's own. */

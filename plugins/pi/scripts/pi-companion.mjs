@@ -47,6 +47,7 @@ import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
   attachMounts,
   buildSandboxImage,
+  containerNameForJob,
   describeSandbox,
   describeSlotUsage,
   isSandboxed,
@@ -83,7 +84,7 @@ import {
   renderStoredJobResult
 } from "./lib/render.mjs";
 import { resolveRunRoot, resolveWorkspaceRoot } from "./lib/workspace.mjs";
-import { databasePath, openDatabase, queryStats, queryTotals } from "./lib/db.mjs";
+import { databasePath, openDatabase, queryStats, queryTotals, recordJobSafely } from "./lib/db.mjs";
 
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -1120,10 +1121,16 @@ async function commandCancel(argv, workspaceRoot) {
   const job = resolveCancelableJob(workspaceRoot, positional[0] ?? null);
 
   let cancelled = false;
-  if (job.status === "running" && job.pid) {
+  // `pending` is a job whose detached child has not reached runTrackedJob yet,
+  // and `orphaned` one whose wrapper died with the container still up. Both
+  // used to fall through this block untouched while the command reported
+  // success — a pending run kept going after "cancelled", and an orphaned one
+  // held its container, and with it a slot of the concurrency pool, forever.
+  const stoppable = job.status === "running" || job.status === "pending" || job.status === "orphaned";
+  if (stoppable) {
     // Ask pi to stop through the control channel first: an abort keeps the
     // session intact and lets the run record its partial work.
-    if (job.engine !== "json") {
+    if (job.engine !== "json" && job.status === "running") {
       pushControlMessage(workspaceRoot, job.id, { kind: "abort" });
       appendLogLine(job.logFile, "Abort requested from Claude Code.");
       for (let waited = 0; waited < 4000; waited += 250) {
@@ -1139,19 +1146,27 @@ async function commandCancel(argv, workspaceRoot) {
     if (!cancelled) {
       // pi runs in its own process group; the companion wrapper does not.
       const piStopped = job.piPid ? await terminateProcessTree(job.piPid, { group: true }) : false;
-      const wrapperStopped = await terminateProcessTree(job.pid, { group: false });
+      const wrapperStopped = job.pid ? await terminateProcessTree(job.pid, { group: false }) : false;
       cancelled = piStopped || wrapperStopped;
     }
 
     // Signals reach the `docker run` client, never the container behind it, so
-    // a sandboxed job is only really stopped once the container is gone.
-    if (job.containerName) {
-      const removed = removeSandboxContainer(job.containerName);
+    // a sandboxed job is only really stopped once the container is gone. This
+    // is the only thing that helps an orphaned job, whose wrapper is already
+    // dead, and a pending one, whose container may have started before the
+    // record caught up.
+    const containerName = job.containerName ?? containerNameForJob(job.id, job.sandboxProfile ?? null);
+    if (containerName) {
+      const removed = removeSandboxContainer(containerName);
       cancelled = cancelled || removed;
     }
 
     const record = { id: job.id, status: "cancelled", phase: "cancelled", pid: null, completedAt: nowIso() };
     upsertJob(workspaceRoot, record);
+    // The journal only ever heard about a job from runTrackedJob, so a cancelled
+    // or orphaned run stayed `running` there for good: it counted against the
+    // success rate of every report and could never be corrected.
+    recordJobSafely({ ...job, ...(readStoredJob(workspaceRoot, job.id) ?? {}), ...record });
     // Keep whatever the run already stored (partial output, session id) and
     // only overlay the cancellation.
     writeJobFile(workspaceRoot, job.id, {
@@ -1162,7 +1177,7 @@ async function commandCancel(argv, workspaceRoot) {
   }
 
   output(renderCancelReport(job, cancelled), { job, cancelled }, Boolean(flags.json));
-  return cancelled || job.status !== "running" ? 0 : 1;
+  return cancelled || !stoppable ? 0 : 1;
 }
 
 const COMMANDS = {

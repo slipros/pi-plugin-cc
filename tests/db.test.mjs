@@ -129,11 +129,12 @@ test("the models report only queries the journal when stats are asked for", asyn
         p50Seconds: 12,
         p90Seconds: 300,
         turns: 8,
+        counted_runs: 4,
         tool_calls: 10,
         tool_errors: 1,
         cost: 0
       }
     ]
   });
-  assert.match(report, /\| `m1` \| 4 \| 75% \| 812K \| 1\.0M \| 40\.4 \| 12s \| 5m \| 2\.0 \| 10% \|/);
+  assert.match(report, /\| `m1` \| 4 \| 75% \| 812K \| 1\.0M \| 40\.4 \| 12s \| 5\.0m \| 2\.0 \| 10% \|/);
 });

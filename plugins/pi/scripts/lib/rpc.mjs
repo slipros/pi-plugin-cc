@@ -132,9 +132,26 @@ export async function runPiRpcTurn({
     stderr += chunk;
   });
 
-  const closed = new Promise((resolve, reject) => {
-    child.on("error", reject);
+  // A spawn failure is a normal outcome here, not an exception to propagate: it
+  // resolves like any other bad exit so the job gets a terminal record. Left as
+  // a rejection it became an unhandled one — the waiter below only attaches a
+  // fulfilment handler — and the process died with the job stuck at "running".
+  let spawnError = null;
+  const closed = new Promise((resolve) => {
+    child.on("error", (error) => {
+      spawnError = error;
+      resolve(1);
+    });
     child.on("close", (code, signal) => resolve(code == null ? (signal ? 1 : 0) : code));
+  });
+
+  // Writing the prompt can fail after the fact if pi exits first (EPIPE on a
+  // 200KB review diff, for instance). Without a handler that is an unhandled
+  // 'error' event on the socket, which takes the whole process down.
+  child.stdin.on("error", (error) => {
+    if (!closing) {
+      state.errors.push(`Could not write to pi: ${error.message}`);
+    }
   });
 
   send({ type: "get_state", id: "state-1" });
@@ -197,6 +214,13 @@ export async function runPiRpcTurn({
   // grace window; an abort short-circuits the wait.
   await new Promise((resolve) => {
     const poll = setInterval(() => {
+      // A process that never started has nothing to settle: waiting for the
+      // grace window would burn the whole timeout before reporting the failure.
+      if (spawnError) {
+        clearInterval(poll);
+        resolve();
+        return;
+      }
       inbox?.drain();
       const quietFor = Date.now() - Math.max(settledAt ?? 0, lastControlAt);
       if (settledAt !== null && (aborted || quietFor >= settleGraceMs)) {
@@ -241,6 +265,9 @@ export async function runPiRpcTurn({
 
   const text = state.assistantTexts.at(-1) ?? "";
   const errors = [...state.errors];
+  if (spawnError) {
+    errors.push(`Could not start ${launch.command}: ${spawnError.message}`);
+  }
   if (timedOut) {
     errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
   }

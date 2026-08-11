@@ -84,30 +84,28 @@ function summarizeToolCall(toolName, args) {
   return `${name}: ${text.length > 96 ? `${text.slice(0, 93)}...` : text}`;
 }
 
-/** Tokens the model actually generated: visible output plus hidden reasoning. */
-function producedTokens(usage) {
-  if (!usage || typeof usage !== "object") {
-    return 0;
-  }
-  return (typeof usage.output === "number" ? usage.output : 0) +
-    (typeof usage.reasoning === "number" ? usage.reasoning : 0);
-}
-
 /**
  * How much of the context window one exchange occupied: everything the model
- * had to hold at once — the prompt it was sent, whatever of it was served from
- * cache, and the answer it produced.
+ * had to hold at once — the prompt it was sent, whatever of it came from cache,
+ * what was written to cache, and the answer it produced.
  *
  * The per-run total of `input` cannot answer this. Every turn resends the
  * conversation, so a 47-turn run sums to a million input tokens while never
  * holding more than a fraction of that at once.
+ *
+ * `reasoning` is deliberately absent: providers report it as a *subset* of
+ * `output`, not in addition to it ("completion_tokens already includes
+ * reasoning_tokens" — pi-ai's own openai-completions provider), so adding it
+ * counted those tokens twice. `cacheWrite` is present because Anthropic keeps
+ * cache creation out of `input`, and a first turn that writes a 100K prompt to
+ * cache would otherwise register as a few hundred tokens.
  */
 function contextTokens(usage) {
   if (!usage || typeof usage !== "object") {
     return 0;
   }
   const value = (key) => (typeof usage[key] === "number" ? usage[key] : 0);
-  return value("input") + value("cacheRead") + value("output") + value("reasoning");
+  return value("input") + value("cacheRead") + value("cacheWrite") + value("output");
 }
 
 /**
@@ -534,6 +532,11 @@ export async function runPiTurn({
     stderr += chunk;
   });
 
+  // pi may exit before reading the prompt (unknown model, bad flag, docker
+  // failing on its arguments). The write then fails asynchronously with EPIPE,
+  // and without this handler that is an unhandled 'error' event that kills the
+  // process before the job can be recorded as failed.
+  child.stdin.on("error", () => {});
   child.stdin.end(String(prompt));
 
   const exitStatus = await new Promise((resolve, reject) => {

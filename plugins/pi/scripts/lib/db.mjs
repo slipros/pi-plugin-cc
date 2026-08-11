@@ -101,6 +101,11 @@ export function openDatabase(file = databasePath()) {
     return withoutSqliteWarning(() => {
       const db = new (loadSqlite().DatabaseSync)(file);
       db.exec("PRAGMA journal_mode = WAL");
+      // Without this a second writer fails instantly with SQLITE_BUSY instead of
+      // waiting, and since recording is best-effort the loss is silent: the run
+      // stays `running` in the journal with zero tokens forever. The plugin is
+      // built for fan-out background runs, so contention is the normal case.
+      db.exec("PRAGMA busy_timeout = 5000");
       db.exec(SCHEMA);
       addMissingColumns(db);
       return { db, close: () => db.close() };
@@ -280,6 +285,23 @@ export function recordJobSafely(job) {
   }
 }
 
+/**
+ * Window clause for the last N days.
+ *
+ * Timestamps are stored as ISO strings with a `T`, while `datetime()` returns a
+ * space-separated one; comparing them as text let the whole boundary day in,
+ * because 'T' sorts after ' '. Replacing the separator makes the comparison
+ * mean what the flag says. A non-positive or non-numeric value means no window
+ * rather than a clause SQLite evaluates to NULL, which matched nothing at all.
+ */
+function whereWithinDays(days) {
+  const window = Number(days);
+  if (!Number.isFinite(window) || window <= 0) {
+    return "";
+  }
+  return `WHERE created_at >= replace(datetime('now', '-${window} days'), ' ', 'T')`;
+}
+
 const GROUPS = {
   day: "date(created_at)",
   model: "COALESCE(model, '(unknown)')",
@@ -300,7 +322,7 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
   if (!expression) {
     throw new Error(`Unknown grouping "${by}". Use one of: ${Object.keys(GROUPS).join(", ")}.`);
   }
-  const where = days ? `WHERE created_at >= datetime('now', '-${Number(days)} days')` : "";
+  const where = whereWithinDays(days);
   const rows = handle.db
     .prepare(
       `SELECT ${expression} AS bucket,
@@ -317,10 +339,22 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               SUM(tool_ms)        AS tool_ms,
               -- Tokens from the same rows the model time came from: mixing the
               -- output of untimed runs into a rate measured on timed ones
-              -- inflates it without limit.
-              SUM(CASE WHEN model_ms > 0 THEN output + reasoning ELSE 0 END) AS timed_output,
-              SUM(model_ms > 0)   AS timed_runs,
+              -- inflates it without limit. A run that spent model time and
+              -- produced nothing is excluded from both sides for the same
+              -- reason — one 300s timeout would otherwise halve a bucket.
+              --
+              -- reasoning is not added to output: providers report it as a
+              -- subset of output, so summing them counted hidden reasoning
+              -- twice and inflated the rate by up to 59% for the providers
+              -- that report it at all.
+              SUM(CASE WHEN model_ms > 0 AND output > 0 THEN output ELSE 0 END) AS timed_output,
+              SUM(CASE WHEN model_ms > 0 AND output > 0 THEN model_ms ELSE 0 END) AS timed_model_ms,
+              SUM(model_ms > 0 AND output > 0) AS timed_runs,
               SUM(turns)          AS turns,
+              -- Denominator for per-run averages: runs recorded before the
+              -- counters existed carry zeroes, and dividing by COUNT(*) halved
+              -- every average without saying so.
+              SUM(turns > 0)      AS counted_runs,
               SUM(tool_calls)     AS tool_calls,
               SUM(tool_errors)    AS tool_errors,
               -- Context is a high-water mark per run, so it averages and peaks
@@ -362,7 +396,7 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
       // Generated tokens over the time actually spent waiting on the model,
       // which is the run minus its tools. Runs recorded before timings existed
       // carry a zero and simply do not contribute.
-      tokensPerSecond: row.model_ms > 0 ? row.timed_output / (row.model_ms / 1000) : null,
+      tokensPerSecond: row.timed_model_ms > 0 ? row.timed_output / (row.timed_model_ms / 1000) : null,
       p50Seconds: percentile(sorted, 0.5),
       p90Seconds: percentile(sorted, 0.9)
     };
@@ -379,7 +413,7 @@ function percentile(sorted, fraction) {
 }
 
 export function queryTotals(handle, { days = 30 } = {}) {
-  const where = days ? `WHERE created_at >= datetime('now', '-${Number(days)} days')` : "";
+  const where = whereWithinDays(days);
   return (
     handle.db
       .prepare(

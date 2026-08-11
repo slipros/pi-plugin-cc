@@ -120,7 +120,8 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
       );
       for (const row of measured) {
-        const turnsPerRun = row.runs ? (Number(row.turns ?? 0) / row.runs).toFixed(1) : "—";
+        const counted = Number(row.counted_runs ?? 0);
+        const turnsPerRun = counted ? (Number(row.turns ?? 0) / counted).toFixed(1) : "—";
         lines.push(
           `| \`${row.bucket}\` | ${row.runs} | ${formatShare(row.completed, row.runs)} | ` +
             `${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
@@ -432,7 +433,17 @@ function formatShare(part, whole) {
   if (!total) {
     return "—";
   }
-  return `${Math.round((100 * Number(part ?? 0)) / total)}%`;
+  const value = Number(part ?? 0);
+  const percent = (100 * value) / total;
+  // Rounding must not turn a failure into a clean sheet: 249/250 is not 100%,
+  // and one error in a thousand calls is not 0%.
+  if (percent > 99 && value < total) {
+    return ">99%";
+  }
+  if (percent > 0 && percent < 1) {
+    return "<1%";
+  }
+  return `${Math.round(percent)}%`;
 }
 
 /** Tokens per second; null when no run in the bucket carried timings. */
@@ -472,17 +483,26 @@ function formatSeconds(value) {
     return "—";
   }
   const seconds = Number(value);
-  return seconds >= 90 ? `${Math.round(seconds / 60)}m` : `${Math.round(seconds)}s`;
+  if (seconds < 120) {
+    return `${Math.round(seconds)}s`;
+  }
+  const minutes = seconds / 60;
+  return minutes < 10 ? `${minutes.toFixed(1)}m` : `${Math.round(minutes)}m`;
 }
 
 function formatDuration(totalSeconds) {
-  const seconds = Number(totalSeconds ?? 0);
+  const seconds = Math.round(Number(totalSeconds ?? 0));
   if (!seconds) {
     return "0s";
   }
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.round((seconds % 3600) / 60);
-  return hours ? `${hours}h ${minutes}m` : `${minutes || Math.round(seconds)}${hours ? "m" : minutes ? "m" : "s"}`;
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  // Carry the rounded minutes into hours: 3599s is an hour, not "60m".
+  const totalMinutes = Math.round(seconds / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
 export function renderStatsReport({ rows, totals, by, days, database }) {

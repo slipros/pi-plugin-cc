@@ -46,6 +46,38 @@ export function resolveProviderEndpoint(homeDir, provider) {
   }
 }
 
+/**
+ * Build the upstream URL for one request, or null if it does not belong here.
+ *
+ * The path is parsed against a throwaway origin and only its pathname and query
+ * are copied onto a clone of the upstream, so nothing in the request can move
+ * the destination: the host, port and protocol come from the provider table and
+ * from nowhere else. The final check is belt and braces — if any of them still
+ * differs, the request is refused rather than sent with the real credential
+ * attached.
+ */
+function resolveTarget(upstream, requestUrl) {
+  const raw = String(requestUrl ?? "");
+  if (!raw.startsWith("/") || raw.startsWith("//")) {
+    return null;
+  }
+  let incoming;
+  try {
+    incoming = new URL(raw, "http://request.invalid");
+  } catch {
+    return null;
+  }
+  const prefix = upstream.pathname.replace(/\/$/, "");
+  const target = new URL(upstream);
+  target.pathname = `${prefix}${incoming.pathname}`;
+  target.search = incoming.search;
+  target.hash = "";
+  if (target.host !== upstream.host || target.protocol !== upstream.protocol) {
+    return null;
+  }
+  return target;
+}
+
 /** The credential a provider entry authenticates with, whatever its shape. */
 export function credentialOf(entry) {
   if (!entry || typeof entry !== "object") {
@@ -84,7 +116,16 @@ export async function startCredentialProxy({ homeDir, provider, authEntry, onWar
       return;
     }
 
-    const target = new URL(`${upstream.pathname.replace(/\/$/, "")}${request.url}`, upstream);
+    const target = resolveTarget(upstream, request.url);
+    if (!target) {
+      // The path decided the destination host: `//elsewhere/v1` resolves as a
+      // protocol-relative URL, and for a provider whose base URL carries no
+      // path that turned this into an open relay handing out the real key.
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Invalid request path." } }));
+      request.resume();
+      return;
+    }
     const headers = { ...request.headers };
     // Host must match the upstream, and hop-by-hop headers are ours to set.
     delete headers.host;

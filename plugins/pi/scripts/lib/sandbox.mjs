@@ -54,6 +54,9 @@ const SANDBOX_DEFAULTS = {
 
 const DISABLED = new Set(["none", "off", "false", "no"]);
 
+/** A credential slice older than this belonged to a run that never cleaned up. */
+const ABANDONED_SLICE_MS = 3_600_000;
+
 /** How long a slot reservation is trusted before it is treated as abandoned. */
 const RESERVATION_WINDOW_MS = 30_000;
 
@@ -317,10 +320,14 @@ export function buildDockerRunArgs({
     // naming one fails with "Unknown provider". It holds no credentials —
     // those are in auth.json, which only comes along when `auth` is on.
     const hostAgentDir = path.join(homeDir, ".pi", "agent");
-    for (const [file, wanted] of [["models.json", true], ["auth.json", Boolean(sandbox.auth)]]) {
-      const source = path.join(hostAgentDir, file);
-      if (wanted && fs.existsSync(source)) {
-        args.push("-v", `${source}:${AGENT_DIR}/${file}:ro`);
+    const models = path.join(hostAgentDir, "models.json");
+    if (fs.existsSync(models)) {
+      args.push("-v", `${models}:${AGENT_DIR}/models.json:ro`);
+    }
+    if (sandbox.auth) {
+      const credentials = resolveCredentialsMount(hostAgentDir, sandbox.provider ?? null);
+      if (credentials) {
+        args.push("-v", `${credentials}:${AGENT_DIR}/auth.json:ro`);
       }
     }
   }
@@ -333,6 +340,84 @@ export function buildDockerRunArgs({
   args.push(sandbox.image || DEFAULT_SANDBOX_IMAGE);
   args.push(...piArgs);
   return args;
+}
+
+/**
+ * The auth.json a sandboxed run gets: only the provider it will talk to.
+ *
+ * The host file holds credentials for every provider, and an agent with bash
+ * and network access inside the container can read all of them — the sandbox
+ * protects the host from the agent, not the credentials. Handing over one entry
+ * makes a compromised run cost one key instead of the whole set.
+ *
+ * Falls back to the whole file when the provider is unknown, which cannot
+ * happen for a preset that names its model, and is better than a run failing to
+ * authenticate at all.
+ */
+function resolveCredentialsMount(hostAgentDir, provider) {
+  const source = path.join(hostAgentDir, "auth.json");
+  if (!fs.existsSync(source)) {
+    return null;
+  }
+  if (!provider) {
+    return source;
+  }
+  let entry;
+  try {
+    entry = JSON.parse(fs.readFileSync(source, "utf8"))?.[provider];
+  } catch {
+    return source;
+  }
+  if (!entry) {
+    return source;
+  }
+  try {
+    const dir = path.join(os.tmpdir(), "pi-companion", "auth");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const slice = path.join(dir, `${provider.replace(/[^a-zA-Z0-9_.-]+/g, "-")}.${process.pid}.json`);
+    fs.writeFileSync(slice, JSON.stringify({ [provider]: entry }), { encoding: "utf8", mode: 0o600 });
+    return slice;
+  } catch {
+    return source;
+  }
+}
+
+/**
+ * Remove the credential slices this process created.
+ *
+ * They live under the same short-lived state tree as everything else, so a
+ * missed cleanup is bounded — but a file holding a provider key should not
+ * outlive the run that needed it.
+ */
+export function cleanupCredentialSlices() {
+  const dir = path.join(os.tmpdir(), "pi-companion", "auth");
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const entry of entries) {
+    const file = path.join(dir, entry);
+    // Ours goes immediately; anything left by a process that died before it
+    // could clean up goes once it is old enough to be nobody's.
+    if (entry.includes(`.${process.pid}.`)) {
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        // Already gone.
+      }
+      continue;
+    }
+    try {
+      if (now - fs.statSync(file).mtimeMs > ABANDONED_SLICE_MS) {
+        fs.unlinkSync(file);
+      }
+    } catch {
+      // Someone else swept it first.
+    }
+  }
 }
 
 export function currentIdentity() {

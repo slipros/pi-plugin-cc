@@ -47,6 +47,7 @@ import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
   attachMounts,
   buildSandboxImage,
+  cleanupCredentialSlices,
   containerNameForJob,
   describeSandbox,
   describeSlotUsage,
@@ -92,6 +93,83 @@ const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 // handing it off again, and both halves agree on the job id.
 const DETACHED_ENV = "PI_PLUGIN_DETACHED";
 const DETACHED_JOB_ENV = "PI_PLUGIN_JOB_ID";
+
+/**
+ * Incremental reader over a job's event file.
+ *
+ * `--follow` polls several times a second, and re-reading the whole transcript
+ * each time is quadratic in its size: a long run writes megabytes, and every
+ * tick re-parsed all of it. This keeps a byte offset and only decodes what was
+ * appended since, while still counting lines — the cursor is public API, so it
+ * stays a line number.
+ *
+ * The tail of a partial line is held back until its newline arrives: a poll can
+ * land mid-write, and half a JSON object is not an event.
+ */
+export function createEventReader(file) {
+  let offset = 0;
+  let line = 0;
+  let base = 0;
+  let partial = "";
+  let events = [];
+
+  const pull = () => {
+    let handle;
+    try {
+      handle = fs.openSync(file, "r");
+    } catch {
+      return;
+    }
+    try {
+      const size = fs.fstatSync(handle).size;
+      // A shorter file is a different file: the run restarted, or state was
+      // cleaned. Start over rather than decode from a meaningless offset.
+      if (size < offset) {
+        offset = 0;
+        line = 0;
+        base = 0;
+        partial = "";
+        events = [];
+      }
+      while (offset < size) {
+        const buffer = Buffer.allocUnsafe(Math.min(256 * 1024, size - offset));
+        const read = fs.readSync(handle, buffer, 0, buffer.length, offset);
+        if (read <= 0) {
+          break;
+        }
+        offset += read;
+        const chunk = partial + buffer.toString("utf8", 0, read);
+        const pieces = chunk.split("\n");
+        partial = pieces.pop() ?? "";
+        for (const piece of pieces) {
+          if (!piece) {
+            continue;
+          }
+          line += 1;
+          const event = parseJsonLine(piece);
+          if (event) {
+            events.push(event);
+          }
+        }
+      }
+    } finally {
+      fs.closeSync(handle);
+    }
+  };
+
+  return {
+    read(fromLine) {
+      pull();
+      // Buffered events start at `base`; anything before the caller's cursor is
+      // already seen. What is handed over is then released — a follow loop runs
+      // for hours, and keeping every event alive would grow without bound.
+      const out = events.slice(Math.max(0, fromLine - base));
+      base = line;
+      events = [];
+      return { events: out, nextLine: line };
+    }
+  };
+}
 
 /**
  * Statuses a job never leaves. Everything else — `running`, and `pending` while
@@ -372,11 +450,15 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     );
   }
   if (isSandboxed(sandbox)) {
+    // The provider decides which credential the container gets, so it has to
+    // travel with the sandbox descriptor rather than only with the pi args.
+    sandbox = { ...sandbox, provider: providerOf(settings) };
     // A worktree cannot see its own repository through /workspace alone, so the
     // shared .git is mounted for it. Listed before the run's own mounts, which
     // therefore win the deduplication if one names the same target explicitly.
-    worktreeMount = resolveWorktreeMount(runRoot);
-    sandbox = attachMounts(sandbox, worktreeMount ? [worktreeMount, ...settings.mounts] : settings.mounts);
+    const worktreeMounts = resolveWorktreeMount(runRoot) ?? [];
+    worktreeMount = worktreeMounts[0] ?? null;
+    sandbox = attachMounts(sandbox, [...worktreeMounts, ...settings.mounts]);
     const identity = gitIdentityEnv(settings.git);
     if (Object.keys(identity).length) {
       sandbox = {
@@ -670,6 +752,22 @@ async function commandModels(argv, workspaceRoot) {
 }
 
 /**
+ * Which provider a run will authenticate against.
+ *
+ * Taken from `--provider` or from the `provider/model` form of the model id.
+ * Null means "pi decides", and a sandboxed run then falls back to the full
+ * credentials file — the only case where the whole set still travels.
+ */
+function providerOf(settings) {
+  if (settings.provider) {
+    return String(settings.provider);
+  }
+  const model = typeof settings.model === "string" ? settings.model : "";
+  const separator = model.indexOf("/");
+  return separator > 0 ? model.slice(0, separator) : null;
+}
+
+/**
  * Resolve a profile's slot allowance from the pool it belongs to.
  *
  * The limit lives with the pool rather than with each profile, so profiles
@@ -952,16 +1050,8 @@ async function commandWatch(argv, workspaceRoot) {
   }
   const deadline = followSeconds ? Date.now() + followSeconds * 1000 : null;
 
-  const readEvents = (fromLine) => {
-    if (!fs.existsSync(file)) {
-      return { events: [], nextLine: fromLine };
-    }
-    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
-    return {
-      events: lines.slice(fromLine).map(parseJsonLine).filter(Boolean),
-      nextLine: lines.length
-    };
-  };
+  const reader = createEventReader(file);
+  const readEvents = (fromLine) => reader.read(fromLine);
 
   const initial = readEvents(since);
   if (flags.json) {
@@ -981,7 +1071,9 @@ async function commandWatch(argv, workspaceRoot) {
   // that starts mid-stream replays the skipped events into a throwaway state.
   const state = {};
   if (since > 0) {
-    for (const event of readEvents(0).events.slice(0, since)) {
+    // A separate reader: the main one streams forward and drops what it has
+    // handed over, so it cannot serve a second pass from the beginning.
+    for (const event of createEventReader(file).read(0).events.slice(0, since)) {
       renderTranscriptEvent(event, state);
     }
   }
@@ -1331,5 +1423,9 @@ if (invokedAsScript()) {
     .catch((error) => {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
       process.exitCode = 1;
+    })
+    .finally(() => {
+      // The credential slice exists for the duration of the run and no longer.
+      cleanupCredentialSlices();
     });
 }

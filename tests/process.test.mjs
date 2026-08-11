@@ -184,10 +184,53 @@ test("a worktree run mounts the repository it points at, an ordinary repo mounts
 
     // The worktree's .git is a file naming this path; the container has to see
     // it at exactly that path for git to resolve anything at all.
-    assert.equal(resolveWorktreeMount(tree), `${path.join(main, ".git")}:${path.join(main, ".git")}`);
+    const mounts = resolveWorktreeMount(tree);
+    const gitDir = path.join(main, ".git");
+    assert.equal(mounts[0], `${gitDir}:${gitDir}`, "the shared repository is writable");
+    // hooks and config execute on the host, so the container only reads them.
+    assert.ok(mounts.includes(`${path.join(gitDir, "hooks")}:${path.join(gitDir, "hooks")}:ro`));
+    assert.ok(mounts.includes(`${path.join(gitDir, "config")}:${path.join(gitDir, "config")}:ro`));
     assert.equal(resolveWorktreeMount(main), null, "an ordinary repository carries its own .git");
     assert.equal(resolveWorktreeMount(root), null, "a plain directory is not a repository");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("the event reader decodes only what was appended, and never half a line", async () => {
+  const { createEventReader } = await import("../plugins/pi/scripts/pi-companion.mjs");
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-events-")), "run.events.jsonl");
+  const event = (index) => `${JSON.stringify({ type: "turn_start", index })}\n`;
+
+  fs.writeFileSync(file, event(1) + event(2));
+  const reader = createEventReader(file);
+
+  const first = reader.read(0);
+  assert.deepEqual(first.events.map((entry) => entry.index), [1, 2]);
+  assert.equal(first.nextLine, 2);
+
+  // Nothing new: no events, cursor unchanged.
+  assert.deepEqual(reader.read(first.nextLine).events, []);
+
+  // A write caught mid-line must not yield a broken event.
+  fs.appendFileSync(file, '{"type":"turn_start","index":3}');
+  assert.deepEqual(reader.read(2).events, [], "a line without its newline is held back");
+
+  fs.appendFileSync(file, "\n" + event(4));
+  const rest = reader.read(2);
+  assert.deepEqual(rest.events.map((entry) => entry.index), [3, 4]);
+  assert.equal(rest.nextLine, 4);
+
+  // A shorter file means a different run: the reader starts over instead of
+  // decoding from a meaningless offset.
+  fs.writeFileSync(file, event(9));
+  const restarted = reader.read(0);
+  assert.deepEqual(restarted.events.map((entry) => entry.index), [9]);
+  assert.equal(restarted.nextLine, 1);
+
+  fs.rmSync(path.dirname(file), { recursive: true, force: true });
 });

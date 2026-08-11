@@ -186,5 +186,29 @@ export function resolveWorktreeMount(cwd) {
   if (!commonDir || !fs.existsSync(commonDir)) {
     return null;
   }
-  return `${commonDir}:${commonDir}`;
+  return [`${commonDir}:${commonDir}`, ...hostExecutionGuards(commonDir)];
+}
+
+/**
+ * Read-only covers over the parts of a shared .git that run code on the host.
+ *
+ * The repository has to be writable — git keeps the index, HEAD and new objects
+ * there — but two of its contents are executed outside the container: hooks run
+ * on the next commit made from the host, and config carries `core.pager`,
+ * `core.fsmonitor` and aliases, which run on almost any git command. Mounting
+ * them read-only leaves commits working while closing the only path by which a
+ * sandboxed agent could reach the host through this mount. Verified: commit,
+ * add and branch operations pass; writing a hook or `git config` is refused.
+ */
+function hostExecutionGuards(commonDir) {
+  const guards = [];
+  const hooks = path.join(commonDir, "hooks");
+  if (fs.existsSync(hooks)) {
+    guards.push(`${hooks}:${hooks}:ro`);
+  }
+  const config = path.join(commonDir, "config");
+  if (fs.existsSync(config)) {
+    guards.push(`${config}:${config}:ro`);
+  }
+  return guards;
 }

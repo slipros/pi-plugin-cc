@@ -168,6 +168,7 @@ function inboxPathFor(workspaceRoot, jobId) {
  * broken file; rename is atomic, so it sees either the old content or the new.
  */
 function writeFileAtomic(filePath, contents) {
+  sweepStaleTemporaries(filePath);
   const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(temporary, contents, "utf8");
@@ -218,9 +219,26 @@ function withStateLock(workspaceRoot, fn) {
     }
   }
 
+  // A holder whose section runs longer than the staleness threshold used to be
+  // declared dead and have its lock stolen — eviction over a slow filesystem is
+  // enough. Touching the directory while working says "still alive", so only a
+  // holder that actually died looks stale.
+  const heartbeat = held
+    ? setInterval(() => {
+        try {
+          const now = new Date();
+          fs.utimesSync(lockPath, now, now);
+        } catch {
+          // Lock already gone; nothing to keep alive.
+        }
+      }, Math.max(200, Math.floor(LOCK_TIMEOUT_MS / 4)))
+    : null;
+  heartbeat?.unref?.();
+
   try {
-    return fn();
+    return fn(held);
   } finally {
+    clearInterval(heartbeat ?? undefined);
     if (held) {
       try {
         fs.rmdirSync(lockPath);
@@ -231,12 +249,35 @@ function withStateLock(workspaceRoot, fn) {
   }
 }
 
+/** Leftovers from a process killed between writing and renaming. */
+function sweepStaleTemporaries(filePath) {
+  try {
+    const dir = path.dirname(filePath);
+    const prefix = `${path.basename(filePath)}.`;
+    for (const entry of fs.readdirSync(dir)) {
+      if (!entry.startsWith(prefix) || !entry.endsWith(".tmp")) {
+        continue;
+      }
+      const candidate = path.join(dir, entry);
+      if (Date.now() - fs.statSync(candidate).mtimeMs > LOCK_TIMEOUT_MS * 10) {
+        fs.unlinkSync(candidate);
+      }
+    }
+  } catch {
+    // Housekeeping only.
+  }
+}
+
 export function updateState(workspaceRoot, mutate) {
   ensureStateDir(workspaceRoot);
-  return withStateLock(workspaceRoot, () => {
+  return withStateLock(workspaceRoot, (held) => {
     const state = loadState(workspaceRoot);
     mutate(state);
-    return saveState(workspaceRoot, state);
+    // Without the lock another writer may be mid-update, and this view of the
+    // job list is not authoritative enough to delete anyone's files by. The
+    // write still happens — losing a status update is survivable, losing
+    // another run's results is not.
+    return saveState(workspaceRoot, state, { evict: held });
   });
 }
 

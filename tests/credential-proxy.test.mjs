@@ -292,3 +292,37 @@ test("a provider that drops mid-stream ends the client instead of hanging it", a
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("masking does not silently disable prompt caching on OpenAI", async () => {
+  const { startCredentialProxy } = await import("../plugins/pi/scripts/lib/credential-proxy.mjs");
+  const upstream = await startUpstream();
+
+  // pi keys this decision off the model's base URL, which the mask replaces —
+  // so the proxy has to put the key back for hosts that understand it.
+  const openaiLike = fakeHome(upstream.port, { baseUrl: `http://api.openai.com.127.0.0.1.nip.io:${upstream.port}/v1` });
+  const plain = fakeHome(upstream.port);
+
+  for (const [home, expectKey] of [[openaiLike, true], [plain, false]]) {
+    const proxy = await startCredentialProxy({
+      homeDir: home,
+      provider: "test-provider",
+      model: "real-model",
+      authEntry: { key: "k" }
+    });
+    const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+    try {
+      await fetch(`${local}/chat`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${proxy.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: "agent-model", messages: [] })
+      }).catch(() => {});
+      const call = upstream.seen.at(-1);
+      const sent = call ? Boolean(JSON.parse(call.body).prompt_cache_key) : false;
+      assert.equal(sent, expectKey);
+    } finally {
+      await proxy.close();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  }
+  await upstream.close();
+});

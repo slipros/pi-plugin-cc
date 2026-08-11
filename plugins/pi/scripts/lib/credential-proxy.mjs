@@ -169,6 +169,26 @@ function resolveTarget(upstream, requestUrl) {
   return target;
 }
 
+/**
+ * Put back the prompt cache key that masking took away.
+ *
+ * pi decides whether to send `prompt_cache_key` by looking at the model's base
+ * URL (`openai-completions.js`: `model.baseUrl.includes("api.openai.com")`).
+ * Behind the mask that URL is the proxy, so the check fails and prompt caching
+ * silently stops for anyone actually on OpenAI — a real cost increase caused by
+ * hiding the endpoint. The key only has to be stable within a run for the
+ * provider to reuse its prefix, and the run token is exactly that.
+ *
+ * Added only where the field is known to be understood: an unexpected parameter
+ * is an error at some gateways, and this is not the place to find that out.
+ */
+function restorePromptCacheKey(payload, upstream, token) {
+  if (!upstream.host.includes("api.openai.com") || payload.prompt_cache_key) {
+    return;
+  }
+  payload.prompt_cache_key = `pi-run-${crypto.createHash("sha256").update(token).digest("hex").slice(0, 32)}`;
+}
+
 /** Thinking levels pi accepts as a `model:level` suffix. */
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -388,6 +408,7 @@ export async function startCredentialProxy({ homeDir, provider, model = null, au
         const payload = JSON.parse(raw.toString("utf8"));
         if (payload && typeof payload === "object" && "model" in payload) {
           payload.model = realModel;
+          restorePromptCacheKey(payload, upstream, token);
           forward(Buffer.from(JSON.stringify(payload), "utf8"));
           return;
         }

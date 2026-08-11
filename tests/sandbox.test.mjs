@@ -57,7 +57,9 @@ test("an object overrides only the fields it names", () => {
   assert.equal(sandbox.mode, "docker");
   assert.equal(sandbox.image, "custom:1");
   assert.equal(sandbox.network, "none");
-  assert.deepEqual(sandbox.env, ["A", "B"]);
+  // The defaults every sandbox carries come first; a profile adds to them.
+  assert.deepEqual(sandbox.env.slice(-2), ["A", "B"]);
+  assert.ok(sandbox.env.includes("PI_OFFLINE=1"), "startup network calls stay off by default");
   assert.equal(sandbox.agentDir, "volume");
 });
 
@@ -290,7 +292,7 @@ test("a sandbox can be named: the profile carries the toolchain", () => {
   const sandbox = normalizeSandbox("go", PROFILES);
   assert.equal(sandbox.mode, "docker");
   assert.equal(sandbox.image, DEFAULT_SANDBOX_IMAGE, "unnamed fields keep their defaults");
-  assert.deepEqual(sandbox.env, ["PATH=/gobin:/usr/local/bin:/usr/bin:/bin"]);
+  assert.deepEqual(sandbox.env.slice(-1), ["PATH=/gobin:/usr/local/bin:/usr/bin:/bin"]);
   assert.deepEqual(sandbox.extensions, ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]);
 });
 
@@ -381,7 +383,7 @@ test("a sandbox object starting from a profile adds to its equipment, not over i
     PROFILES
   );
   assert.deepEqual(
-    sandbox.env,
+    sandbox.env.slice(-2),
     ["PATH=/gobin:/usr/local/bin:/usr/bin:/bin", "PI_HOOKS=goimports-on-edit"],
     "the profile PATH survives; without it every mounted binary is unreachable"
   );
@@ -398,7 +400,7 @@ test("an inline value still overrides the profile entry it collides with", () =>
     { profile: "go", env: ["PATH=/only-this"], mounts: ["~/other:/gobin:ro"] },
     PROFILES
   );
-  assert.deepEqual(sandbox.env, ["PATH=/only-this"]);
+  assert.deepEqual(sandbox.env.slice(-1), ["PATH=/only-this"]);
   assert.deepEqual(sandbox.mounts, ["~/other:/gobin:ro", "~/.pi/agent/extensions:/pi-agent/host-extensions:ro"]);
 });
 
@@ -413,7 +415,7 @@ test("a profile can start from another profile", () => {
     "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
     "~/mem:/mem-cli:ro"
   ]);
-  assert.deepEqual(sandbox.env, [
+  assert.deepEqual(sandbox.env.slice(-2), [
     "PATH=/gobin:/usr/local/bin:/usr/bin:/bin",
     "MEMORY_MEM_PATH=/mem-cli/mem"
   ]);

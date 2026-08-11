@@ -43,7 +43,11 @@ const SANDBOX_DEFAULTS = {
   // without the rest of the host agent directory coming along.
   auth: true,
   user: "current",
-  env: [],
+  // True of every sandboxed run, not of any one toolchain, so it belongs here
+  // rather than repeated in each profile: the container has no business phoning
+  // home for updates or telemetry, and its only outbound need is the model.
+  // Skipping those checks also takes them off the startup path of every run.
+  env: ["PI_OFFLINE=1", "PI_SKIP_VERSION_CHECK=1", "PI_TELEMETRY=0"],
   mounts: [],
   args: [],
   // Tooling the agent only gets inside this sandbox: extensions and skills

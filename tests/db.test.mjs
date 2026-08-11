@@ -119,8 +119,21 @@ test("the models report only queries the journal when stats are asked for", asyn
   const report = renderModelsReport({
     ...catalogue,
     measured: [
-      { bucket: "m1", runs: 4, completed: 3, tokensPerSecond: 40.4, p50Seconds: 12, p90Seconds: 300, turns: 8, tool_calls: 10, tool_errors: 1, cost: 0 }
+      {
+        bucket: "m1",
+        runs: 4,
+        completed: 3,
+        avg_context: 812_431,
+        max_context: 1_004_000,
+        tokensPerSecond: 40.4,
+        p50Seconds: 12,
+        p90Seconds: 300,
+        turns: 8,
+        tool_calls: 10,
+        tool_errors: 1,
+        cost: 0
+      }
     ]
   });
-  assert.match(report, /\| `m1` \| 4 \| 75% \| 40\.4 \| 12s \| 5m \| 2\.0 \| 10% \|/);
+  assert.match(report, /\| `m1` \| 4 \| 75% \| 812K \| 1\.0M \| 40\.4 \| 12s \| 5m \| 2\.0 \| 10% \|/);
 });

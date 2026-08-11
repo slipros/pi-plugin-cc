@@ -302,6 +302,7 @@ export async function runTrackedJob(job, runner) {
       toolCalls: Array.isArray(execution.toolCalls) ? execution.toolCalls.length : (execution.toolCalls ?? 0),
       toolErrors: execution.toolErrors ?? 0,
       timing: execution.timing ?? null,
+      peakContext: execution.peakContext ?? 0,
       summary: execution.summary ?? null,
       rendered: execution.rendered ?? null,
       errors: execution.errors ?? []

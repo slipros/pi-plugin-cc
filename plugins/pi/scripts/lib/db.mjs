@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   model_ms         INTEGER DEFAULT 0,
   tool_ms          INTEGER DEFAULT 0,
   span_ms          INTEGER DEFAULT 0,
+  peak_context     INTEGER DEFAULT 0,
   session_id       TEXT,
   background       INTEGER DEFAULT 0,
   updated_at       TEXT
@@ -120,7 +121,8 @@ function addMissingColumns(db) {
   const additions = [
     ["model_ms", "INTEGER DEFAULT 0"],
     ["tool_ms", "INTEGER DEFAULT 0"],
-    ["span_ms", "INTEGER DEFAULT 0"]
+    ["span_ms", "INTEGER DEFAULT 0"],
+    ["peak_context", "INTEGER DEFAULT 0"]
   ];
   for (const [name, definition] of additions) {
     if (!present.has(name)) {
@@ -172,6 +174,7 @@ const COLUMNS = [
   "model_ms",
   "tool_ms",
   "span_ms",
+  "peak_context",
   "session_id",
   "background",
   "updated_at"
@@ -216,6 +219,7 @@ export function jobToRow(job) {
     model_ms: job.timing?.modelMs ?? 0,
     tool_ms: job.timing?.toolMs ?? 0,
     span_ms: job.timing?.spanMs ?? 0,
+    peak_context: job.peakContext ?? 0,
     session_id: job.sessionId ?? null,
     background: job.background ? 1 : 0,
     updated_at: new Date().toISOString()
@@ -234,7 +238,7 @@ export function recordJob(handle, job) {
   const placeholders = COLUMNS.map((column) => `$${column}`).join(", ");
   const updates = COLUMNS.filter((column) => column !== "id")
     .map((column) =>
-      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms"].includes(
+      ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms", "peak_context"].includes(
         column
       )
         ? `${column} = MAX(${column}, excluded.${column})`
@@ -310,7 +314,11 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               SUM(model_ms > 0)   AS timed_runs,
               SUM(turns)          AS turns,
               SUM(tool_calls)     AS tool_calls,
-              SUM(tool_errors)    AS tool_errors
+              SUM(tool_errors)    AS tool_errors,
+              -- Context is a high-water mark per run, so it averages and peaks
+              -- rather than summing: totals across runs mean nothing here.
+              AVG(NULLIF(peak_context, 0)) AS avg_context,
+              MAX(peak_context)   AS max_context
        FROM jobs ${where}
        GROUP BY bucket
        ORDER BY (SUM(input) + SUM(output)) DESC, bucket DESC

@@ -116,13 +116,14 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
       lines.push(
         "What the catalogue cannot say: how these models behaved on this machine.",
         "",
-        "| Model | runs | ok | tok/s | p50 | p90 | turns/run | tool err | cost |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| Model | runs | ok | ctx avg | ctx max | tok/s | p50 | p90 | turns/run | tool err | cost |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
       );
       for (const row of measured) {
         const turnsPerRun = row.runs ? (Number(row.turns ?? 0) / row.runs).toFixed(1) : "—";
         lines.push(
           `| \`${row.bucket}\` | ${row.runs} | ${formatShare(row.completed, row.runs)} | ` +
+            `${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
             `${formatRate(row.tokensPerSecond)} | ${formatSeconds(row.p50Seconds)} | ${formatSeconds(row.p90Seconds)} | ` +
             `${turnsPerRun} | ${formatShare(row.tool_errors, row.tool_calls)} | ${formatCost(row.cost) ?? "—"} |`
         );
@@ -439,6 +440,18 @@ function formatRate(rate) {
   return rate >= 100 ? String(Math.round(rate)) : rate.toFixed(1);
 }
 
+/** Token counts at a glance: 812K rather than 812,431. */
+function formatCompact(value) {
+  const tokens = Number(value ?? 0);
+  if (!tokens) {
+    return "—";
+  }
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(tokens >= 10_000_000 ? 0 : 1)}M`;
+  }
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}K` : String(Math.round(tokens));
+}
+
 function formatSeconds(value) {
   if (value == null) {
     return "—";
@@ -477,13 +490,14 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
   );
 
   lines.push(
-    `| ${by} | runs | ok | in | out | tok/s | p50 | p90 | tools | err | cost |`,
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    `| ${by} | runs | ok | in | out | ctx avg | ctx max | tok/s | p50 | p90 | tools | err | cost |`,
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
   );
   for (const row of rows) {
     lines.push(
       `| ${row.bucket} | ${row.runs} | ${formatShare(row.completed, row.runs)} | ${formatTokens(row.input)} | ` +
-        `${formatTokens(row.output)} | ${formatRate(row.tokensPerSecond)} | ${formatSeconds(row.p50Seconds)} | ` +
+        `${formatTokens(row.output)} | ${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
+        `${formatRate(row.tokensPerSecond)} | ${formatSeconds(row.p50Seconds)} | ` +
         `${formatSeconds(row.p90Seconds)} | ${row.tool_calls ?? 0} | ${row.tool_errors ?? 0} | ${formatCost(row.cost) ?? "—"} |`
     );
   }
@@ -491,7 +505,9 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
   lines.push(
     "",
     "`tok/s` is generated tokens over model time — the run minus the time its tools held it; runs recorded before " +
-      "timings existed count as zero and are left out of it. `p50`/`p90` are run durations, tools included.",
+      "timings existed count as zero and are left out of it. `p50`/`p90` are run durations, tools included. " +
+      "`ctx` is how much of the context window a run held at its peak — averaged and at its worst — which the `in` " +
+      "column cannot show, since every turn resends the conversation.",
     "",
     `Journal: \`${database}\` · group by \`--by day|model|preset|workspace|kind|status\` · \`--days N\` or \`--all\`.`
   );

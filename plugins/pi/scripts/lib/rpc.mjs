@@ -260,6 +260,7 @@ export async function runPiRpcTurn({
     toolCalls: state.toolCalls,
     toolErrors: state.toolErrors,
     timing: summarizeTiming(state.timing),
+    peakContext: state.peakContext ?? 0,
     queue: state.queue,
     steering: delivered,
     aborted,

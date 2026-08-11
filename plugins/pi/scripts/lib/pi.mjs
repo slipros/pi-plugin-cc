@@ -93,6 +93,23 @@ function producedTokens(usage) {
     (typeof usage.reasoning === "number" ? usage.reasoning : 0);
 }
 
+/**
+ * How much of the context window one exchange occupied: everything the model
+ * had to hold at once — the prompt it was sent, whatever of it was served from
+ * cache, and the answer it produced.
+ *
+ * The per-run total of `input` cannot answer this. Every turn resends the
+ * conversation, so a 47-turn run sums to a million input tokens while never
+ * holding more than a fraction of that at once.
+ */
+function contextTokens(usage) {
+  if (!usage || typeof usage !== "object") {
+    return 0;
+  }
+  const value = (key) => (typeof usage[key] === "number" ? usage[key] : 0);
+  return value("input") + value("cacheRead") + value("output") + value("reasoning");
+}
+
 /** Pairs a tool_execution_end with its start; ids differ per pi version. */
 function toolKey(event) {
   return String(event.toolCallId ?? event.id ?? event.callId ?? event.toolName ?? "tool");
@@ -315,6 +332,7 @@ export function applyPiEvent(state, event, now = Date.now()) {
         if (text) {
           state.assistantTexts.push(text);
         }
+        state.peakContext = Math.max(state.peakContext ?? 0, contextTokens(message.usage));
         state.usage = accumulateUsage(state.usage, message.usage);
         if (message.model) {
           state.model = message.provider ? `${message.provider}/${message.model}` : String(message.model);
@@ -394,6 +412,7 @@ export function createTurnState() {
     assistantTexts: [],
     usage: {},
     timing: createTimingState(),
+    peakContext: 0,
     model: null,
     thinkingLevel: null,
     stopReason: null,
@@ -541,6 +560,7 @@ export async function runPiTurn({
     toolCalls: state.toolCalls,
     toolErrors: state.toolErrors,
     timing: summarizeTiming(state.timing),
+    peakContext: state.peakContext ?? 0,
     exitStatus: errors.length && exitStatus === 0 ? 1 : exitStatus,
     stderr: stderr.trim(),
     errors,

@@ -422,7 +422,9 @@ pi-companion.mjs stats --by status           # how runs ended
 pi-companion.mjs models --stats <search>     # the catalogue plus these numbers
 ```
 
-The report is not only tokens: `ok` is the share of runs that finished, `tok/s` the model's speed, `p50`/`p90` run durations, `tools`/`err` tool calls and the errors among them.
+The report is not only tokens: `ok` is the share of runs that finished, `ctx avg`/`ctx max` how much of the context window a run held at its peak, `tok/s` the model's speed, `p50`/`p90` run durations, `tools`/`err` tool calls and the errors among them.
+
+**`ctx` answers "does this fit in the window", which the `in` column cannot.** Every turn resends the conversation, so the input total runs far ahead of what the model ever held at once — a four-turn run totalling 30K of input peaked at 10K of context. It is measured as the largest `input + cache + output` of a single exchange.
 
 **`tok/s` is measured against model time** — the run's span minus the time its tools held it, with concurrent tool calls counted once rather than summed. Generation cannot be timed from the event stream directly: `message_start` arrives once the provider is already answering and the tokens then land in a few large batches, so that interval would report a thousand tokens per second for a model doing forty. Runs recorded before this measurement existed are left out of the rate entirely and show a dash.
 

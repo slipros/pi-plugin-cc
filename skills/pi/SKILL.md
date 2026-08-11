@@ -75,11 +75,13 @@ delegate --system-prompt "Отвечай одним предложением" "�
 Встроенные инструменты pi: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`. По умолчанию `delegate` разрешает всё, `review` — только чтение.
 
 ```bash
-delegate --read-only "разберись, почему падает сборка"     # read, grep, find, ls
+delegate --read-only "разберись, почему падает сборка"     # read, grep, find, ls + навигация LSP
 delegate --tools read,grep,find,ls,bash "воспроизведи баг, ничего не меняя"
 delegate --exclude-tools bash "поправь типы, команды не запускай"
 delegate --no-tools "просто подумай вслух над архитектурой"
 ```
+
+`--read-only` сохраняет и навигацию LSP — `lsp_definition`, `lsp_references`, `lsp_hover`, `lsp_document_symbols`, `lsp_workspace_symbols`, `lsp_more`: поиск вызовов символа ничего не меняет и нужен ревью в первую очередь. `lsp_diagnostics` в набор не входит — вердикт о сломанности кода за гейтами. Учти: `--tools` — белый список, поэтому явно заданный набор отсекает всё неназванное, включая LSP.
 
 Новые инструменты дают расширения pi — включая MCP-серверы через `pi-mcp-adapter`, который читает `.mcp.json` проекта:
 

@@ -44,6 +44,19 @@ test("read-only runs restrict pi to the safe tool set", () => {
   assert.deepEqual(args.slice(3), ["--tools", READ_ONLY_TOOLS.join(",")]);
 });
 
+test("the read-only set navigates with LSP but cannot mutate or diagnose", () => {
+  for (const tool of ["lsp_definition", "lsp_references", "lsp_more"]) {
+    assert.ok(READ_ONLY_TOOLS.includes(tool), `${tool} belongs to a look-but-do-not-touch run`);
+  }
+  for (const tool of ["bash", "edit", "write"]) {
+    assert.ok(!READ_ONLY_TOOLS.includes(tool), `${tool} would let a read-only run change the tree`);
+  }
+  assert.ok(
+    !READ_ONLY_TOOLS.includes("lsp_diagnostics"),
+    "gates decide whether code is broken, not the language server"
+  );
+});
+
 test("an explicit tool list overrides the read-only default", () => {
   const args = buildPiArgs({ readOnly: true, tools: ["read", "bash"] });
   assert.deepEqual(args.slice(3), ["--tools", "read,bash"]);

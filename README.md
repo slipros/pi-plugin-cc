@@ -154,11 +154,13 @@ Values resolve layer by layer, highest first: command-line flags → preset → 
 Built-in pi tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
 
 ```bash
-/pi:delegate --read-only            investigate why the build fails   # read, grep, find, ls
+/pi:delegate --read-only            investigate why the build fails   # read, grep, find, ls + LSP navigation
 /pi:delegate --tools read,grep,bash reproduce the bug, change nothing
 /pi:delegate --exclude-tools bash   fix the types, do not run commands
 /pi:delegate --no-tools             think out loud about the architecture
 ```
+
+`--read-only` also keeps the LSP navigation tools — `lsp_definition`, `lsp_references`, `lsp_hover`, `lsp_document_symbols`, `lsp_workspace_symbols`, `lsp_more` — since finding who calls a symbol changes nothing and is exactly what a review needs. `lsp_diagnostics` is left out: gates decide whether code is broken. Note `--tools` is an allow list, so spelling one out drops everything you did not name, LSP included.
 
 Anything beyond the built-ins comes from pi extensions — including MCP servers, via the `pi-mcp-adapter` extension that reads your project's `.mcp.json`:
 

@@ -7,8 +7,30 @@ import { isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mj
 
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
 
-/** Tool set for reviews and other look-but-do-not-touch runs. */
-export const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
+/**
+ * Tool set for reviews and other look-but-do-not-touch runs.
+ *
+ * The lsp_* half is navigation, not mutation: it answers where a symbol is
+ * declared and who calls it. A review is exactly the run that needs it — `--tools`
+ * is an allow list, so leaving them out left a reviewer grepping for names and
+ * hitting `Tool lsp_references not found` on every attempt to do better.
+ * `lsp_more` pages through a truncated result and is useless without them.
+ * `lsp_diagnostics` stays out on purpose: gates own the verdict on whether code
+ * is broken, and a reviewer reading a language server's opinion instead invites
+ * findings no build would confirm.
+ */
+export const READ_ONLY_TOOLS = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "lsp_definition",
+  "lsp_references",
+  "lsp_hover",
+  "lsp_document_symbols",
+  "lsp_workspace_symbols",
+  "lsp_more"
+];
 
 const TEXT_BLOCK_TYPES = new Set(["text"]);
 

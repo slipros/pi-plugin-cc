@@ -27,6 +27,7 @@ import {
   resolveWorktreeMount,
   summarizeTreeChanges
 } from "./lib/git.mjs";
+import { resolveGitProxyHosts } from "./lib/git-proxy.mjs";
 import {
   appendLogLine,
   buildStatusSnapshot,
@@ -532,6 +533,9 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     // cache between one's own repositories and keeps a throwaway one for a
     // checkout that arrived from outside.
     sandbox = { ...sandbox, provider: providerOf(settings), isolateCaches: !trusted };
+    // Which forges the run may fetch from is decided here, where the config is
+    // in hand; the proxy itself starts per run, next to the credential one.
+    sandbox = { ...sandbox, gitProxyHosts: resolveGitProxyHosts(config, sandbox) };
     // A worktree cannot see its own repository through /workspace alone, so the
     // shared .git is mounted for it. Listed before the run's own mounts, which
     // therefore win the deduplication if one names the same target explicitly.

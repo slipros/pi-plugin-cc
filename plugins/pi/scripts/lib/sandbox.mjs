@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { concatAdditive } from "./config.mjs";
+import { activeGitProxy, gitProxyConfig } from "./git-proxy.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
 
 /**
@@ -362,9 +363,10 @@ export function buildDockerRunArgs({
   if (sandbox.profileName) {
     args.push("--label", `${LABEL}-profile=${sandbox.profileName}`);
   }
-  if (sandbox.credentialProxy) {
-    // The proxy listens on the host's loopback; this is the name that reaches it
-    // from inside on Linux, where it is not resolvable by default.
+  const gitProxy = activeGitProxy(sandbox);
+  if (sandbox.credentialProxy || gitProxy) {
+    // Both proxies listen on the host's loopback; this is the name that reaches
+    // it from inside on Linux, where it is not resolvable by default.
     args.push("--add-host", "host.docker.internal:host-gateway");
   }
   if (sandbox.concurrencyGroup) {
@@ -458,7 +460,19 @@ export function buildDockerRunArgs({
     }
   }
 
+  const gitconfigTarget = `${CONTAINER_HOME}/.gitconfig`;
+  if (gitProxy) {
+    args.push("-v", `${writeRunGitconfig(gitProxy)}:${gitconfigTarget}:ro`);
+  }
+
   for (const mount of sandbox.mounts ?? []) {
+    // The host's own gitconfig rewrites forge URLs onto ssh, which the image
+    // has no client for; with a proxy running, its rewrites are exactly the
+    // ones that must not win. Docker would refuse the duplicate target anyway,
+    // so a profile that still mounts it is dropped rather than failing the run.
+    if (gitProxy && parseMount(mount).target === gitconfigTarget) {
+      continue;
+    }
     if (isolatesState(sandbox)) {
       const anonymous = anonymousVolumeFor(mount, homeDir);
       if (anonymous) {
@@ -492,11 +506,50 @@ function runConfigDir() {
 }
 
 function writeRunConfig(name, contents) {
+  return writeRunFile(`${name}.${process.pid}.json`, JSON.stringify(contents));
+}
+
+/** Same directory and same permissions, for the files that are not JSON. */
+function writeRunFile(name, contents) {
   const dir = runConfigDir();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, `${name}.${process.pid}.json`);
-  fs.writeFileSync(file, JSON.stringify(contents), { encoding: "utf8", mode: 0o600 });
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, contents, { encoding: "utf8", mode: 0o600 });
   return file;
+}
+
+/**
+ * The container's gitconfig: forge URLs rewritten onto this run's git proxy.
+ *
+ * Written per run because it carries the run token, and readable only by the
+ * caller for the same reason — the file exists on the host, where the token is
+ * still worth something until the run ends.
+ */
+function writeRunGitconfig(gitProxy) {
+  return writeRunFile(`gitconfig-run.${process.pid}`, `${gitProxyConfig(gitProxy)}${hostCheckoutSettings()}`);
+}
+
+/**
+ * Checkout settings carried over from the host's global gitconfig.
+ *
+ * Only the ones that decide what lands in the working tree: with the host file
+ * no longer mounted, an agent on a repository normalized under
+ * `autocrlf = input` would otherwise commit line endings the human never sees.
+ * Identity is deliberately absent: it arrives as the GIT_AUTHOR and
+ * GIT_COMMITTER variables, resolved on the host, where an `includeIf
+ * "gitdir:…"` rule still matches a real path — inside the container the
+ * repository is /workspace and no such rule could ever fire.
+ */
+function hostCheckoutSettings() {
+  const lines = [];
+  for (const key of ["core.autocrlf", "core.eol", "core.ignorecase"]) {
+    const result = spawnSync("git", ["config", "--global", "--get", key], { encoding: "utf8" });
+    const value = result.status === 0 ? result.stdout.trim() : "";
+    if (value) {
+      lines.push(`\t${key.slice("core.".length)} = ${value}`);
+    }
+  }
+  return lines.length ? `[core]\n${lines.join("\n")}\n` : "";
 }
 
 /** auth.json holding the run token instead of the provider's own credential. */

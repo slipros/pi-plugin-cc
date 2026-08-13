@@ -8,6 +8,7 @@ import { budgetExceeded } from "./budget.mjs";
 import { listModels } from "./models.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
+import { startGitProxy } from "./git-proxy.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
@@ -521,6 +522,42 @@ async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
   }
 }
 
+/**
+ * Bring up the git proxy for a sandboxed run that was given forges to reach.
+ *
+ * Never fatal, and for the same reason as the credential proxy: a proxy that
+ * cannot start means a run without git networking — which is how every sandboxed
+ * run behaved before this existed — rather than no run at all.
+ */
+async function openGitProxy(sandbox, onProgress) {
+  if (!isSandboxed(sandbox) || !sandbox.gitProxyHosts) {
+    return null;
+  }
+  try {
+    const proxy = await startGitProxy({
+      hosts: sandbox.gitProxyHosts,
+      onWarning: (message) => onProgress?.({ phase: "working", message })
+    });
+    if (proxy) {
+      onProgress?.({
+        phase: "starting",
+        message: `Git stays on the host: fetch from ${proxy.hosts.map((entry) => entry.host).join(", ")} goes through a run-scoped proxy, push is refused.`
+      });
+    } else {
+      // Silence here would look like a working setup until the agent's first
+      // fetch fails with a rewrite pointing at a proxy that is not listening.
+      onProgress?.({ phase: "starting", message: "Git proxy has no usable host; the run gets no git networking." });
+    }
+    return proxy;
+  } catch (error) {
+    onProgress?.({
+      phase: "starting",
+      message: `Git proxy could not start (${error instanceof Error ? error.message : String(error)}); the run gets no git networking.`
+    });
+    return null;
+  }
+}
+
 export async function runPiTurn({
   cwd,
   prompt,
@@ -552,6 +589,17 @@ export async function runPiTurn({
     // pi is told to use the masked names; the proxy maps them back. Reported
     // usage still names the real model, which is what the journal records.
     options = { ...options, provider: MASKED_PROVIDER, model: MASKED_MODEL };
+  }
+  // Same bargain for forge credentials: the container is handed a run token and
+  // a loopback URL, and the token that can read the repositories never leaves
+  // this process.
+  const gitProxy = await openGitProxy(sandbox, onProgress);
+  if (gitProxy) {
+    sandbox = { ...sandbox, gitProxy: { url: gitProxy.url, token: gitProxy.token, hosts: gitProxy.hosts } };
+  } else if (sandbox?.gitProxy) {
+    // A profile's request for a proxy is not a proxy: left in place it would
+    // reach the sandbox descriptor as if one were running.
+    sandbox = { ...sandbox, gitProxy: null };
   }
   const piArgs = buildPiArgs(options);
   const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
@@ -701,8 +749,9 @@ export async function runPiTurn({
     }
   }
 
-  // The run is over, so the token it was given stops working right here.
+  // The run is over, so the tokens it was given stop working right here.
   await proxy?.close();
+  await gitProxy?.close();
 
   const text = state.assistantTexts.at(-1) ?? "";
   const errors = [...state.errors];

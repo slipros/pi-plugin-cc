@@ -46,6 +46,10 @@ const BUILT_IN = {
   // `"concurrencyGroup": "ollama-pro"` draws from the same three slots. Optional
   // — a profile can also cap itself with `maxConcurrent` and share nothing.
   concurrencyPools: {},
+  // Forges a sandboxed run may fetch from, keyed by host. The credential stays
+  // on the host and the container is given a run token instead; see
+  // `git-proxy.mjs`.
+  gitProxy: {},
   commands: {
     delegate: {},
     review: { systemPrompt: "reviewer", readOnly: true }
@@ -164,6 +168,7 @@ export function mergeConfigLayer(base, layer) {
     presets: mergeNamed(base.presets, layer.presets),
     sandboxProfiles: mergeNamed(base.sandboxProfiles, layer.sandboxProfiles),
     concurrencyPools: { ...base.concurrencyPools, ...(isPlainObject(layer.concurrencyPools) ? layer.concurrencyPools : {}) },
+    gitProxy: mergeNamed(base.gitProxy ?? {}, layer.gitProxy),
     commands: mergeNamed(base.commands, layer.commands)
   };
 }
@@ -192,6 +197,9 @@ const PROJECT_FORBIDDEN_SANDBOX_KEYS = [
   "mode",
   "env",
   "proxyCredentials",
+  // Which forges the run may reach at all: a repository choosing this would be
+  // widening its own network boundary.
+  "gitProxy",
   // Both decide whether this run shares state with the next one. `volume` names
   // the agent directory an untrusted repository would otherwise put back on the
   // shared one, and `isolateCaches` is the switch that separates them at all.
@@ -263,6 +271,15 @@ export function sanitizeProjectLayer(layer, warnings = []) {
     return layer;
   }
   const clean = { ...layer };
+
+  if ("gitProxy" in clean) {
+    // Its entries name a forge and how to obtain a credential for it, and
+    // `tokenCommand` is executed on the host. A checkout describing that would
+    // be choosing both what the run may reach and what runs outside the
+    // container.
+    warnings.push("gitProxy ignored: the project config cannot describe host credentials.");
+    delete clean.gitProxy;
+  }
 
   if (isPlainObject(clean.defaults)) {
     clean.defaults = sanitizeUntrustedEntry(clean.defaults, "defaults", warnings);

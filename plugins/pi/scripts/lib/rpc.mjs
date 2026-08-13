@@ -10,6 +10,8 @@ import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
 import { runCommand } from "./process.mjs";
 import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs, summarizeTiming } from "./pi.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
+import { openGitProxy, withGitProxy } from "./git-proxy.mjs";
+import { settleProxyPorts } from "./proxy-bind.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 const SETTLE_GRACE_MS = 1500;
@@ -109,6 +111,13 @@ export async function runPiRpcTurn({
     // usage still names the real model, which is what the journal records.
     options = { ...options, provider: MASKED_PROVIDER, model: MASKED_MODEL };
   }
+  // Same bargain for forge credentials: the container gets a run token and a
+  // loopback URL, and the token that can read the repositories stays here.
+  const gitProxy = await openGitProxy(sandbox, onProgress);
+  sandbox = withGitProxy(sandbox, gitProxy);
+  // Both proxies bind loopback, and the hop that carries the container's
+  // connections there needs a moment to notice them.
+  await settleProxyPorts(proxy, gitProxy);
   const piArgs = buildPiArgs({ ...options, mode: "rpc" });
   const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
@@ -371,6 +380,7 @@ export async function runPiRpcTurn({
 
   // The run is over, so the token it was given stops working right here.
   await proxy?.close();
+  await gitProxy?.close();
 
   const text = state.assistantTexts.at(-1) ?? "";
   const errors = [...state.errors];

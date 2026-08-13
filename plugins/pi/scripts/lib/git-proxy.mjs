@@ -259,6 +259,58 @@ export function activeGitProxy(sandbox) {
 }
 
 /**
+ * Bring up the git proxy for a run that was given forges to reach.
+ *
+ * Lives here rather than beside either engine because there are two of them —
+ * json and rpc — and a boundary that exists in one but not the other is worse
+ * than no boundary at all: the run that skips it looks identical from outside.
+ *
+ * Never fatal: a proxy that cannot start means a run without git networking,
+ * which is how every sandboxed run behaved before this existed.
+ */
+export async function openGitProxy(sandbox, onProgress) {
+  // `gitProxyHosts` is only ever set for a sandboxed run, so its presence is the
+  // check — importing `isSandboxed` from sandbox.mjs would close an import loop,
+  // since that module needs the config writer below.
+  if (!sandbox?.gitProxyHosts) {
+    return null;
+  }
+  try {
+    const proxy = await startGitProxy({
+      hosts: sandbox.gitProxyHosts,
+      onWarning: (message) => onProgress?.({ phase: "working", message })
+    });
+    if (proxy) {
+      onProgress?.({
+        phase: "starting",
+        message: `Git stays on the host: fetch from ${proxy.hosts.map((entry) => entry.host).join(", ")} goes through a run-scoped proxy, push is refused.`
+      });
+    } else {
+      // Silence here would look like a working setup until the agent's first
+      // fetch fails against a rewrite pointing at a proxy that is not listening.
+      onProgress?.({ phase: "starting", message: "Git proxy has no usable host; the run gets no git networking." });
+    }
+    return proxy;
+  } catch (error) {
+    onProgress?.({
+      phase: "starting",
+      message: `Git proxy could not start (${error instanceof Error ? error.message : String(error)}); the run gets no git networking.`
+    });
+    return null;
+  }
+}
+
+/** The sandbox descriptor a started proxy produces, or one with no stale request. */
+export function withGitProxy(sandbox, proxy) {
+  if (proxy) {
+    return { ...sandbox, gitProxy: { url: proxy.url, token: proxy.token, hosts: proxy.hosts } };
+  }
+  // A profile's request for a proxy is not a proxy: left in place it would reach
+  // the sandbox descriptor as if one were running.
+  return sandbox?.gitProxy ? { ...sandbox, gitProxy: null } : sandbox;
+}
+
+/**
  * Start the git proxy for one run.
  *
  * @returns {Promise<{ url: string, token: string, hosts: string[], stats: () => object, close: () => Promise<void> } | null>}
@@ -434,9 +486,19 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
 export function gitProxyConfig(proxy) {
   const base = String(proxy.url).replace(/\/$/, "");
   const authority = base.replace(/^https?:\/\//, "");
-  const lines = [];
+  const lines = [
+    // The token is handed over by a helper rather than written into the remote
+    // URL. In the URL it would be echoed by `git remote -v`, by every clone line
+    // and by most of git's error messages — straight into the run transcript,
+    // which is archived. Here it lives in one root-readable file the agent could
+    // read but has no reason to print.
+    `[credential "${base}"]`,
+    `\tusername = git`,
+    `\thelper = "!f() { test \\"$1\\" = get && echo password=${proxy.token}; }; f"`,
+    ""
+  ];
   for (const { host, sshPorts = [] } of proxy.hosts) {
-    const through = `http://git:${proxy.token}@${authority}/${host}/`;
+    const through = `${base}/${host}/`;
     lines.push(
       `[url "${through}"]`,
       `\tinsteadOf = https://${host}/`,

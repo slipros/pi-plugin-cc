@@ -215,7 +215,11 @@ test("the container's gitconfig rewrites every form a remote can take", () => {
   assert.match(config, /insteadOf = git@git\.example:/);
   assert.match(config, /insteadOf = ssh:\/\/git@git\.example\//);
   assert.match(config, /insteadOf = ssh:\/\/git@git\.example:2222\//);
-  assert.match(config, /url "http:\/\/git:pi-git-test@host\.docker\.internal:41234\/git\.example\/"/);
+  assert.match(config, /url "http:\/\/host\.docker\.internal:41234\/git\.example\/"/);
+  // The run token reaches git through a helper, never through a URL git echoes.
+  assert.ok(!/insteadOf.*pi-git-test/.test(config));
+  assert.match(config, /\[credential "http:\/\/host\.docker\.internal:41234"\]/);
+  assert.match(config, /password=pi-git-test/);
   // The forge credential is the one thing that must not be in a file the
   // container can read.
   assert.ok(!config.includes(REAL_TOKEN));

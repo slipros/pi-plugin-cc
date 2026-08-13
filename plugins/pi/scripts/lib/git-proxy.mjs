@@ -17,7 +17,7 @@
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 
 import { PROXY_BIND_ADDRESS } from "./proxy-bind.mjs";
 
@@ -83,22 +83,27 @@ const STRIPPED_RESPONSE_HEADERS = [
  * decision: a literal for a scratch setup, an environment variable for CI, a
  * command for a secret manager. The value is held in this process only.
  */
-function resolveSecret(spec, hostKey) {
+async function resolveSecret(spec, hostKey) {
   if (spec.token) {
-    return String(spec.token);
+    return normalizeSecret(spec.token);
   }
   if (spec.tokenEnv) {
-    const value = process.env[spec.tokenEnv];
-    return value ? String(value) : null;
+    return normalizeSecret(process.env[spec.tokenEnv]);
   }
   if (spec.tokenCommand) {
-    // stderr is dropped rather than reported: a failing secret manager tends to
-    // echo back what it was asked for, and that is the one string that must not
-    // reach a warning, a journal or a transcript.
-    const output = execFileSync("/bin/sh", ["-c", String(spec.tokenCommand)], {
-      encoding: "utf8",
-      timeout: SECRET_COMMAND_TIMEOUT_MS,
-      stdio: ["ignore", "pipe", "ignore"]
+    // Asynchronous on purpose. A secret manager that hangs would otherwise hold
+    // the host's event loop for the whole timeout — per host, one after another —
+    // and everything else this process is doing stops with it.
+    const output = await new Promise((resolve, reject) => {
+      // stderr is dropped rather than reported: a failing secret manager tends to
+      // echo back what it was asked for, and that is the one string that must not
+      // reach a warning, a journal or a transcript.
+      execFile(
+        "/bin/sh",
+        ["-c", String(spec.tokenCommand)],
+        { encoding: "utf8", timeout: SECRET_COMMAND_TIMEOUT_MS },
+        (error, stdout) => (error ? reject(error) : resolve(stdout))
+      );
     });
     return normalizeSecret(output);
   }
@@ -113,18 +118,37 @@ function resolveSecret(spec, hostKey) {
  * plain command instead of a pipeline of `cut` and `tr` that nobody can read.
  * The prefix is only stripped when it is shaped like a variable name, so a token
  * that itself contains `=` (base64 padding, `glpat-…=`) is left alone.
+ *
+ * Applied to every source, not just a command: a token with a stray newline —
+ * from an env var, a multi-line manager, a literal with a typo — becomes an
+ * `Authorization` header value, and node throws `ERR_INVALID_CHAR` on the first
+ * request. Unhandled that used to take the host process down, so the value is
+ * reduced to one clean line here and refused if a control character remains.
  */
 function normalizeSecret(output) {
-  let value = String(output ?? "").trim();
-  const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(value);
+  // Line-oriented: a manager may print a banner before the value, so the last
+  // non-empty line is the token. \r is stripped so a CRLF source does not smuggle
+  // a carriage return into the header.
+  const lines = String(output ?? "")
+    .split("\n")
+    .map((line) => line.replace(/\r$/, "").trim())
+    .filter(Boolean);
+  let value = lines.at(-1) ?? "";
+
+  const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(value);
   if (assignment) {
     value = assignment[2].trim();
   }
-  const quoted = /^(["'])(.*)\1$/s.exec(value);
+  const quoted = /^(["'])(.*)\1$/.exec(value);
   if (quoted) {
     value = quoted[2];
   }
-  return value || null;
+  // A header value cannot hold a control character; a token that still has one
+  // is malformed, and forwarding it would crash the request rather than fail it.
+  if (!value || /[\x00-\x1f\x7f]/.test(value)) {
+    return null;
+  }
+  return value;
 }
 
 /** `Authorization` value for the forge, from whichever scheme the host uses. */
@@ -342,8 +366,9 @@ export async function openGitProxy(sandbox, onProgress) {
   if (!sandbox?.gitProxyHosts) {
     return null;
   }
+  let proxy = null;
   try {
-    const proxy = await startGitProxy({
+    proxy = await startGitProxy({
       hosts: sandbox.gitProxyHosts,
       onWarning: (message) => onProgress?.({ phase: "working", message })
     });
@@ -359,6 +384,9 @@ export async function openGitProxy(sandbox, onProgress) {
     }
     return proxy;
   } catch (error) {
+    // The listener may already be up when onProgress throws — closing it here is
+    // the only chance, since a null return means nobody downstream will.
+    await proxy?.close();
     onProgress?.({
       phase: "starting",
       message: `Git proxy could not start (${error instanceof Error ? error.message : String(error)}); the run gets no git networking.`
@@ -386,15 +414,27 @@ export function withGitProxy(sandbox, proxy) {
  */
 export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } = {}) {
   const hosts = new Map();
-  for (const [hostKey, rawSpec] of Object.entries(hostSpecs ?? {})) {
-    const spec = rawSpec === true ? {} : rawSpec;
-    if (!spec || typeof spec !== "object" || spec.enabled === false) {
+  // Resolved in parallel: each host may shell out to a secret manager, and a run
+  // should wait for the slowest one, not for their sum.
+  const resolved = await Promise.all(
+    Object.entries(hostSpecs ?? {}).map(async ([hostKey, rawSpec]) => {
+      const spec = rawSpec === true ? {} : rawSpec;
+      if (!spec || typeof spec !== "object" || spec.enabled === false) {
+        return null;
+      }
+      try {
+        return { hostKey, spec, secret: await resolveSecret(spec, hostKey) };
+      } catch (error) {
+        return { hostKey, spec, error };
+      }
+    })
+  );
+  for (const entry of resolved) {
+    if (!entry) {
       continue;
     }
-    let secret = null;
-    try {
-      secret = resolveSecret(spec, hostKey);
-    } catch (error) {
+    const { hostKey, spec, secret, error } = entry;
+    if (error) {
       onWarning?.(`Git proxy: ${hostKey} unavailable (${error instanceof Error ? error.message : String(error)}).`);
       continue;
     }
@@ -434,8 +474,30 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
   // kept apart from `rejected`: mixing them would make normal traffic look like
   // something was trying tokens.
   const counters = { requests: 0, blocked: 0, challenged: 0, rejected: 0, upstream_errors: 0 };
+  // Outgoing requests in flight. `server.close()` only reaches the client side of
+  // each hop; a fetch streaming a packfile from the forge lives on its own
+  // socket, with the real token in its headers, and would outlive the run — the
+  // one credential the whole design keeps off the clock. Destroyed on close.
+  const upstreamSockets = new Set();
 
   const server = http.createServer((request, response) => {
+    // The whole handler runs guarded. The container controls the request, and a
+    // few of the calls below throw on malformed input the agent can send at
+    // will: decodeURIComponent on a bad `%` escape, new URL on a misconfigured
+    // upstream, http.request on a header with a control character. Unhandled,
+    // any of them takes down the host process — this listener runs in the
+    // companion, not the sandbox — which the agent could trigger with one curl.
+    try {
+      handleRequest(request, response);
+    } catch (error) {
+      counters.upstream_errors += 1;
+      onWarning?.(`Git proxy rejected a request: ${error instanceof Error ? error.message : String(error)}`);
+      request.resume();
+      plainText(response, 400, "Bad request.");
+    }
+  });
+
+  function handleRequest(request, response) {
     const offered = offeredToken(request.headers.authorization);
     if (offered == null) {
       // git sends credentials only after being asked. Without this challenge
@@ -482,6 +544,13 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
         current.target,
         { method: request.method, headers, timeout: UPSTREAM_IDLE_TIMEOUT_MS },
         (upstreamResponse) => {
+          // A client that hung up — the agent cancelled its fetch, the container
+          // was killed — must not leave the forge streaming into nothing.
+          response.on("close", () => {
+            if (!response.writableEnded) {
+              proxied.destroy();
+            }
+          });
           const status = upstreamResponse.statusCode ?? 502;
           if (status >= 300 && status < 400) {
             // Followed here rather than handed to the client. GitLab answers the
@@ -527,7 +596,18 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
       proxied.on("error", (error) => {
         counters.upstream_errors += 1;
         onWarning?.(`Git proxy could not reach ${current.host.key}: ${error.message}`);
-        plainText(response, 502, `Proxy could not reach ${current.host.key}: ${error.message}`);
+        // Headers may already be on their way to the client from an earlier hop;
+        // appending an error string to a packfile makes git reject a truncated
+        // body it cannot explain. Once committed, drop the socket instead.
+        if (response.headersSent) {
+          response.destroy();
+        } else {
+          plainText(response, 502, `Proxy could not reach ${current.host.key}: ${error.message}`);
+        }
+      });
+      proxied.on("socket", (socket) => {
+        upstreamSockets.add(socket);
+        socket.on("close", () => upstreamSockets.delete(socket));
       });
       request.on("error", () => proxied.destroy());
       // Only the first attempt still has a body to send; a redirect is followed
@@ -540,8 +620,7 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
     };
 
     forward(route, 0);
-
-  });
+  }
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -562,9 +641,14 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
     async close() {
       await new Promise((resolve) => {
         server.close(() => resolve());
-        // A fetch still streaming holds its socket; a run that is over does not
-        // wait for it.
+        // The client side of each hop; the run is over and does not wait on it.
         server.closeAllConnections?.();
+        // The forge side, which server.close never touches — a live fetch would
+        // otherwise keep streaming (real token in its headers) past the run.
+        for (const socket of upstreamSockets) {
+          socket.destroy();
+        }
+        upstreamSockets.clear();
       });
     }
   };

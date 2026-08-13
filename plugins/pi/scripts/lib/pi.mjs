@@ -9,6 +9,7 @@ import { listModels } from "./models.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
 import { startGitProxy } from "./git-proxy.mjs";
+import { settleProxyPorts } from "./proxy-bind.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
@@ -601,6 +602,10 @@ export async function runPiTurn({
     // reach the sandbox descriptor as if one were running.
     sandbox = { ...sandbox, gitProxy: null };
   }
+  // Both proxies bind loopback, and the hop that carries the container's
+  // connections there needs a moment to notice them. Waited out once, before the
+  // container exists, rather than paid for by whichever request goes first.
+  await settleProxyPorts(proxy, gitProxy);
   const piArgs = buildPiArgs(options);
   const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
   const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });

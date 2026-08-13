@@ -10,6 +10,7 @@ import http from "node:http";
 import test from "node:test";
 
 import { activeGitProxy, gitProxyConfig, resolveGitProxyHosts, startGitProxy } from "../lib/git-proxy.mjs";
+import { PROXY_BIND_ADDRESS } from "../lib/proxy-bind.mjs";
 import { buildDockerRunArgs } from "../lib/sandbox.mjs";
 
 const REAL_TOKEN = "forge-secret-token";
@@ -258,6 +259,25 @@ test("a profile narrows the host table, and false opts out", () => {
   assert.deepEqual(Object.keys(resolveGitProxyHosts(config, { gitProxy: ["b.test"] })), ["b.test"]);
   assert.equal(resolveGitProxyHosts(config, { gitProxy: false }), null);
   assert.equal(resolveGitProxyHosts({}, {}), null);
+});
+
+test("the proxy holding real forge tokens stays off the network", async () => {
+  // A wider bind would expose a credential-holding listener to everything that
+  // can route to this host; the container does not need it to reach the proxy.
+  assert.equal(PROXY_BIND_ADDRESS, "127.0.0.1");
+
+  const upstream = await startUpstream();
+  const proxy = await startGitProxy({ hosts: { "forge.test": { upstream: upstream.origin, token: REAL_TOKEN } } });
+  const bound = await new Promise((resolve) => {
+    const probe = http.get(`http://127.0.0.1:${new URL(proxy.url).port}/`, (response) => {
+      response.resume();
+      resolve(response.socket.localAddress);
+    });
+    probe.on("error", () => resolve(null));
+  });
+  assert.equal(bound, "127.0.0.1");
+  await proxy.close();
+  upstream.server.close();
 });
 
 test("a profile asking for a proxy is not mistaken for a running one", () => {

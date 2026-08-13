@@ -1,5 +1,5 @@
 /**
- * Run: node --test scripts/tests/git-proxy.e2e.test.mjs
+ * Run: npm test — or node --test tests/git-proxy.e2e.test.mjs
  *
  * The client here is the real `git`, against a real `git http-backend`. What the
  * unit tests cannot answer is whether git actually authenticates the way the
@@ -15,7 +15,7 @@ import path from "node:path";
 import test from "node:test";
 import { spawn } from "node:child_process";
 
-import { gitProxyConfig, startGitProxy } from "../lib/git-proxy.mjs";
+import { gitProxyConfig, startGitProxy } from "../plugins/pi/scripts/lib/git-proxy.mjs";
 
 const REAL_TOKEN = "upstream-token";
 

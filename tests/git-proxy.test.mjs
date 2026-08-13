@@ -1,5 +1,5 @@
 /**
- * Run: node --test scripts/tests/git-proxy.test.mjs
+ * Run: npm test — or node --test tests/git-proxy.test.mjs
  *
  * The upstream here is a local server standing in for a forge: what matters is
  * which requests reach it, and with which credential.
@@ -9,9 +9,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
 
-import { activeGitProxy, gitProxyConfig, resolveGitProxyHosts, startGitProxy } from "../lib/git-proxy.mjs";
-import { PROXY_BIND_ADDRESS } from "../lib/proxy-bind.mjs";
-import { buildDockerRunArgs } from "../lib/sandbox.mjs";
+import { activeGitProxy, gitProxyConfig, resolveGitProxyHosts, startGitProxy } from "../plugins/pi/scripts/lib/git-proxy.mjs";
+import { PROXY_BIND_ADDRESS } from "../plugins/pi/scripts/lib/proxy-bind.mjs";
+import { buildDockerRunArgs } from "../plugins/pi/scripts/lib/sandbox.mjs";
 
 const REAL_TOKEN = "forge-secret-token";
 
@@ -318,6 +318,34 @@ test("a token that itself contains = survives intact", async () => {
   upstream.server.close();
 });
 
+test("a token is cleaned and control-character junk is refused", async () => {
+  const upstream = await startUpstream();
+  // A banner line before the value, a trailing newline, and a literal with a
+  // stray newline — all reduce to the clean token, none reach a header raw.
+  for (const [command, expected] of [
+    [`printf 'Loaded from cache\nGL_TOKEN=realtok\n'`, "realtok"],
+    [`printf 'realtok\r\n'`, "realtok"]
+  ]) {
+    const proxy = await startGitProxy({ hosts: { "forge.test": { upstream: upstream.origin, user: "oauth2", tokenCommand: command } } });
+    const base = proxy.url.replace("host.docker.internal", "127.0.0.1");
+    const response = await call(base, "/forge.test/repo.git/info/refs?service=git-upload-pack", { token: proxy.token });
+    assert.equal(response.status, 200);
+    const decoded = Buffer.from(upstream.seen.at(-1).authorization.replace(/^Basic\s+/, ""), "base64").toString("utf8");
+    assert.equal(decoded, `oauth2:${expected}`);
+    await proxy.close();
+  }
+
+  // A token that is only a control character resolves to nothing: the host is
+  // dropped with a warning instead of crashing the request.
+  const warnings = [];
+  const broken = await startGitProxy({
+    hosts: { "forge.test": { upstream: upstream.origin, token: "\n\n" } },
+    onWarning: (message) => warnings.push(message)
+  });
+  assert.equal(broken, null);
+  assert.ok(warnings.some((w) => w.includes("resolved empty")));
+  upstream.server.close();
+});
 test("a profile narrows the host table, and false opts out", () => {
   const config = { gitProxy: { "a.test": { token: "x" }, "b.test": { token: "y" } } };
   assert.deepEqual(Object.keys(resolveGitProxyHosts(config, {})), ["a.test", "b.test"]);
@@ -366,4 +394,34 @@ test("a run with a proxy mounts its own gitconfig instead of the host's", () => 
   assert.equal(gitconfigMounts.length, 1);
   assert.ok(!gitconfigMounts[0].startsWith(`${process.env.HOME}/.gitconfig`));
   assert.ok(args.includes("host.docker.internal:host-gateway"));
+});
+
+test("a malformed request cannot crash the host process", async () => {
+  // decodeURIComponent throws on a bad % escape, and the handler runs in the
+  // companion, not the sandbox. Unguarded, one curl from inside the container
+  // takes the host process down. The agent legitimately holds the run token, so
+  // it reaches this path.
+  await withProxy({}, async ({ base, proxy }) => {
+    const raw = await new Promise((resolve, reject) => {
+      const url = new URL(base);
+      const request = http.request(
+        {
+          host: url.hostname,
+          port: url.port,
+          path: "/%zz/repo.git/info/refs?service=git-upload-pack",
+          headers: { authorization: `Basic ${Buffer.from(`git:${proxy.token}`).toString("base64")}` }
+        },
+        (response) => {
+          response.resume();
+          response.on("end", () => resolve(response.statusCode));
+        }
+      );
+      request.on("error", reject);
+      request.end();
+    });
+    assert.equal(raw, 400);
+    // The proxy is still answering — the process did not die.
+    const ok = await call(base, "/forge.test/repo.git/info/refs?service=git-upload-pack", { token: proxy.token });
+    assert.equal(ok.status, 200);
+  });
 });

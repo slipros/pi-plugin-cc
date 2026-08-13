@@ -122,6 +122,16 @@ export async function runPiRpcTurn({
   // container that fails to spawn, a budget that stops the turn. Any of those
   // used to leave the listener alive with a live forge token behind it.
   const closeProxies = async () => {
+    // Read before close, reported to the run header: a push the agent tried is
+    // otherwise invisible — it fails inside the container and the host only sees
+    // a 403 count that goes nowhere. Same for a run token someone else probed.
+    const git = gitProxy?.stats?.();
+    if (git && (git.blocked || git.rejected)) {
+      const parts = [];
+      if (git.blocked) parts.push(`${git.blocked} push/dumb-http request(s) refused`);
+      if (git.rejected) parts.push(`${git.rejected} request(s) with a wrong run token`);
+      onProgress?.({ phase: "working", message: `Git proxy blocked ${parts.join(", ")}.` });
+    }
     await proxy?.close();
     await gitProxy?.close();
   };

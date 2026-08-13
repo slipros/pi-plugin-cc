@@ -526,7 +526,10 @@ function writeRunFile(name, contents) {
  * still worth something until the run ends.
  */
 function writeRunGitconfig(gitProxy) {
-  return writeRunFile(`gitconfig-run.${process.pid}`, `${gitProxyConfig(gitProxy)}${hostCheckoutSettings()}`);
+  // `.${pid}.conf`, not `.${pid}`: the sweep in `cleanupCredentialSlices` matches
+  // `.<pid>.`, so a name ending on the pid was invisible to it and a file holding
+  // the run token lingered until some later run aged it out.
+  return writeRunFile(`gitconfig-run.${process.pid}.conf`, `${gitProxyConfig(gitProxy)}${hostCheckoutSettings()}`);
 }
 
 /**

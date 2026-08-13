@@ -425,3 +425,39 @@ test("a malformed request cannot crash the host process", async () => {
     assert.equal(ok.status, 200);
   });
 });
+
+test("a 304 is passed through, not mistaken for a redirect", async () => {
+  const handler = (request, response) => {
+    response.writeHead(304);
+    response.end();
+  };
+  await withProxy({ handler }, async ({ base, proxy }) => {
+    const response = await call(base, "/forge.test/repo.git/info/refs?service=git-upload-pack", { token: proxy.token });
+    assert.equal(response.status, 304);
+  });
+});
+
+test("percent-encoded traversal is refused, not forwarded", async () => {
+  // fetch normalises a literal `..` away before sending, so an attacker sends
+  // `%2e%2e`; the segments are decoded before the check, so it is caught.
+  await withProxy({}, async ({ base, proxy, upstream }) => {
+    const raw = await new Promise((resolve) => {
+      const url = new URL(base);
+      const request = http.request(
+        {
+          host: url.hostname,
+          port: url.port,
+          path: "/forge.test/%2e%2e/evil/info/refs?service=git-upload-pack",
+          headers: { authorization: `Basic ${Buffer.from(`git:${proxy.token}`).toString("base64")}` }
+        },
+        (response) => {
+          response.resume();
+          response.on("end", () => resolve(response.statusCode));
+        }
+      );
+      request.end();
+    });
+    assert.equal(raw, 400);
+    assert.equal(upstream.seen.length, 0);
+  });
+});

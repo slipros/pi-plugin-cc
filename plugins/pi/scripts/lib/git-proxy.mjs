@@ -38,6 +38,13 @@ const RECEIVE_PACK = "git-receive-pack";
 const MAX_UPSTREAM_HOPS = 3;
 
 /**
+ * Statuses that carry a Location worth following. Not the whole 3xx range: 304
+ * Not Modified has no Location, and treating it as a redirect turned a
+ * conditional GET into a 502.
+ */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/**
  * Headers that belong to the hop, not the message, plus the ones this proxy
  * owns. `authorization` especially: whatever the container sent authenticated
  * it to the proxy and must never reach the forge.
@@ -197,7 +204,12 @@ function resolveRoute(rawUrl, method, hosts) {
   } catch {
     return { error: "Invalid request path." };
   }
-  const segments = parsed.pathname.split("/").filter(Boolean);
+  // Decoded before the `..` check, not after: `fetch` normalises a literal `..`
+  // away before it is ever sent, so the segment that actually arrives is
+  // `%2e%2e`, and comparing raw segments would wave it straight through to the
+  // upstream path. decodeURIComponent can throw on a bad escape (`%zz`), which
+  // the caller's try/catch turns into a 400 rather than a crash.
+  const segments = parsed.pathname.split("/").filter(Boolean).map((segment) => decodeURIComponent(segment));
   if (segments.length < 2) {
     return { error: "Path must start with a configured forge host." };
   }
@@ -206,7 +218,7 @@ function resolveRoute(rawUrl, method, hosts) {
   if (segments.some((segment) => segment === "..")) {
     return { error: "Invalid request path." };
   }
-  const hostKey = decodeURIComponent(segments[0]);
+  const hostKey = segments[0];
   const host = hosts.get(hostKey);
   if (!host) {
     return { error: `Host "${hostKey}" is not configured for this run.` };
@@ -237,7 +249,7 @@ function resolveRoute(rawUrl, method, hosts) {
   const target = new URL(host.upstream);
   target.pathname = `${target.pathname.replace(/\/$/, "")}${repoPath}`;
   target.search = parsed.search;
-  return { host, target, repoPath, search: parsed.search, write: isReceivePack };
+  return { host, target, repoPath, search: parsed.search };
 }
 
 /**
@@ -552,7 +564,7 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
             }
           });
           const status = upstreamResponse.statusCode ?? 502;
-          if (status >= 300 && status < 400) {
+          if (REDIRECT_STATUSES.has(status)) {
             // Followed here rather than handed to the client. GitLab answers the
             // `.git`-less URL that `go` probes with a 301 to the canonical one,
             // and a client following it re-authenticates against what it sees as

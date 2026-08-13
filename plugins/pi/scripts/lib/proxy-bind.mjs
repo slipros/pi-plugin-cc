@@ -15,8 +15,23 @@
  */
 export const PROXY_BIND_ADDRESS = process.env.PI_PROXY_BIND || "127.0.0.1";
 
-/** Grace period before the container may dial a freshly bound proxy. */
-export const PROXY_SETTLE_MS = Number.parseInt(process.env.PI_PROXY_SETTLE_MS ?? "", 10) || 1000;
+/**
+ * Grace period before the container may dial a freshly bound proxy.
+ *
+ * `?? 1000` rather than `|| 1000` so an explicit `PI_PROXY_SETTLE_MS=0` turns
+ * the wait off, as documented — `||` treated 0 as "unset" and forced the
+ * default back on. A negative or unparseable value falls back to the default.
+ */
+function resolveSettleMs() {
+  const raw = process.env.PI_PROXY_SETTLE_MS;
+  if (raw == null || raw.trim() === "") {
+    return 1000;
+  }
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value >= 0 ? value : 1000;
+}
+
+export const PROXY_SETTLE_MS = resolveSettleMs();
 
 /**
  * Give the port forwarder time to pick up the listeners this run just opened.

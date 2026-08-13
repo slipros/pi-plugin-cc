@@ -731,6 +731,45 @@ export function sandboxPreflight(sandbox) {
  * Warn about settings that mean something different inside the container than
  * they do on the host.
  */
+/**
+ * Isolation a profile gave away through raw docker arguments.
+ *
+ * `args` is an escape hatch, so the flags that matter most for the boundary
+ * arrive as opaque strings — a profile can hand the container the host's docker
+ * socket or drop seccomp entirely and nothing would say so. Read here and named
+ * in the run header, because the difference between profiles is otherwise
+ * invisible at the moment it matters.
+ */
+function relaxedIsolationWarnings(sandbox) {
+  const args = (sandbox.args ?? []).map(String);
+  const line = args.join(" ");
+  const warnings = [];
+
+  if (args.includes("--privileged")) {
+    warnings.push("Sandbox runs `--privileged`: the container reaches the host's devices, which is not a boundary.");
+  }
+  if (/seccomp=unconfined/.test(line)) {
+    warnings.push("Sandbox disables seccomp entirely; every syscall the kernel has is reachable from the agent.");
+  } else if (/--security-opt\s*$|seccomp=/.test(line)) {
+    warnings.push("Sandbox replaces the default seccomp profile; it allows syscalls docker would refuse.");
+  }
+  if (/apparmor=unconfined/.test(line)) {
+    warnings.push("Sandbox disables AppArmor confinement.");
+  }
+  if (/systempaths=unconfined/.test(line)) {
+    warnings.push("Sandbox unmasks /proc: /proc/kcore and /proc/sysrq-trigger are reachable from the container.");
+  }
+  for (const [index, value] of args.entries()) {
+    if (value === "--device" && args[index + 1]) {
+      warnings.push(`Sandbox passes the host device ${args[index + 1]} into the container.`);
+    }
+  }
+  if ((sandbox.mounts ?? []).some((mount) => String(mount).includes("docker.sock"))) {
+    warnings.push("Sandbox mounts the host docker socket: containers it starts run on the host, as root.");
+  }
+  return warnings;
+}
+
 export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], skills = [] } = {}) {
   if (!isSandboxed(sandbox)) {
     return [];
@@ -743,6 +782,7 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
   if (sandbox.agentDir === "host") {
     warnings.push("Sandbox mounts the host `~/.pi/agent`, so container code can read host sessions and credentials.");
   }
+  warnings.push(...relaxedIsolationWarnings(sandbox));
 
   // Paths the container does have: the workspace, the agent dir, the system
   // directories the image itself provides (a globally installed extension lives

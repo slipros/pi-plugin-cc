@@ -258,6 +258,34 @@ fatal: unable to access '…': The requested URL returned error: 403
 
 Единственная тонкость — гонка: форвардер замечает свежий слушающий сокет не мгновенно (замерено меньше 300 мс: запрос через ~320 мс после `listen` не соединяется, через ~580 мс проходит). Поэтому прогон один раз выжидает `PI_PROXY_SETTLE_MS` (по умолчанию 1000) до старта контейнера, вместо того чтобы уронить первый же запрос к модели или fetch.
 
+### Контейнеры внутри песочницы: профиль go-dind
+
+Тесты на `testcontainers-go` поднимают БД контейнером — в обычном профиле такого нет и быть не должно. Профиль `go-dind` даёт прогону **свой** rootless-демон: его контейнеры живут внутри песочницы, умирают вместе с ней и в `docker ps` на хосте не видны.
+
+```bash
+delegate --sandbox go-dind "почини интеграционные тесты advertising-api"
+sandbox build go-dind      # образ собирается отдельно от go
+```
+
+Ни хостового сокета, ни `--privileged`. Всё, что понадобилось (замерено, не взято из инструкции):
+
+| Что | Зачем |
+|---|---|
+| `--security-opt seccomp=dind-seccomp.json` | дефолтный профиль docker блокирует `unshare`/`mount`/`clone` с `CLONE_NEW*` — без них rootless не стартует |
+| `--device /dev/net/tun` | RootlessKit создаёт tap-интерфейс; без него падает на `ip tuntap add` |
+| `DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS=--pidns` | со своим PID namespace демон получает собственный `/proc` и может писать sysctl в свои сетевые namespace |
+| volume под `~/.local/share/docker` | иначе образы качаются заново каждый прогон |
+| `TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1` | иначе testcontainers адресует контейнеры через `172.17.0.1` и виснет на проверке готовности |
+| `TESTCONTAINERS_RYUK_DISABLED=true` | уборщик не нужен: всё внутри умирает вместе с песочницей |
+
+**Не понадобились:** `apparmor=unconfined` (на Docker Desktop AppArmor не активен), `systempaths=unconfined` (`/proc/kcore` и `/proc/sysrq-trigger` остаются замаскированными), `--device /dev/fuse` (overlay2 работает поверх volume), `--privileged`.
+
+**Профиль seccomp** генерируется из профиля rootless podman (`containers/common`) скриптом `make-dind-seccomp.py` рядом с Dockerfile. Он разрешает четыре сисколла, которые upstream держит за `CAP_SYS_ADMIN`: `sethostname`, `setdomainname`, `setns`, `chroot`. Их выполняет вложенный runc, а docker сверяет capability-гейт с правами **внешнего** контейнера, где этой capability нет. Разрешение сисколла не даёт привилегии: ядро по-прежнему требует `CAP_SYS_ADMIN` в том namespace, которым владеет вызывающий — он есть у вложенного рантайма и отсутствует у процесса, который полез бы к хосту.
+
+**Версия docker в образе закреплена на 28.x.** В 29.x скрипт запуска пишет `net.ipv4.ip_forward` через sysctl и падает на read-only `/proc/sys`; лечится это только `systempaths=unconfined`, то есть возвратом доступа к `/proc/kcore` ради одного sysctl.
+
+**Остаточный риск.** Агент может создавать user namespace и монтировать внутри него — побег отсюда только через уязвимость ядра, не через штатный механизм. У него по-прежнему нет хостового демона, устройств хоста, немаскированного `/proc` и `CAP_SYS_ADMIN` снаружи. Прогон, ослабляющий изоляцию, теперь сам об этом сообщает: `Sandbox replaces the default seccomp profile…`, `Sandbox passes the host device /dev/net/tun…`.
+
 ### Другой каталог: --cwd
 
 Агент может работать не там, где ты стоишь:

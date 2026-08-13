@@ -563,200 +563,217 @@ export async function runPiTurn({
   // Both proxies bind loopback, and the hop that carries the container's
   // connections there needs a moment to notice them. Waited out once, before the
   // container exists, rather than paid for by whichever request goes first.
+  // Registered the moment both exist, because everything between here and the
+  // end of the run can throw: a queue that gives up waiting for a slot, a
+  // container that fails to spawn, a budget that stops the turn. Any of those
+  // used to leave the listener alive with a live forge token behind it.
+  const closeProxies = async () => {
+    await proxy?.close();
+    await gitProxy?.close();
+  };
   await settleProxyPorts(proxy, gitProxy);
   const piArgs = buildPiArgs(options);
-  const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
-  const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
-  const state = createTurnState();
-  const report = (event) => {
-    if (event && onProgress) {
-      onProgress(event);
-    }
-  };
+  // The body runs inside a closure so the proxies are closed on every exit
+  // from here on, not only the one that reaches the end: a slot wait that
+  // gives up, a container that fails to spawn and a thrown budget stop all
+  // used to leave a listener alive with a live forge token behind it.
+  const runTurn = async () => {
+    const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
+    const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
+    const state = createTurnState();
+    const report = (event) => {
+      if (event && onProgress) {
+        onProgress(event);
+      }
+    };
 
-  report({ phase: "starting", message: `Running ${launch.command} ${redactArgs(launch.args)}` });
+    report({ phase: "starting", message: `Running ${launch.command} ${redactArgs(launch.args)}` });
 
-  // detached puts pi in its own process group, so cancelling a job can take
-  // down the tools it spawned without touching the caller's shell.
-  const child = spawn(launch.command, launch.args, {
-    cwd,
-    env,
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: process.platform !== "win32"
-  });
+    // detached puts pi in its own process group, so cancelling a job can take
+    // down the tools it spawned without touching the caller's shell.
+    const child = spawn(launch.command, launch.args, {
+      cwd,
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32"
+    });
 
-  onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
-  // `spawn` returns before the docker client has even exec'd, so releasing here
-  // would restore the very race the reservation exists for. The reservation
-  // expires on its own; releasing it early is only an optimisation, and it can
-  // wait until the container is actually visible.
-  const releaseSlotWhenVisible = () => {
-    if (!launch.containerName) {
-      slot.release?.();
-      return;
-    }
-    const deadline = Date.now() + 15_000;
-    const poll = setInterval(() => {
-      const visible = runCommand("docker", ["ps", "--filter", `name=${launch.containerName}`, "--format", "{{.Names}}"]);
-      if (Date.now() >= deadline || String(visible.stdout ?? "").includes(launch.containerName)) {
-        clearInterval(poll);
+    onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
+    // `spawn` returns before the docker client has even exec'd, so releasing here
+    // would restore the very race the reservation exists for. The reservation
+    // expires on its own; releasing it early is only an optimisation, and it can
+    // wait until the container is actually visible.
+    const releaseSlotWhenVisible = () => {
+      if (!launch.containerName) {
         slot.release?.();
+        return;
       }
-    }, 500);
-    poll.unref?.();
-  };
-  releaseSlotWhenVisible();
-
-  let stderr = "";
-  let stdoutRest = "";
-  let timedOut = false;
-  let budgetStop = null;
-
-  /**
-   * Stop a run that has crossed one of its ceilings.
-   *
-   * The one-shot mode has no control channel, so unlike the rpc engine there is
-   * no way to ask pi to wrap up: the only lever is the one the timeout already
-   * uses. Whatever the agent has written to the workspace stays; the assistant
-   * text of the message in flight is lost.
-   */
-  const enforceBudget = () => {
-    if (budgetStop) {
-      return;
-    }
-    const exceeded = budgetExceeded(budget, { usage: state.usage, turns: state.turns });
-    if (!exceeded) {
-      return;
-    }
-    budgetStop = exceeded;
-    report({ phase: "working", message: `Budget reached: ${exceeded}. Stopping pi.` });
-    try {
-      process.kill(-child.pid, "SIGKILL");
-    } catch {
-      child.kill("SIGKILL");
-    }
-    if (isSandboxed(sandbox)) {
-      removeSandboxContainer(launch.containerName);
-    }
-  };
-
-  const timer =
-    timeoutMs > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          try {
-            process.kill(-child.pid, "SIGKILL");
-          } catch {
-            child.kill("SIGKILL");
-          }
-          // Signalling the `docker run` client does not stop the container.
-          if (isSandboxed(sandbox)) {
-            removeSandboxContainer(launch.containerName);
-          }
-        }, timeoutMs)
-      : null;
-
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    stdoutRest += chunk;
-    let newlineIndex = stdoutRest.indexOf("\n");
-    while (newlineIndex !== -1) {
-      const line = stdoutRest.slice(0, newlineIndex).trim();
-      stdoutRest = stdoutRest.slice(newlineIndex + 1);
-      if (line) {
-        try {
-          const update = applyPiEvent(state, JSON.parse(line));
-          report(update ? { ...update, usage: state.usage } : null);
-          enforceBudget();
-        } catch {
-          // Non-JSON output on stdout is diagnostic noise, not a fatal error.
+      const deadline = Date.now() + 15_000;
+      const poll = setInterval(() => {
+        const visible = runCommand("docker", ["ps", "--filter", `name=${launch.containerName}`, "--format", "{{.Names}}"]);
+        if (Date.now() >= deadline || String(visible.stdout ?? "").includes(launch.containerName)) {
+          clearInterval(poll);
+          slot.release?.();
         }
+      }, 500);
+      poll.unref?.();
+    };
+    releaseSlotWhenVisible();
+
+    let stderr = "";
+    let stdoutRest = "";
+    let timedOut = false;
+    let budgetStop = null;
+
+    /**
+     * Stop a run that has crossed one of its ceilings.
+     *
+     * The one-shot mode has no control channel, so unlike the rpc engine there is
+     * no way to ask pi to wrap up: the only lever is the one the timeout already
+     * uses. Whatever the agent has written to the workspace stays; the assistant
+     * text of the message in flight is lost.
+     */
+    const enforceBudget = () => {
+      if (budgetStop) {
+        return;
       }
-      newlineIndex = stdoutRest.indexOf("\n");
-    }
-  });
-
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk;
-  });
-
-  // pi may exit before reading the prompt (unknown model, bad flag, docker
-  // failing on its arguments). The write then fails asynchronously with EPIPE,
-  // and without this handler that is an unhandled 'error' event that kills the
-  // process before the job can be recorded as failed.
-  child.stdin.on("error", () => {});
-  child.stdin.end(String(prompt));
-
-  const exitStatus = await new Promise((resolve, reject) => {
-    child.on("error", (error) => {
-      if (timer) {
-        clearTimeout(timer);
+      const exceeded = budgetExceeded(budget, { usage: state.usage, turns: state.turns });
+      if (!exceeded) {
+        return;
       }
-      reject(error);
+      budgetStop = exceeded;
+      report({ phase: "working", message: `Budget reached: ${exceeded}. Stopping pi.` });
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+      if (isSandboxed(sandbox)) {
+        removeSandboxContainer(launch.containerName);
+      }
+    };
+
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            try {
+              process.kill(-child.pid, "SIGKILL");
+            } catch {
+              child.kill("SIGKILL");
+            }
+            // Signalling the `docker run` client does not stop the container.
+            if (isSandboxed(sandbox)) {
+              removeSandboxContainer(launch.containerName);
+            }
+          }, timeoutMs)
+        : null;
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdoutRest += chunk;
+      let newlineIndex = stdoutRest.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = stdoutRest.slice(0, newlineIndex).trim();
+        stdoutRest = stdoutRest.slice(newlineIndex + 1);
+        if (line) {
+          try {
+            const update = applyPiEvent(state, JSON.parse(line));
+            report(update ? { ...update, usage: state.usage } : null);
+            enforceBudget();
+          } catch {
+            // Non-JSON output on stdout is diagnostic noise, not a fatal error.
+          }
+        }
+        newlineIndex = stdoutRest.indexOf("\n");
+      }
     });
-    child.on("close", (code, signal) => {
-      if (timer) {
-        clearTimeout(timer);
-      }
-      resolve(code == null ? (signal ? 1 : 0) : code);
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
     });
-  });
 
-  if (stdoutRest.trim()) {
-    try {
-      const tailUpdate = applyPiEvent(state, JSON.parse(stdoutRest.trim()));
-      report(tailUpdate ? { ...tailUpdate, usage: state.usage } : null);
-    } catch {
-      // Trailing partial line; nothing useful to recover.
+    // pi may exit before reading the prompt (unknown model, bad flag, docker
+    // failing on its arguments). The write then fails asynchronously with EPIPE,
+    // and without this handler that is an unhandled 'error' event that kills the
+    // process before the job can be recorded as failed.
+    child.stdin.on("error", () => {});
+    child.stdin.end(String(prompt));
+
+    const exitStatus = await new Promise((resolve, reject) => {
+      child.on("error", (error) => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        reject(error);
+      });
+      child.on("close", (code, signal) => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+        resolve(code == null ? (signal ? 1 : 0) : code);
+      });
+    });
+
+    if (stdoutRest.trim()) {
+      try {
+        const tailUpdate = applyPiEvent(state, JSON.parse(stdoutRest.trim()));
+        report(tailUpdate ? { ...tailUpdate, usage: state.usage } : null);
+      } catch {
+        // Trailing partial line; nothing useful to recover.
+      }
     }
-  }
 
-  // The run is over, so the tokens it was given stop working right here.
-  await proxy?.close();
-  await gitProxy?.close();
 
-  const text = state.assistantTexts.at(-1) ?? "";
-  const errors = [...state.errors];
-  if (timedOut) {
-    errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
-  }
-  if (budgetStop) {
-    errors.push(`Stopped by the run budget: ${budgetStop}.`);
-  }
-  if (!text && !errors.length && exitStatus === 0) {
-    errors.push("pi produced no assistant output.");
-  }
-  if (exitStatus !== 0 && stderr.trim()) {
-    errors.push(stderr.trim());
-  }
+    const text = state.assistantTexts.at(-1) ?? "";
+    const errors = [...state.errors];
+    if (timedOut) {
+      errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
+    }
+    if (budgetStop) {
+      errors.push(`Stopped by the run budget: ${budgetStop}.`);
+    }
+    if (!text && !errors.length && exitStatus === 0) {
+      errors.push("pi produced no assistant output.");
+    }
+    if (exitStatus !== 0 && stderr.trim()) {
+      errors.push(stderr.trim());
+    }
 
-  return {
-    text,
-    sessionId: state.sessionId,
-    usage: state.usage,
-    stopReason: state.stopReason,
-    // The agent was told a masked name, so its reported model is that mask.
-    // Statistics are about what actually answered, and only the host knows it.
-    model: proxy?.realModel ? `${proxyProviderOf(sandbox)}/${proxy.realModel}` : state.model,
-    turns: state.turns,
-    toolCalls: state.toolCalls,
-    toolErrors: state.toolErrors,
-    timing: summarizeTiming(state.timing),
-    peakContext: state.peakContext ?? 0,
-    thinkingChars: state.thinkingChars ?? 0,
-    // Already measured by the slot queue and thrown away until now: the time
-    // this run spent waiting for a container of its own pool, which is time no
-    // model spent working.
-    slotWaitMs: slot.waitedMs ?? 0,
-    // Per-request telemetry the proxy collected, rolled up for the job row.
-    proxyStats: proxy?.stats?.() ?? null,
-    budgetStop,
-    exitStatus: errors.length && exitStatus === 0 ? 1 : exitStatus,
-    stderr: stderr.trim(),
-    errors,
-    timedOut,
-    containerName: launch.containerName,
-    command: `${launch.command} ${redactArgs(launch.args)}`
+    return {
+      text,
+      sessionId: state.sessionId,
+      usage: state.usage,
+      stopReason: state.stopReason,
+      // The agent was told a masked name, so its reported model is that mask.
+      // Statistics are about what actually answered, and only the host knows it.
+      model: proxy?.realModel ? `${proxyProviderOf(sandbox)}/${proxy.realModel}` : state.model,
+      turns: state.turns,
+      toolCalls: state.toolCalls,
+      toolErrors: state.toolErrors,
+      timing: summarizeTiming(state.timing),
+      peakContext: state.peakContext ?? 0,
+      thinkingChars: state.thinkingChars ?? 0,
+      // Already measured by the slot queue and thrown away until now: the time
+      // this run spent waiting for a container of its own pool, which is time no
+      // model spent working.
+      slotWaitMs: slot.waitedMs ?? 0,
+      // Per-request telemetry the proxy collected, rolled up for the job row.
+      proxyStats: proxy?.stats?.() ?? null,
+      budgetStop,
+      exitStatus: errors.length && exitStatus === 0 ? 1 : exitStatus,
+      stderr: stderr.trim(),
+      errors,
+      timedOut,
+      containerName: launch.containerName,
+      command: `${launch.command} ${redactArgs(launch.args)}`
+  };
+
+  try {
+    return await runTurn();
+  } finally {
+    await closeProxies();
+  }
   };
 }

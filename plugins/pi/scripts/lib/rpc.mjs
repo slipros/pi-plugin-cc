@@ -117,325 +117,342 @@ export async function runPiRpcTurn({
   sandbox = withGitProxy(sandbox, gitProxy);
   // Both proxies bind loopback, and the hop that carries the container's
   // connections there needs a moment to notice them.
+  // Registered the moment both exist, because everything between here and the
+  // end of the run can throw: a queue that gives up waiting for a slot, a
+  // container that fails to spawn, a budget that stops the turn. Any of those
+  // used to leave the listener alive with a live forge token behind it.
+  const closeProxies = async () => {
+    await proxy?.close();
+    await gitProxy?.close();
+  };
   await settleProxyPorts(proxy, gitProxy);
   const piArgs = buildPiArgs({ ...options, mode: "rpc" });
-  const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
-  const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
-  const state = createTurnState();
-  const report = (event) => {
-    if (event && onProgress) {
-      onProgress(event);
-    }
-  };
-
-  report({ phase: "starting", message: `Running ${launch.command} ${redactArgs(launch.args)}` });
-
-  const child = spawn(launch.command, launch.args, {
-    cwd,
-    env,
-    stdio: ["pipe", "pipe", "pipe"],
-    detached: process.platform !== "win32"
-  });
-  onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
-  // `spawn` returns before the docker client has even exec'd, so releasing here
-  // would restore the very race the reservation exists for. The reservation
-  // expires on its own; releasing it early is only an optimisation, and it can
-  // wait until the container is actually visible.
-  const releaseSlotWhenVisible = () => {
-    if (!launch.containerName) {
-      slot.release?.();
-      return;
-    }
-    const deadline = Date.now() + 15_000;
-    const poll = setInterval(() => {
-      const visible = runCommand("docker", ["ps", "--filter", `name=${launch.containerName}`, "--format", "{{.Names}}"]);
-      if (Date.now() >= deadline || String(visible.stdout ?? "").includes(launch.containerName)) {
-        clearInterval(poll);
-        slot.release?.();
+  // The body runs inside a closure so the proxies are closed on every exit
+  // from here on, not only the one that reaches the end: a slot wait that
+  // gives up, a container that fails to spawn and a rejected turn all used to
+  // leave a listener alive with a live forge token behind it.
+  const runTurn = async () => {
+    const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
+    const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
+    const state = createTurnState();
+    const report = (event) => {
+      if (event && onProgress) {
+        onProgress(event);
       }
-    }, 500);
-    poll.unref?.();
-  };
-  releaseSlotWhenVisible();
+    };
 
-  let stderr = "";
-  let settledAt = null;
-  let aborted = false;
-  let budgetStop = null;
-  let closing = false;
-  let lastControlAt = 0;
-  const delivered = [];
+    report({ phase: "starting", message: `Running ${launch.command} ${redactArgs(launch.args)}` });
 
-  const send = (command) => {
-    if (child.stdin.destroyed || child.stdin.writableEnded) {
-      return false;
-    }
-    child.stdin.write(`${JSON.stringify(command)}\n`);
-    return true;
-  };
-
-  const appendEvent = (event) => {
-    if (!eventsFile) {
-      return;
-    }
-    try {
-      // pi stamps a message with the time it was created, which makes
-      // message_start and message_end carry the same value; the arrival time is
-      // the only thing in the journal that can date an event afterwards.
-      fs.appendFileSync(eventsFile, `${JSON.stringify({ ...event, receivedAt: Date.now() })}\n`, "utf8");
-    } catch {
-      // A broken transcript must never take the job down.
-    }
-  };
-
-  attachJsonlReader(child.stdout, (line) => {
-    const event = parseJsonLine(line);
-    if (!event) {
-      return;
-    }
-
-    if (event.type === "response") {
-      if (event.command === "get_state" && event.data) {
-        if (event.data.sessionId) {
-          state.sessionId = String(event.data.sessionId);
-        }
-        // The effective thinking level, which is what pi resolved from flags,
-        // settings and the model — not necessarily what the caller asked for.
-        if (event.data.thinkingLevel) {
-          state.thinkingLevel = String(event.data.thinkingLevel);
-        }
-      }
-      if (event.success === false) {
-        const detail = event.error ?? event.message ?? "unknown error";
-        state.errors.push(`pi rejected "${event.command}": ${detail}`);
-        report({ phase: "working", message: `pi rejected ${event.command}: ${detail}` });
-      }
-      return;
-    }
-
-    appendEvent(event);
-
-    if (event.type === "agent_settled") {
-      settledAt = Date.now();
-    } else if (event.type === "agent_start" || event.type === "turn_start") {
-      settledAt = null;
-    }
-
-    const update = applyPiEvent(state, event);
-    // The accumulated usage rides along with every progress event, so a job
-    // that is still running can report what it has spent so far — until now
-    // the number only existed in this process and landed on disk at the end.
-    report(update ? { ...update, usage: state.usage } : null);
-
-    // Checked on the same numbers the caller sees, right after they change: the
-    // ceiling can only be enforced once the message that crossed it is paid for,
-    // so the earliest useful moment is here. `abort` is the same command
-    // steering uses — pi wraps up the turn instead of being killed, which keeps
-    // whatever the agent has already produced.
-    if (!budgetStop && !aborted) {
-      const exceeded = budgetExceeded(budget, { usage: state.usage, turns: state.turns });
-      if (exceeded) {
-        budgetStop = exceeded;
-        send({ type: "abort" });
-        report({ phase: "working", message: `Budget reached: ${exceeded}. Stopping pi.` });
-      }
-    }
-  });
-
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk;
-  });
-
-  // A spawn failure is a normal outcome here, not an exception to propagate: it
-  // resolves like any other bad exit so the job gets a terminal record. Left as
-  // a rejection it became an unhandled one — the waiter below only attaches a
-  // fulfilment handler — and the process died with the job stuck at "running".
-  let spawnError = null;
-  const closed = new Promise((resolve) => {
-    child.on("error", (error) => {
-      spawnError = error;
-      resolve(1);
+    const child = spawn(launch.command, launch.args, {
+      cwd,
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32"
     });
-    child.on("close", (code, signal) => resolve(code == null ? (signal ? 1 : 0) : code));
-  });
-
-  // Writing the prompt can fail after the fact if pi exits first (EPIPE on a
-  // 200KB review diff, for instance). Without a handler that is an unhandled
-  // 'error' event on the socket, which takes the whole process down.
-  child.stdin.on("error", (error) => {
-    if (!closing) {
-      state.errors.push(`Could not write to pi: ${error.message}`);
-    }
-  });
-
-  send({ type: "get_state", id: "state-1" });
-  send({ type: "prompt", message: String(prompt), id: "prompt-1" });
-
-  /**
-   * A control message that arrives while pi is working is steering; one that
-   * arrives in the settle window re-opens the run as a new prompt, which is
-   * what "nudge the agent" means once it has already stopped.
-   */
-  const handleControl = (entry) => {
-    lastControlAt = Date.now();
-
-    if (entry.kind === "abort") {
-      aborted = true;
-      send({ type: "abort" });
-      report({ phase: "working", message: "Abort requested; stopping pi." });
-      delivered.push({ ...entry, deliveredAs: "abort" });
-      return;
-    }
-
-    const isSettled = settledAt !== null;
-    const command = isSettled
-      ? { type: "prompt", message: entry.message, id: entry.id }
-      : entry.kind === "follow_up"
-        ? { type: "follow_up", message: entry.message }
-        : { type: "steer", message: entry.message };
-
-    if (send(command)) {
-      settledAt = null;
-      delivered.push({ ...entry, deliveredAs: command.type });
-      report({
-        phase: "working",
-        message: `Delivered ${command.type}: ${entry.message.slice(0, 120)}`
-      });
-    }
-  };
-
-  const inbox = inboxFile ? createInboxWatcher(inboxFile, handleControl) : null;
-
-  // Killing the `docker run` client leaves the container running, so a
-  // sandboxed job has to be stopped on the docker side as well.
-  const stop = () => {
-    killTree(child);
-    if (isSandboxed(sandbox)) {
-      removeSandboxContainer(launch.containerName);
-    }
-  };
-
-  let timedOut = false;
-  const hardTimer =
-    timeoutMs > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          stop();
-        }, timeoutMs)
-      : null;
-
-  // Close the session once pi has settled and nothing new arrived in the
-  // grace window; an abort short-circuits the wait.
-  await new Promise((resolve) => {
-    const poll = setInterval(() => {
-      // A process that never started has nothing to settle: waiting for the
-      // grace window would burn the whole timeout before reporting the failure.
-      if (spawnError) {
-        clearInterval(poll);
-        resolve();
+    onSpawn?.({ pid: child.pid ?? null, containerName: launch.containerName });
+    // `spawn` returns before the docker client has even exec'd, so releasing here
+    // would restore the very race the reservation exists for. The reservation
+    // expires on its own; releasing it early is only an optimisation, and it can
+    // wait until the container is actually visible.
+    const releaseSlotWhenVisible = () => {
+      if (!launch.containerName) {
+        slot.release?.();
         return;
       }
-      inbox?.drain();
-      const quietFor = Date.now() - Math.max(settledAt ?? 0, lastControlAt);
-      if (settledAt !== null && (aborted || budgetStop || quietFor >= settleGraceMs)) {
+      const deadline = Date.now() + 15_000;
+      const poll = setInterval(() => {
+        const visible = runCommand("docker", ["ps", "--filter", `name=${launch.containerName}`, "--format", "{{.Names}}"]);
+        if (Date.now() >= deadline || String(visible.stdout ?? "").includes(launch.containerName)) {
+          clearInterval(poll);
+          slot.release?.();
+        }
+      }, 500);
+      poll.unref?.();
+    };
+    releaseSlotWhenVisible();
+
+    let stderr = "";
+    let settledAt = null;
+    let aborted = false;
+    let budgetStop = null;
+    let closing = false;
+    let lastControlAt = 0;
+    const delivered = [];
+
+    const send = (command) => {
+      if (child.stdin.destroyed || child.stdin.writableEnded) {
+        return false;
+      }
+      child.stdin.write(`${JSON.stringify(command)}\n`);
+      return true;
+    };
+
+    const appendEvent = (event) => {
+      if (!eventsFile) {
+        return;
+      }
+      try {
+        // pi stamps a message with the time it was created, which makes
+        // message_start and message_end carry the same value; the arrival time is
+        // the only thing in the journal that can date an event afterwards.
+        fs.appendFileSync(eventsFile, `${JSON.stringify({ ...event, receivedAt: Date.now() })}\n`, "utf8");
+      } catch {
+        // A broken transcript must never take the job down.
+      }
+    };
+
+    attachJsonlReader(child.stdout, (line) => {
+      const event = parseJsonLine(line);
+      if (!event) {
+        return;
+      }
+
+      if (event.type === "response") {
+        if (event.command === "get_state" && event.data) {
+          if (event.data.sessionId) {
+            state.sessionId = String(event.data.sessionId);
+          }
+          // The effective thinking level, which is what pi resolved from flags,
+          // settings and the model — not necessarily what the caller asked for.
+          if (event.data.thinkingLevel) {
+            state.thinkingLevel = String(event.data.thinkingLevel);
+          }
+        }
+        if (event.success === false) {
+          const detail = event.error ?? event.message ?? "unknown error";
+          state.errors.push(`pi rejected "${event.command}": ${detail}`);
+          report({ phase: "working", message: `pi rejected ${event.command}: ${detail}` });
+        }
+        return;
+      }
+
+      appendEvent(event);
+
+      if (event.type === "agent_settled") {
+        settledAt = Date.now();
+      } else if (event.type === "agent_start" || event.type === "turn_start") {
+        settledAt = null;
+      }
+
+      const update = applyPiEvent(state, event);
+      // The accumulated usage rides along with every progress event, so a job
+      // that is still running can report what it has spent so far — until now
+      // the number only existed in this process and landed on disk at the end.
+      report(update ? { ...update, usage: state.usage } : null);
+
+      // Checked on the same numbers the caller sees, right after they change: the
+      // ceiling can only be enforced once the message that crossed it is paid for,
+      // so the earliest useful moment is here. `abort` is the same command
+      // steering uses — pi wraps up the turn instead of being killed, which keeps
+      // whatever the agent has already produced.
+      if (!budgetStop && !aborted) {
+        const exceeded = budgetExceeded(budget, { usage: state.usage, turns: state.turns });
+        if (exceeded) {
+          budgetStop = exceeded;
+          send({ type: "abort" });
+          report({ phase: "working", message: `Budget reached: ${exceeded}. Stopping pi.` });
+        }
+      }
+    });
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+
+    // A spawn failure is a normal outcome here, not an exception to propagate: it
+    // resolves like any other bad exit so the job gets a terminal record. Left as
+    // a rejection it became an unhandled one — the waiter below only attaches a
+    // fulfilment handler — and the process died with the job stuck at "running".
+    let spawnError = null;
+    const closed = new Promise((resolve) => {
+      child.on("error", (error) => {
+        spawnError = error;
+        resolve(1);
+      });
+      child.on("close", (code, signal) => resolve(code == null ? (signal ? 1 : 0) : code));
+    });
+
+    // Writing the prompt can fail after the fact if pi exits first (EPIPE on a
+    // 200KB review diff, for instance). Without a handler that is an unhandled
+    // 'error' event on the socket, which takes the whole process down.
+    child.stdin.on("error", (error) => {
+      if (!closing) {
+        state.errors.push(`Could not write to pi: ${error.message}`);
+      }
+    });
+
+    send({ type: "get_state", id: "state-1" });
+    send({ type: "prompt", message: String(prompt), id: "prompt-1" });
+
+    /**
+     * A control message that arrives while pi is working is steering; one that
+     * arrives in the settle window re-opens the run as a new prompt, which is
+     * what "nudge the agent" means once it has already stopped.
+     */
+    const handleControl = (entry) => {
+      lastControlAt = Date.now();
+
+      if (entry.kind === "abort") {
+        aborted = true;
+        send({ type: "abort" });
+        report({ phase: "working", message: "Abort requested; stopping pi." });
+        delivered.push({ ...entry, deliveredAs: "abort" });
+        return;
+      }
+
+      const isSettled = settledAt !== null;
+      const command = isSettled
+        ? { type: "prompt", message: entry.message, id: entry.id }
+        : entry.kind === "follow_up"
+          ? { type: "follow_up", message: entry.message }
+          : { type: "steer", message: entry.message };
+
+      if (send(command)) {
+        settledAt = null;
+        delivered.push({ ...entry, deliveredAs: command.type });
+        report({
+          phase: "working",
+          message: `Delivered ${command.type}: ${entry.message.slice(0, 120)}`
+        });
+      }
+    };
+
+    const inbox = inboxFile ? createInboxWatcher(inboxFile, handleControl) : null;
+
+    // Killing the `docker run` client leaves the container running, so a
+    // sandboxed job has to be stopped on the docker side as well.
+    const stop = () => {
+      killTree(child);
+      if (isSandboxed(sandbox)) {
+        removeSandboxContainer(launch.containerName);
+      }
+    };
+
+    let timedOut = false;
+    const hardTimer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            stop();
+          }, timeoutMs)
+        : null;
+
+    // Close the session once pi has settled and nothing new arrived in the
+    // grace window; an abort short-circuits the wait.
+    await new Promise((resolve) => {
+      const poll = setInterval(() => {
+        // A process that never started has nothing to settle: waiting for the
+        // grace window would burn the whole timeout before reporting the failure.
+        if (spawnError) {
+          clearInterval(poll);
+          resolve();
+          return;
+        }
+        inbox?.drain();
+        const quietFor = Date.now() - Math.max(settledAt ?? 0, lastControlAt);
+        if (settledAt !== null && (aborted || budgetStop || quietFor >= settleGraceMs)) {
+          clearInterval(poll);
+          resolve();
+        }
+      }, 200);
+      poll.unref?.();
+
+      closed.then(() => {
         clearInterval(poll);
         resolve();
-      }
-    }, 200);
-    poll.unref?.();
-
-    closed.then(() => {
-      clearInterval(poll);
-      resolve();
+      });
     });
-  });
 
-  closing = true;
-  inbox?.stop();
+    closing = true;
+    inbox?.stop();
 
-  if (!child.killed) {
-    try {
-      child.stdin.end();
-    } catch {
-      // Already gone.
+    if (!child.killed) {
+      try {
+        child.stdin.end();
+      } catch {
+        // Already gone.
+      }
     }
-  }
 
-  const exitStatus = await Promise.race([
-    closed,
-    new Promise((resolve) =>
-      setTimeout(() => {
-        stop();
-        resolve(closed);
-      }, SHUTDOWN_GRACE_MS).unref?.()
-    )
-  ]).catch((error) => {
-    throw error;
-  });
+    const exitStatus = await Promise.race([
+      closed,
+      new Promise((resolve) =>
+        setTimeout(() => {
+          stop();
+          resolve(closed);
+        }, SHUTDOWN_GRACE_MS).unref?.()
+      )
+    ]).catch((error) => {
+      throw error;
+    });
 
-  if (hardTimer) {
-    clearTimeout(hardTimer);
-  }
+    if (hardTimer) {
+      clearTimeout(hardTimer);
+    }
 
-  // The run is over, so the token it was given stops working right here.
-  await proxy?.close();
-  await gitProxy?.close();
 
-  const text = state.assistantTexts.at(-1) ?? "";
-  const errors = [...state.errors];
-  if (spawnError) {
-    errors.push(`Could not start ${launch.command}: ${spawnError.message}`);
-  }
-  if (timedOut) {
-    errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
-  }
-  if (aborted) {
-    errors.push("The run was aborted before pi finished.");
-  }
-  if (budgetStop) {
-    errors.push(`Stopped by the run budget: ${budgetStop}.`);
-  }
-  if (!text && !errors.length) {
-    errors.push("pi produced no assistant output.");
-  }
-  if (stderr.trim() && (errors.length || exitStatus !== 0)) {
-    errors.push(stderr.trim());
-  }
+    const text = state.assistantTexts.at(-1) ?? "";
+    const errors = [...state.errors];
+    if (spawnError) {
+      errors.push(`Could not start ${launch.command}: ${spawnError.message}`);
+    }
+    if (timedOut) {
+      errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
+    }
+    if (aborted) {
+      errors.push("The run was aborted before pi finished.");
+    }
+    if (budgetStop) {
+      errors.push(`Stopped by the run budget: ${budgetStop}.`);
+    }
+    if (!text && !errors.length) {
+      errors.push("pi produced no assistant output.");
+    }
+    if (stderr.trim() && (errors.length || exitStatus !== 0)) {
+      errors.push(stderr.trim());
+    }
 
-  return {
-    text,
-    sessionId: state.sessionId,
-    usage: state.usage,
-    stopReason: state.stopReason,
-    // The agent was told a masked name, so its reported model is that mask.
-    // Statistics are about what actually answered, and only the host knows it.
-    model: proxy?.realModel ? `${proxyProviderOf(sandbox)}/${proxy.realModel}` : state.model,
-    turns: state.turns,
-    toolCalls: state.toolCalls,
-    toolErrors: state.toolErrors,
-    timing: summarizeTiming(state.timing),
-    peakContext: state.peakContext ?? 0,
-    thinkingChars: state.thinkingChars ?? 0,
-    // Already measured by the slot queue and thrown away until now: the time
-    // this run spent waiting for a container of its own pool, which is time no
-    // model spent working.
-    slotWaitMs: slot.waitedMs ?? 0,
-    // Per-request telemetry the proxy collected, rolled up for the job row.
-    proxyStats: proxy?.stats?.() ?? null,
-    queue: state.queue,
-    steering: delivered,
-    aborted,
-    budgetStop,
-    thinkingLevel: state.thinkingLevel ?? null,
-    exitStatus: errors.length ? 1 : (exitStatus ?? 0),
-    stderr: stderr.trim(),
-    errors,
-    timedOut,
-    closing,
-    containerName: launch.containerName,
-    command: `${launch.command} ${redactArgs(launch.args)}`
+    return {
+      text,
+      sessionId: state.sessionId,
+      usage: state.usage,
+      stopReason: state.stopReason,
+      // The agent was told a masked name, so its reported model is that mask.
+      // Statistics are about what actually answered, and only the host knows it.
+      model: proxy?.realModel ? `${proxyProviderOf(sandbox)}/${proxy.realModel}` : state.model,
+      turns: state.turns,
+      toolCalls: state.toolCalls,
+      toolErrors: state.toolErrors,
+      timing: summarizeTiming(state.timing),
+      peakContext: state.peakContext ?? 0,
+      thinkingChars: state.thinkingChars ?? 0,
+      // Already measured by the slot queue and thrown away until now: the time
+      // this run spent waiting for a container of its own pool, which is time no
+      // model spent working.
+      slotWaitMs: slot.waitedMs ?? 0,
+      // Per-request telemetry the proxy collected, rolled up for the job row.
+      proxyStats: proxy?.stats?.() ?? null,
+      queue: state.queue,
+      steering: delivered,
+      aborted,
+      budgetStop,
+      thinkingLevel: state.thinkingLevel ?? null,
+      exitStatus: errors.length ? 1 : (exitStatus ?? 0),
+      stderr: stderr.trim(),
+      errors,
+      timedOut,
+      closing,
+      containerName: launch.containerName,
+      command: `${launch.command} ${redactArgs(launch.args)}`
+    };
   };
+
+  try {
+    return await runTurn();
+  } finally {
+    await closeProxies();
+  }
 }
 
 function killTree(child) {

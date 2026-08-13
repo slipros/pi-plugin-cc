@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL, URL } from "node:url";
 
 import { runCommand } from "./process.mjs";
+import { PROXY_BIND_ADDRESS } from "./proxy-bind.mjs";
 import { createStreamMeter } from "./sse-meter.mjs";
 import { createRequestRecorder } from "./telemetry.mjs";
 
@@ -539,9 +540,10 @@ export async function startCredentialProxy({
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    // Loopback only: the container reaches it through the host gateway, and
-    // nothing outside this machine can.
-    server.listen(0, "127.0.0.1", resolve);
+    // Not loopback, however much it should be: `host-gateway` does not reach it
+    // there, and a run whose model endpoint is unreachable fails outright. The
+    // run token is what makes the listener safe — see `proxy-bind.mjs`.
+    server.listen(0, PROXY_BIND_ADDRESS, resolve);
     // A listening socket keeps the event loop alive: an early throw between
     // starting the proxy and closing it left the CLI hanging forever, with the
     // run token still answering on loopback.

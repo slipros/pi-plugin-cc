@@ -266,6 +266,68 @@ function sanitizeUntrustedEntry(entry, path, warnings) {
  * Skipped entirely when the user has marked the workspace as trusted, which is
  * the normal case for one's own repositories.
  */
+/**
+ * Keys a repository never gets to set, however much the workspace is trusted.
+ *
+ * Trust says "the code in this checkout is mine", which is a statement about the
+ * code — not a grant of host execution to whoever writes a file in it. And the
+ * one who writes files in it is, among others, a sandboxed agent: the workspace
+ * is mounted read-write, so anything the project layer may decide is decided by
+ * a process the sandbox exists to contain. `onFinish` runs a command on the
+ * host, and `gitProxy.tokenCommand` is executed on the host to fetch a secret —
+ * both are host execution reachable from inside the container, one run later.
+ *
+ * The rest of the project layer survives: a repository still describes its model,
+ * prompts, toolchain and — through `gitProxy` entries without `tokenCommand` —
+ * which of the host's already-configured forges it needs.
+ */
+function stripHostExecution(layer, warnings = []) {
+  if (!isPlainObject(layer)) {
+    return layer;
+  }
+  const clean = { ...layer };
+
+  if (isPlainObject(clean.defaults) && "onFinish" in clean.defaults) {
+    warnings.push("defaults.onFinish ignored: a checkout cannot run commands on the host, trusted or not.");
+    clean.defaults = { ...clean.defaults, onFinish: undefined };
+    delete clean.defaults.onFinish;
+  }
+  for (const section of ["presets", "commands"]) {
+    if (!isPlainObject(clean[section])) {
+      continue;
+    }
+    const entries = {};
+    for (const [name, entry] of Object.entries(clean[section])) {
+      if (isPlainObject(entry) && "onFinish" in entry) {
+        warnings.push(`${section}.${name}.onFinish ignored: a checkout cannot run commands on the host, trusted or not.`);
+        const stripped = { ...entry };
+        delete stripped.onFinish;
+        entries[name] = stripped;
+        continue;
+      }
+      entries[name] = entry;
+    }
+    clean[section] = entries;
+  }
+
+  if (isPlainObject(clean.gitProxy)) {
+    const hosts = {};
+    for (const [host, spec] of Object.entries(clean.gitProxy)) {
+      if (isPlainObject(spec) && "tokenCommand" in spec) {
+        warnings.push(`gitProxy.${host}.tokenCommand ignored: a checkout cannot name a command the host will run.`);
+        const stripped = { ...spec };
+        delete stripped.tokenCommand;
+        hosts[host] = stripped;
+        continue;
+      }
+      hosts[host] = spec;
+    }
+    clean.gitProxy = hosts;
+  }
+
+  return clean;
+}
+
 export function sanitizeProjectLayer(layer, warnings = []) {
   if (!isPlainObject(layer)) {
     return layer;
@@ -366,7 +428,8 @@ export function loadConfig(workspaceRoot) {
   }
   if (project.value) {
     sources.push(projectConfigPath(workspaceRoot));
-    config = mergeConfigLayer(config, trusted ? project.value : sanitizeProjectLayer(project.value, warnings));
+    const layer = trusted ? stripHostExecution(project.value, warnings) : sanitizeProjectLayer(project.value, warnings);
+    config = mergeConfigLayer(config, layer);
   }
 
   return { config, sources, errors, warnings };

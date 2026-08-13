@@ -726,3 +726,28 @@ test("the project layer cannot hand itself back the shared volumes", async () =>
   assert.deepEqual(clean.defaults.sandbox, { profile: "go" });
   assert.equal(warnings.length, 2, `expected both keys refused, got: ${warnings.join(" | ")}`);
 });
+
+test("relaxed-isolation warnings name what a profile gave away through args", () => {
+  const warn = (args, mounts = []) =>
+    sandboxRunWarnings(normalizeSandbox({ mode: "docker", args, mounts }), { workspaceRoot: "/work" });
+
+  // Both flag forms docker accepts, and through args rather than mounts.
+  assert.ok(warn(["--privileged=true"]).some((w) => w.includes("--privileged")));
+  assert.ok(warn(["--device=/dev/net/tun"]).some((w) => w.includes("/dev/net/tun")));
+  assert.ok(
+    warn(["-v", "/var/run/docker.sock:/var/run/docker.sock"]).some((w) => w.includes("docker socket")),
+    "docker.sock in args must warn"
+  );
+
+  // A replaced seccomp profile and a disabled one read differently.
+  assert.ok(
+    warn(["--security-opt", "seccomp=/x.json"]).some((w) => w.includes("replaces the default seccomp")),
+    "a custom profile is a replacement, not a disable"
+  );
+  assert.ok(
+    warn(["--security-opt", "seccomp=unconfined"]).some((w) => w.includes("disables seccomp entirely"))
+  );
+
+  // A plain profile says nothing.
+  assert.deepEqual(warn([]).filter((w) => /seccomp|device|privileged|docker socket/.test(w)), []);
+});

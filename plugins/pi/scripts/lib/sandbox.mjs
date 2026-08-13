@@ -482,11 +482,34 @@ export function buildDockerRunArgs({
     }
     args.push("-v", resolveMountSource(mount, homeDir, cwd));
   }
-  args.push(...(sandbox.args ?? []));
+  args.push(...(sandbox.args ?? []).map((arg) => resolveSandboxFileRefs(String(arg), cwd)));
 
   args.push(sandbox.image || DEFAULT_SANDBOX_IMAGE);
   args.push(...piArgs);
   return args;
+}
+
+/**
+ * Expand `@sandbox/<file>` inside a raw docker argument to an absolute path.
+ *
+ * A profile that needs to point docker at a file it ships — a seccomp profile,
+ * an apparmor one — would otherwise carry that file's absolute path in the
+ * config, which breaks the moment the config moves to another machine or user.
+ * `@sandbox/x.json` is resolved along the same search path Dockerfiles use, so a
+ * project copy shadows the plugin's and a home copy survives updates.
+ */
+function resolveSandboxFileRefs(arg, cwd) {
+  return arg.replace(/@sandbox\/([\w.\-/]+)/g, (whole, name) => {
+    for (const dir of dockerfileSearchPath(cwd)) {
+      const candidate = path.join(dir, name);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+    // Left as written when nothing matches: docker will fail with the literal,
+    // which is a clearer error than a silently half-substituted path.
+    return whole;
+  });
 }
 
 /** Where the host keeps pi's own agent directory. */
@@ -748,7 +771,9 @@ function relaxedIsolationWarnings(sandbox) {
   const line = args.join(" ");
   const warnings = [];
 
-  if (args.includes("--privileged")) {
+  // `--privileged` and `--privileged=true` are the same flag to docker; the bare
+  // form is the common one, the `=true` form the one a naive check misses.
+  if (args.some((value) => value === "--privileged" || /^--privileged=true$/i.test(value))) {
     warnings.push("Sandbox runs `--privileged`: the container reaches the host's devices, which is not a boundary.");
   }
   if (/seccomp=unconfined/.test(line)) {
@@ -762,13 +787,19 @@ function relaxedIsolationWarnings(sandbox) {
   if (/systempaths=unconfined/.test(line)) {
     warnings.push("Sandbox unmasks /proc: /proc/kcore and /proc/sysrq-trigger are reachable from the container.");
   }
+  // Both `--device /dev/x` and `--device=/dev/x` are accepted by docker.
   for (const [index, value] of args.entries()) {
-    if (value === "--device" && args[index + 1]) {
-      warnings.push(`Sandbox passes the host device ${args[index + 1]} into the container.`);
+    const device = value === "--device" ? args[index + 1] : /^--device=(.+)$/.exec(value)?.[1];
+    if (device) {
+      warnings.push(`Sandbox passes the host device ${device} into the container.`);
     }
   }
-  if ((sandbox.mounts ?? []).some((mount) => String(mount).includes("docker.sock"))) {
-    warnings.push("Sandbox mounts the host docker socket: containers it starts run on the host, as root.");
+  // The socket can arrive as a mount or, just as easily, through raw `args`;
+  // reading only `mounts` was the gap the warning's own docstring described.
+  const socketInArgs = args.some((value) => value.includes("docker.sock"));
+  const socketInMounts = (sandbox.mounts ?? []).some((mount) => String(mount).includes("docker.sock"));
+  if (socketInArgs || socketInMounts) {
+    warnings.push("Sandbox exposes the host docker socket: containers it starts run on the host, as root.");
   }
   return warnings;
 }
@@ -1153,6 +1184,19 @@ export function buildSandboxImage({
   const args = ["build", "-t", image, "-f", dockerfile];
   if (piVersion) {
     args.push("--build-arg", `PI_VERSION=${piVersion}`);
+  }
+  // The runtime user the container runs as is the caller's own uid (see
+  // `--user` in buildDockerRunArgs). An image that bakes in files owned by, or a
+  // subuid range for, a fixed uid only works when the builder's uid matches. Any
+  // image ignoring the arg is unaffected; the dind one uses it so a build on a
+  // non-1000 machine still produces a working rootless daemon.
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const gid = typeof process.getgid === "function" ? process.getgid() : null;
+  if (uid != null) {
+    args.push("--build-arg", `RUNTIME_UID=${uid}`);
+  }
+  if (gid != null) {
+    args.push("--build-arg", `RUNTIME_GID=${gid}`);
   }
   if (noCache) {
     args.push("--no-cache");

@@ -34,6 +34,9 @@ const SECRET_COMMAND_TIMEOUT_MS = 15_000;
 const UPLOAD_PACK = "git-upload-pack";
 const RECEIVE_PACK = "git-receive-pack";
 
+/** Redirect hops the proxy will follow before giving up on a request. */
+const MAX_UPSTREAM_HOPS = 3;
+
 /**
  * Headers that belong to the hop, not the message, plus the ones this proxy
  * owns. `authorization` especially: whatever the container sent authenticated
@@ -52,8 +55,26 @@ const STRIPPED_REQUEST_HEADERS = [
   "cookie"
 ];
 
-/** Anything that could teach the container about the host's session. */
-const STRIPPED_RESPONSE_HEADERS = ["set-cookie", "www-authenticate", "authorization"];
+/**
+ * Response headers this proxy owns.
+ *
+ * The first three would teach the container about the host's session. The rest
+ * describe *this* hop and must not be copied from the upstream one: leaving
+ * `transfer-encoding: chunked` in place while node applies its own framing
+ * chunk-encodes the body twice, and git meets the result as
+ * "fatal: expected flush after ref listing" — a fetch that fails only for
+ * repositories whose advertisement the forge happens to stream.
+ */
+const STRIPPED_RESPONSE_HEADERS = [
+  "set-cookie",
+  "www-authenticate",
+  "authorization",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+  "trailer",
+  "upgrade"
+];
 
 /**
  * Read one host's real credential.
@@ -192,21 +213,24 @@ function resolveRoute(rawUrl, method, hosts) {
   const target = new URL(host.upstream);
   target.pathname = `${target.pathname.replace(/\/$/, "")}${repoPath}`;
   target.search = parsed.search;
-  return { host, target, write: isReceivePack };
+  return { host, target, repoPath, search: parsed.search, write: isReceivePack };
 }
 
 /**
- * A redirect the container may follow: same forge, expressed as a path on this
- * proxy. Returns null for anything else — an upstream that redirects to another
- * host is the shape that would turn this into an open relay.
+ * The route a redirect points at, or null when it leaves the configured forges.
+ *
+ * The location is resolved against the request it answers, mapped back onto this
+ * proxy's own path shape, and run through the same gate as any other request —
+ * so a redirect can no more reach `git-receive-pack`, or a forge nobody
+ * configured, than a direct call could.
  */
-function proxiedRedirect(location, route, hosts) {
+function redirectRoute(location, current, hosts) {
   if (!location) {
     return null;
   }
   let target;
   try {
-    target = new URL(location, route.target);
+    target = new URL(location, current.target);
   } catch {
     return null;
   }
@@ -216,7 +240,50 @@ function proxiedRedirect(location, route, hosts) {
   }
   const prefix = new URL(host.upstream).pathname.replace(/\/$/, "");
   const repoPath = target.pathname.startsWith(prefix) ? target.pathname.slice(prefix.length) : target.pathname;
-  return `/${encodeURIComponent(host.key)}${repoPath}${target.search}`;
+  const route = resolveRoute(`/${encodeURIComponent(host.key)}${repoPath}${target.search}`, "GET", hosts);
+  return route.error || route.blocked ? null : route;
+}
+
+/**
+ * Repository prefix of a smart-HTTP path: everything before the endpoint.
+ *
+ * Both endpoints of the protocol hang off the same prefix, which is what makes
+ * one recorded rewrite enough for the whole exchange.
+ */
+function repoPrefixOf(repoPath) {
+  for (const suffix of ["/info/refs", `/${UPLOAD_PACK}`, `/${RECEIVE_PACK}`]) {
+    if (repoPath.endsWith(suffix)) {
+      return repoPath.slice(0, -suffix.length);
+    }
+  }
+  return null;
+}
+
+/** Record that a forge canonicalised one repository path into another. */
+function rememberCanonical(from, to, canonical) {
+  const before = repoPrefixOf(from.repoPath);
+  const after = repoPrefixOf(to.repoPath);
+  if (before && after && before !== after) {
+    canonical.set(`${from.host.key}${before}`, after);
+  }
+}
+
+/** Apply a rewrite the forge already asked for on an earlier request. */
+function canonicalize(route, method, hosts, canonical) {
+  if (route.error || route.blocked || !route.repoPath) {
+    return route;
+  }
+  const prefix = repoPrefixOf(route.repoPath);
+  const replacement = prefix ? canonical.get(`${route.host.key}${prefix}`) : null;
+  if (!replacement) {
+    return route;
+  }
+  const rewritten = resolveRoute(
+    `/${encodeURIComponent(route.host.key)}${route.repoPath.replace(prefix, replacement)}${route.search ?? ""}`,
+    method,
+    hosts
+  );
+  return rewritten.error || rewritten.blocked ? route : rewritten;
 }
 
 function plainText(response, status, message) {
@@ -352,6 +419,17 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
   }
 
   const token = `pi-git-${crypto.randomBytes(24).toString("hex")}`;
+  /**
+   * Repository paths the forge redirected to their canonical form.
+   *
+   * Smart-HTTP is two requests, and git derives the second from the URL it was
+   * given, not from where the first one landed: GitLab answers `…/repo/info/refs`
+   * with a 301 to `…/repo.git/…`, then meets the POST at the un-canonical path
+   * with a 422. Following the redirect inside the proxy fixes the first request
+   * and breaks the second unless the rewrite is remembered for the rest of the
+   * run — which is all this map is.
+   */
+  const canonical = new Map();
   // `challenged` counts the 401 git always earns on its first request, so it is
   // kept apart from `rejected`: mixing them would make normal traffic look like
   // something was trying tokens.
@@ -379,7 +457,7 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
       return;
     }
 
-    const route = resolveRoute(request.url, request.method, hosts);
+    const route = canonicalize(resolveRoute(request.url, request.method, hosts), request.method, hosts, canonical);
     if (route.error || route.blocked) {
       counters.blocked += 1;
       plainText(response, route.error ? 400 : 403, route.error ?? route.blocked);
@@ -388,63 +466,81 @@ export async function startGitProxy({ hosts: hostSpecs = {}, onWarning = null } 
     }
 
     counters.requests += 1;
-    const headers = { ...request.headers };
-    for (const header of STRIPPED_REQUEST_HEADERS) {
-      delete headers[header];
-    }
-    headers.authorization = route.host.authorization;
 
-    const transport = route.target.protocol === "http:" ? http : https;
-    const proxied = transport.request(
-      route.target,
-      { method: request.method, headers, timeout: UPSTREAM_IDLE_TIMEOUT_MS },
-      (upstreamResponse) => {
-        const status = upstreamResponse.statusCode ?? 502;
-        if (status >= 300 && status < 400) {
-          // Redirects are real traffic, not an edge case: GitLab answers the
-          // `.git`-less URL that `go` probes with a 301 to the canonical one.
-          // Following it in the container would send a request with no proxy
-          // credential to the forge directly, so the location is rewritten back
-          // onto this proxy — relative, since only the container knows which
-          // name it reached us by. The gate then runs again on the new path, and
-          // a redirect pointing anywhere else is refused rather than relayed.
-          const redirected = proxiedRedirect(upstreamResponse.headers.location, route, hosts);
-          upstreamResponse.resume();
-          if (!redirected) {
-            counters.upstream_errors += 1;
-            plainText(response, 502, "Upstream redirected outside the configured forges.");
+    // One attempt against one upstream. Wrapped in a function because a GET may
+    // have to be repeated against the location a redirect names, and the retry
+    // has to reuse everything below — headers, timeouts, error handling.
+    const forward = (current, hops) => {
+      const headers = { ...request.headers };
+      for (const header of STRIPPED_REQUEST_HEADERS) {
+        delete headers[header];
+      }
+      headers.authorization = current.host.authorization;
+
+      const transport = current.target.protocol === "http:" ? http : https;
+      const proxied = transport.request(
+        current.target,
+        { method: request.method, headers, timeout: UPSTREAM_IDLE_TIMEOUT_MS },
+        (upstreamResponse) => {
+          const status = upstreamResponse.statusCode ?? 502;
+          if (status >= 300 && status < 400) {
+            // Followed here rather than handed to the client. GitLab answers the
+            // `.git`-less URL that `go` probes with a 301 to the canonical one,
+            // and a client following it re-authenticates against what it sees as
+            // a new location: git then meets a challenge mid-negotiation and the
+            // fetch dies as "expected flush after ref listing". A hop taken here
+            // is invisible to git, and the gate runs again on the new path — a
+            // redirect cannot reach a forge, or a route, that was refused.
+            const next =
+              request.method === "GET" && hops < MAX_UPSTREAM_HOPS
+                ? redirectRoute(upstreamResponse.headers.location, current, hosts)
+                : null;
+            upstreamResponse.resume();
+            if (!next) {
+              counters.upstream_errors += 1;
+              plainText(response, 502, "Upstream redirected outside the configured forges.");
+              return;
+            }
+            rememberCanonical(current, next, canonical);
+            forward(next, hops + 1);
             return;
           }
-          response.writeHead(status, { location: redirected });
-          response.end();
-          return;
+          const outgoing = { ...upstreamResponse.headers };
+          for (const header of STRIPPED_RESPONSE_HEADERS) {
+            delete outgoing[header];
+          }
+          response.writeHead(status, outgoing);
+          // Streamed, never buffered: a fetch response is a packfile, and holding
+          // one whole would put the repository in the host process's memory.
+          upstreamResponse.pipe(response);
+          upstreamResponse.on("error", () => {
+            counters.upstream_errors += 1;
+            response.destroy();
+          });
         }
-        const outgoing = { ...upstreamResponse.headers };
-        for (const header of STRIPPED_RESPONSE_HEADERS) {
-          delete outgoing[header];
-        }
-        response.writeHead(status, outgoing);
-        // Streamed, never buffered: a fetch response is a packfile, and holding
-        // one whole would put the repository in the host process's memory.
-        upstreamResponse.pipe(response);
-        upstreamResponse.on("error", () => {
-          counters.upstream_errors += 1;
-          response.destroy();
-        });
-      }
-    );
+      );
 
-    proxied.on("timeout", () => {
-      counters.upstream_errors += 1;
-      proxied.destroy(new Error("upstream timed out"));
-    });
-    proxied.on("error", (error) => {
-      counters.upstream_errors += 1;
-      onWarning?.(`Git proxy could not reach ${route.host.key}: ${error.message}`);
-      plainText(response, 502, `Proxy could not reach ${route.host.key}: ${error.message}`);
-    });
-    request.on("error", () => proxied.destroy());
-    request.pipe(proxied);
+      proxied.on("timeout", () => {
+        counters.upstream_errors += 1;
+        proxied.destroy(new Error("upstream timed out"));
+      });
+      proxied.on("error", (error) => {
+        counters.upstream_errors += 1;
+        onWarning?.(`Git proxy could not reach ${current.host.key}: ${error.message}`);
+        plainText(response, 502, `Proxy could not reach ${current.host.key}: ${error.message}`);
+      });
+      request.on("error", () => proxied.destroy());
+      // Only the first attempt still has a body to send; a redirect is followed
+      // with a GET whose body was already consumed.
+      if (hops === 0) {
+        request.pipe(proxied);
+      } else {
+        proxied.end();
+      }
+    };
+
+    forward(route, 0);
+
   });
 
   await new Promise((resolve, reject) => {

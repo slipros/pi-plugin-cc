@@ -101,6 +101,26 @@ test("upload-pack POST is forwarded body and all", async () => {
   });
 });
 
+test("a chunked advertisement arrives intact, not double-encoded", async () => {
+  // A forge that streams its ref advertisement sends transfer-encoding: chunked.
+  // Copying that header onto our own response makes node frame the body a second
+  // time, and git rejects the result with "expected flush after ref listing".
+  const payload = "001e# service=git-upload-pack\n0000" + "0".repeat(4096);
+  const handler = (request, response) => {
+    response.writeHead(200, {
+      "content-type": "application/x-git-upload-pack-advertisement",
+      "transfer-encoding": "chunked"
+    });
+    response.write(payload.slice(0, 100));
+    response.end(payload.slice(100));
+  };
+  await withProxy({ handler }, async ({ base, proxy }) => {
+    const response = await call(base, "/forge.test/repo.git/info/refs?service=git-upload-pack", { token: proxy.token });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), payload);
+  });
+});
+
 test("push is refused at both of its steps, before any credential is attached", async () => {
   await withProxy({}, async ({ base, proxy, upstream }) => {
     const advertisement = await call(base, "/forge.test/repo.git/info/refs?service=git-receive-pack", {
@@ -168,14 +188,43 @@ test("a redirect to the same forge comes back as a path on the proxy", async () 
     response.writeHead(200, { "content-type": "application/x-git-upload-pack-advertisement" });
     response.end("refs");
   };
-  await withProxy({ handler }, async ({ base, proxy }) => {
+  await withProxy({ handler }, async ({ base, proxy, upstream }) => {
     const response = await call(base, "/forge.test/repo/info/refs?service=git-upload-pack", { token: proxy.token });
-    assert.equal(response.status, 301);
-    assert.equal(response.headers.get("location"), "/forge.test/repo.git/info/refs?service=git-upload-pack");
+    // The hop is invisible to the client: it gets the canonical answer, not a
+    // redirect it would have to re-authenticate against.
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "refs");
+    assert.equal(upstream.seen.at(-1).url, "/repo.git/info/refs?service=git-upload-pack");
+  });
+});
 
-    // Following it lands on the gate again, not past it.
-    const followed = await call(base, response.headers.get("location"), { token: proxy.token });
-    assert.equal(followed.status, 200);
+test("a canonicalised path is remembered for the POST that follows", async () => {
+  // GitLab redirects `…/repo/info/refs` to `…/repo.git/…` and then answers the
+  // POST at the un-canonical path with 422 — git derives it from the URL it was
+  // given, not from where the advertisement landed.
+  const handler = (request, response) => {
+    if (!request.url.startsWith("/repo.git/")) {
+      const upstream = `http://127.0.0.1:${request.socket.localPort}`;
+      response.writeHead(301, { location: `${upstream}/repo.git${request.url.slice("/repo".length)}` });
+      response.end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/x-git-upload-pack-result" });
+    response.end("pack");
+  };
+  await withProxy({ handler }, async ({ base, proxy, upstream }) => {
+    const advertisement = await call(base, "/forge.test/repo/info/refs?service=git-upload-pack", { token: proxy.token });
+    assert.equal(advertisement.status, 200);
+
+    const negotiation = await call(base, "/forge.test/repo/git-upload-pack", {
+      token: proxy.token,
+      method: "POST",
+      body: "0032want cafebabe\n"
+    });
+    assert.equal(negotiation.status, 200);
+    assert.equal(upstream.seen.at(-1).url, "/repo.git/git-upload-pack");
+    // The POST is not redirected: it reached the canonical path on the first try.
+    assert.equal(upstream.seen.filter((entry) => entry.url === "/repo/git-upload-pack").length, 0);
   });
 });
 
@@ -187,9 +236,21 @@ test("a redirect cannot smuggle push past the gate", async () => {
   };
   await withProxy({ handler }, async ({ base, proxy, upstream }) => {
     const response = await call(base, "/forge.test/repo/info/refs?service=git-upload-pack", { token: proxy.token });
-    const followed = await call(base, response.headers.get("location"), { token: proxy.token });
-    assert.equal(followed.status, 403);
+    assert.equal(response.status, 502);
     assert.equal(upstream.seen.filter((entry) => entry.url.includes("receive-pack")).length, 0);
+  });
+});
+
+test("a redirect loop ends, and does not hold the client forever", async () => {
+  const handler = (request, response) => {
+    const upstream = `http://127.0.0.1:${request.socket.localPort}`;
+    response.writeHead(302, { location: `${upstream}/repo.git/info/refs?service=git-upload-pack&n=${Math.random()}` });
+    response.end();
+  };
+  await withProxy({ handler }, async ({ base, proxy, upstream }) => {
+    const response = await call(base, "/forge.test/repo.git/info/refs?service=git-upload-pack", { token: proxy.token });
+    assert.equal(response.status, 502);
+    assert.ok(upstream.seen.length <= 5, `hops: ${upstream.seen.length}`);
   });
 });
 

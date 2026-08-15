@@ -359,6 +359,16 @@ Three kinds of tooling, three homes:
 - **Mounted from the host** — locally built binaries no registry has: `custom-gcl` (golangci-lint carrying house rules), `mockery`, protoc plugins. They live in `~/go/bin`, which the profile mounts read-only.
 - **Proxied, not copied** — the module cache. Bind mount the host download cache read-only and point Go at it: `GOPROXY=file:///host-gomod,https://proxy.golang.org,direct`. Gigabytes of already-fetched modules, private ones included, resolve instantly; the container never writes to the host cache and unpacks into its own volume. Verified with `--network none`: `go mod download` and `go test -race -count=1` both pass offline.
 
+## Deeper reading
+
+The skill file (`skills/pi/SKILL.md`) is what an agent loads on every invocation, so it holds the working commands and nothing else. The reasoning behind them lives here:
+
+- [docs/sandbox.md](docs/sandbox.md) — sandbox profiles, images, concurrency pools, why provider keys never enter the container
+- [docs/git-proxy.md](docs/git-proxy.md) — forge access from a sandbox: fetch through a per-run proxy, push refused
+- [docs/dind.md](docs/dind.md) — a docker daemon inside the sandbox, parallel runs, the host-side registry mirror
+- [docs/telemetry.md](docs/telemetry.md) — what `ctx`, `tok/s` and cost actually measure
+- [docs/config.md](docs/config.md) — config layers, presets, what a project may override
+
 ### Containers inside the sandbox
 
 Integration tests that start a database container need a docker daemon of their own — the `go-dind` profile gives the run one, with no host socket and no `--privileged`. What it takes to run rootless docker inside a container, what stays parallel-safe with several such runs at once, and the one-time host setup that keeps image pulls cheap: **[docs/dind.md](docs/dind.md)**.

@@ -288,7 +288,19 @@ sandbox build go-dind      # образ собирается отдельно о
 
 **Версия docker в образе закреплена на 28.x** (проверка в Dockerfile валит сборку, если пришло другое). В 29.x скрипт запуска пишет `net.ipv4.ip_forward` через sysctl и падает на read-only `/proc/sys`; лечится это только `systempaths=unconfined`, то есть возвратом доступа к `/proc/kcore` ради одного sysctl.
 
-**Переносимость.** Образ собирается под uid хоста (`RUNTIME_UID`/`RUNTIME_GID` companion передаёт из `process.getuid()`): для uid ≠ 1000 заводится пользователь и subuid-диапазон, иначе RootlessKit не стартует. При смене пользователя образ нужно пересобрать (`sandbox build go-dind`). Пул `dind` с лимитом 1: два go-dind-прогона на общем volume `pi-dind-images` порушили бы containerd (эксклюзивный lock на `meta.db`), поэтому они сериализуются.
+**Переносимость.** Образ собирается под uid хоста (`RUNTIME_UID`/`RUNTIME_GID` companion передаёт из `process.getuid()`): для uid ≠ 1000 заводится пользователь и subuid-диапазон, иначе RootlessKit не стартует. При смене пользователя образ нужно пересобрать (`sandbox build go-dind`).
+
+**Параллельные go-dind прогоны.** Хранилище образов у каждого прогона своё — монтирование помечено `:isolate`, и docker выдаёт контейнеру анонимный volume, умирающий вместе с ним. Иначе два демона дерутся за эксклюзивный lock containerd на общем volume и портят `meta.db`; общего RW-хранилища образов для нескольких dind в docker нет ([moby#40196](https://github.com/moby/moby/issues/40196)), поэтому изоляция — единственный способ поднять пул `dind` выше единицы. Кеши модулей и сборки при этом остаются общими: `:isolate` действует на одно монтирование, в отличие от `isolateCaches`, который анонимизирует все.
+
+Цена изоляции — холодное хранилище образов на каждом старте, и её снимает **зеркало-кеш на хосте**:
+
+```bash
+docker run -d --restart=always --name pi-registry-mirror -p 5000:5000 \
+  -v pi-registry-cache:/var/lib/registry \
+  -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io registry:2
+```
+
+Профиль передаёт демону внутри песочницы `PI_REGISTRY_MIRROR` (по умолчанию `http://host.docker.internal:5000`), entrypoint пишет из него `registry-mirrors` + `insecure-registries` + `max-concurrent-downloads: 10` в `daemon.json` до старта dockerd. Первый прогон греет зеркало, остальные тянут слои по локальной сети. Зеркало недоступно — docker сам идёт в апстрим, прогон не ломается. Проксируется только Docker Hub: приватные реестры ходят напрямую.
 
 **Остаточный риск.** Проверено pen-test-агентом изнутри: побег на хост **не достигнут**. seccomp реально отдаёт EPERM на `fsopen`/`open_by_handle_at`/`bpf`/`userfaultfd`/`kexec` даже с полными caps в user namespace — это и есть примитивы userns-escape. Агент может создавать user namespace и монтировать внутри него, но `mount_setattr` на host-маунтах даёт EPERM (их владелец — init userns), а побег остаётся только через уязвимость ядра, не через штатный механизм. Хостового демона, устройств хоста, немаскированного `/proc` и `CAP_SYS_ADMIN` снаружи у него нет. Прогон, ослабляющий изоляцию, сам об этом сообщает: `Sandbox replaces the default seccomp profile…`, `Sandbox passes the host device /dev/net/tun…`.
 

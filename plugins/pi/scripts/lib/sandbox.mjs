@@ -470,7 +470,26 @@ export function buildDockerRunArgs({
     // has no client for; with a proxy running, its rewrites are exactly the
     // ones that must not win. Docker would refuse the duplicate target anyway,
     // so a profile that still mounts it is dropped rather than failing the run.
-    if (gitProxy && parseMount(mount).target === gitconfigTarget) {
+    const parsed = parseMount(mount);
+    if (gitProxy && parsed.target === gitconfigTarget) {
+      continue;
+    }
+    // `:isolate` on a single mount, against `isolateCaches` on the whole run:
+    // some state cannot be shared at all, and saying so per mount is what keeps
+    // the rest of the caches warm. The case that forced it: a docker daemon
+    // inside the sandbox holds an exclusive lock on its image store, so two
+    // runs sharing one named volume corrupt it — which capped the parallel
+    // fleet at one. With a store per run they coexist, and the module and build
+    // caches stay shared. Refused rather than ignored where it cannot work: a
+    // silently shared store is the corruption this option exists to prevent.
+    if (parsed.options.includes("isolate")) {
+      const perRun = anonymousVolumeFor(mount, homeDir);
+      if (!perRun) {
+        throw new Error(
+          `Mount "${mount}": ":isolate" needs a writable named volume. A host path is the caller pointing somewhere on purpose, and a read-only mount carries nothing between runs.`
+        );
+      }
+      args.push("-v", perRun);
       continue;
     }
     if (isolatesState(sandbox)) {

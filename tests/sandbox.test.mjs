@@ -677,6 +677,52 @@ test("sessions are bucketed per workspace instead of landing in one shared pile"
   assert.notEqual(sessionDirFor("/a/repo"), sessionDirFor("/b/repo"));
 });
 
+test("a mount marked :isolate is per run, and the rest of the caches stay shared", () => {
+  // The docker daemon inside the sandbox holds an exclusive lock on its image
+  // store: two runs on one named volume corrupt it, which is what capped the
+  // parallel fleet at a single agent. Per-run storage lifts that cap without
+  // throwing away the module and build caches, which is what `isolateCaches`
+  // would have done.
+  const profiles = {
+    dind: {
+      mounts: [
+        "pi-dind-images:/home/pi/.local/share/docker:isolate",
+        "pi-plugin-gomod:/home/pi/go/pkg/mod",
+        "~/go/bin:/gobin:ro"
+      ]
+    }
+  };
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("dind", profiles),
+    cwd: "/home/me/project",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  const mounted = mounts(args);
+
+  assert.ok(mounted.includes("/home/pi/.local/share/docker"), "the image store is anonymous, one per run");
+  assert.ok(!mounted.includes("pi-dind-images:/home/pi/.local/share/docker"), "and never the shared volume");
+  assert.ok(mounted.includes("pi-plugin-gomod:/home/pi/go/pkg/mod"), "module cache is still shared between runs");
+  assert.ok(mounted.includes("/home/me/go/bin:/gobin:ro"), "unrelated mounts are untouched");
+});
+
+test(":isolate on something that cannot be per run is refused, not silently shared", () => {
+  const profiles = { dind: { mounts: ["/home/me/images:/var/lib/docker:isolate"] } };
+  assert.throws(
+    () =>
+      buildDockerRunArgs({
+        sandbox: normalizeSandbox("dind", profiles),
+        cwd: "/home/me/project",
+        identity: IDENTITY,
+        homeDir: "/home/me",
+        env: {}
+      }),
+    /isolate/,
+    "a host path cannot be handed out per run, and quietly sharing it is the corruption this prevents"
+  );
+});
+
 test("an untrusted workspace gets throwaway caches and its own agent volume", () => {
   const profiles = { go: { mounts: ["~/go/bin:/gobin:ro", "cache-vol:/home/pi/.cache", "shared-ro:/ro-vol:ro"] } };
   const args = buildDockerRunArgs({

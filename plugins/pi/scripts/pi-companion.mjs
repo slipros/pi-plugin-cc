@@ -77,6 +77,7 @@ import {
   listJobs,
   nowIso,
   resolveDetachedLogFile,
+  resolvePromptFile,
   resolveStateDir,
   upsertJob,
   writeJobFile
@@ -115,6 +116,8 @@ const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 // handing it off again, and both halves agree on the job id.
 const DETACHED_ENV = "PI_PLUGIN_DETACHED";
 const DETACHED_JOB_ENV = "PI_PLUGIN_JOB_ID";
+// Where the parent left the task text for the detached copy to pick up.
+const DETACHED_PROMPT_ENV = "PI_PLUGIN_PROMPT_FILE";
 
 /**
  * Incremental reader over a job's event file.
@@ -430,6 +433,35 @@ function readStdin() {
   }
 }
 
+/**
+ * The task text the parent left for this detached run, or null when this
+ * process is not one.
+ *
+ * Read once and removed: the same text is in the job record and in the journal,
+ * so the file has no second reader, and leaving it behind would keep a copy of
+ * somebody's repository around for as long as the job is retained.
+ */
+export function takeDetachedPrompt() {
+  const file = process.env[DETACHED_PROMPT_ENV];
+  if (!file) {
+    return null;
+  }
+  let text = "";
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    // A missing handoff file means the parent could not write it; the command
+    // falls back to resolving the task itself, exactly as before.
+    return null;
+  }
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    // The eviction sweep clears it later.
+  }
+  return text.trim() ? text : null;
+}
+
 function output(rendered, payload, asJson) {
   if (asJson) {
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
@@ -497,12 +529,13 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
 
   const settings = resolveRunSettings(config, command, overrides);
   if (!flags["git-name"] && !flags["git-email"]) {
-    // Identity order is flags, then git's own answer for this directory, then a
-    // preset. Config files outrank presets deliberately: an `includeIf
-    // "gitdir:…"` rule is the decision about who commits in this tree, while a
-    // preset only names a fallback for trees that have no such rule. In a
-    // sandbox this resolution is also the only way such a rule can survive —
-    // the container sees /workspace, not the path the rule matches.
+    // Identity order is flags, then git's own answer for this directory (or,
+    // outside a repository, the nearest `.gitconfig` above it), then a preset.
+    // Config files outrank presets deliberately: an `includeIf "gitdir:…"` rule
+    // is the decision about who commits in this tree, while a preset only names
+    // a fallback for trees that have no such rule. In a sandbox this resolution
+    // is also the only way such a rule can survive — the container sees
+    // /workspace, not the path the rule matches.
     settings.git = resolveCommitIdentity(runRoot) ?? settings.git;
   }
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
@@ -644,16 +677,30 @@ function gitIdentityEnv(git) {
  *
  * @returns {boolean} true when the run was handed off and this process is done
  */
-function detachBackgroundRun({ kind, workspaceRoot, jobId, title, settings }) {
+function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settings }) {
   const detachedLog = resolveDetachedLogFile(workspaceRoot, jobId);
   ensureStateDir(workspaceRoot);
   const handle = fs.openSync(detachedLog, "a");
+
+  // The child re-executes this command line with stdin closed, so a task that
+  // arrived on stdin exists only in this process. Handing the assembled text
+  // over through a file is what keeps `--background` and `--stdin` from losing
+  // it: the child used to re-read an empty stdin and run on the first line of
+  // the prompt alone — a brief-sized silence, since the run still started.
+  // 0600 because the text is the contents of somebody's repository.
+  const promptFile = resolvePromptFile(workspaceRoot, jobId);
+  fs.writeFileSync(promptFile, prompt ?? "", { encoding: "utf8", mode: 0o600 });
 
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
     cwd: process.cwd(),
     detached: true,
     stdio: ["ignore", handle, handle],
-    env: { ...process.env, [DETACHED_ENV]: "1", [DETACHED_JOB_ENV]: jobId }
+    env: {
+      ...process.env,
+      [DETACHED_ENV]: "1",
+      [DETACHED_JOB_ENV]: jobId,
+      [DETACHED_PROMPT_ENV]: promptFile
+    }
   });
   child.unref();
   fs.closeSync(handle);
@@ -968,8 +1015,11 @@ function measuredModels({ days = null, search = null } = {}) {
 
 async function commandDelegate(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
-  const piped = flags.stdin ? readStdin().trim() : "";
-  const prompt = [positional.join(" ").trim(), piped].filter(Boolean).join("\n\n");
+  // A detached run gets the text its parent already assembled: re-reading stdin
+  // here would find it closed and quietly drop whatever was piped in.
+  const handedOver = takeDetachedPrompt();
+  const piped = !handedOver && flags.stdin ? readStdin().trim() : "";
+  const prompt = handedOver ?? [positional.join(" ").trim(), piped].filter(Boolean).join("\n\n");
 
   if (!prompt) {
     throw new Error("Nothing to delegate. Pass the task text, e.g. `/pi:delegate investigate the flaky test`.");
@@ -993,7 +1043,7 @@ async function commandDelegate(argv, workspaceRoot) {
   const title = prompt.split("\n")[0].slice(0, 120);
   const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("delegate");
   if (flags.background && process.env[DETACHED_ENV] !== "1") {
-    detachBackgroundRun({ kind: "delegate", workspaceRoot, jobId, title, settings });
+    detachBackgroundRun({ kind: "delegate", workspaceRoot, jobId, title, prompt, settings });
     return 0;
   }
 
@@ -1070,7 +1120,9 @@ async function commandReview(argv, workspaceRoot) {
   });
 
   const focus = positional.join(" ").trim();
-  const prompt = interpolate(loadTaskTemplate(PLUGIN_ROOT, "review"), {
+  // A detached run reviews the diff its parent captured, rather than the tree
+  // as it happens to look once the child starts.
+  const prompt = takeDetachedPrompt() ?? interpolate(loadTaskTemplate(PLUGIN_ROOT, "review"), {
     TARGET: target.description,
     BRANCH: target.branch,
     BASE: target.base ?? "(working tree)",
@@ -1084,7 +1136,7 @@ async function commandReview(argv, workspaceRoot) {
   const title = `Review ${target.description}${focus ? ` — ${focus.slice(0, 60)}` : ""}`;
   const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("review");
   if (flags.background && process.env[DETACHED_ENV] !== "1") {
-    detachBackgroundRun({ kind: "review", workspaceRoot, jobId, title, settings });
+    detachBackgroundRun({ kind: "review", workspaceRoot, jobId, title, prompt, settings });
     return 0;
   }
 
@@ -1810,10 +1862,15 @@ async function commandRerun(argv, workspaceRoot) {
   // The job file wins over the journal: the journal's copy is redacted and
   // capped, which is right for storage and wrong as the text to send again.
   const recorded = local?.prompt ?? stored?.prompt ?? null;
-  const prompt = composeRerunPrompt(recorded, {
-    replacement: flags.prompt ?? (flags.stdin ? readStdin().trim() : null),
-    append: flags.append ?? []
-  });
+  // Same handoff as `delegate`: a rerun whose text came in on stdin has it only
+  // in the parent, and the recorded task is not the one the caller asked for.
+  const handedOver = takeDetachedPrompt();
+  const prompt =
+    handedOver ??
+    composeRerunPrompt(recorded, {
+      replacement: flags.prompt ?? (flags.stdin ? readStdin().trim() : null),
+      append: flags.append ?? []
+    });
   if (!prompt) {
     throw new Error(
       `Run "${reference}" has no stored task text — it predates prompt journalling, or its text has passed the ${DEFAULT_TEXT_TTL_DAYS}-day retention. ` +
@@ -1854,9 +1911,10 @@ async function commandRerun(argv, workspaceRoot) {
   const title = `Rerun of ${stored?.id ?? local?.id ?? reference}: ${prompt.split("\n")[0].slice(0, 100)}`;
   const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("delegate");
   if (flags.background && process.env[DETACHED_ENV] !== "1") {
-    // The detached copy re-runs this same command line, so it resolves the
-    // recorded task itself; nothing needs to travel with it.
-    detachBackgroundRun({ kind: "delegate", workspaceRoot, jobId, title, settings });
+    // The detached copy re-runs this same command line and could resolve the
+    // recorded task itself, but not the replacement or the appends the caller
+    // just made — those travel with the prompt.
+    detachBackgroundRun({ kind: "delegate", workspaceRoot, jobId, title, prompt, settings });
     return 0;
   }
 

@@ -44,10 +44,23 @@ export function resolveJobsDir(workspaceRoot) {
   return path.join(resolveStateDir(workspaceRoot), JOBS_DIR_NAME);
 }
 
-/** The directory every workspace bucket lives under. */
+/**
+ * The directory every workspace bucket lives under.
+ *
+ * Under the data home rather than the temp directory: transcripts, prompts and
+ * event streams are what a finished run is read by, and on a machine that
+ * clears `/tmp` on boot they were gone by the next morning — the log of the run
+ * that has to be explained is exactly the one no longer there. The journal
+ * (`jobs.db`) already lives here, so both halves of a run's history now age out
+ * together, by the eviction rule above rather than by a reboot.
+ */
 function stateRoot() {
   const dataDir = process.env.CLAUDE_PLUGIN_DATA;
-  return dataDir ? path.join(dataDir, "state") : path.join(os.tmpdir(), "pi-companion");
+  if (dataDir) {
+    return path.join(dataDir, "state");
+  }
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
+  return path.join(dataHome, "pi-plugin", "state");
 }
 
 /**
@@ -136,6 +149,18 @@ export function eventsPath(workspaceRoot, jobId) {
 }
 
 /**
+ * The task text handed to a detached background run.
+ *
+ * A background start re-executes this file in a child whose stdin is closed, so
+ * anything the caller piped in exists only in the parent. Writing it here is
+ * what carries it across the handoff; the child consumes the file and deletes
+ * it, and the eviction sweep clears whatever a killed child left behind.
+ */
+export function resolvePromptFile(workspaceRoot, jobId) {
+  return path.join(resolveJobsDir(workspaceRoot), `${jobId}.prompt.txt`);
+}
+
+/**
  * Read the job list.
  *
  * `readable: false` means the file exists but could not be parsed — which is
@@ -189,6 +214,7 @@ export function saveState(workspaceRoot, state, { evict = true } = {}) {
       removeIfExists(resolveDetachedLogFile(workspaceRoot, job.id));
       removeIfExists(eventsPath(workspaceRoot, job.id));
       removeIfExists(inboxPathFor(workspaceRoot, job.id));
+      removeIfExists(resolvePromptFile(workspaceRoot, job.id));
     }
   }
 

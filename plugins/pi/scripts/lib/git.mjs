@@ -252,8 +252,24 @@ export function collectReviewContext(cwd, target, { maxBytes = DEFAULT_MAX_CONTE
  * "gitdir:…"` rules apply — the mechanism that gives one identity per project
  * tree. Inside a container the same rules could never match: the repository is
  * at /workspace there, and the path a rule keys on no longer exists.
+ *
+ * A run root that is not itself a repository is the case this has to be careful
+ * about: `includeIf "gitdir:…"` keys on the repository being worked in, so with
+ * no repository under the cursor not one of those rules fires and git answers
+ * with the personal address from the global file. That answer looks valid and
+ * is wrong — it is the address a corporate forge rejects, discovered on the
+ * first push after the commits are already made. So when the directory is
+ * outside a repository, the tree is asked instead: the nearest `.gitconfig` at
+ * or above it that names a full identity wins, which is the same "one identity
+ * per project tree" the `includeIf` rules express, read directly.
  */
 export function resolveCommitIdentity(cwd) {
+  if (runCommand("git", ["rev-parse", "--git-dir"], { cwd }).status !== 0) {
+    const fromTree = identityFromEnclosingConfig(cwd);
+    if (fromTree) {
+      return fromTree;
+    }
+  }
   const name = runCommand("git", ["config", "user.name"], { cwd });
   const email = runCommand("git", ["config", "user.email"], { cwd });
   if (name.status !== 0 || email.status !== 0) {
@@ -261,6 +277,38 @@ export function resolveCommitIdentity(cwd) {
   }
   const identity = { name: name.stdout.trim(), email: email.stdout.trim() };
   return identity.name && identity.email ? identity : null;
+}
+
+/**
+ * Walk up from `cwd` and read the first `.gitconfig` that names both halves of
+ * an identity.
+ *
+ * Nearest wins, which is how the `includeIf` chain is written too: the general
+ * rule sits above and the narrower tree below overrides it. Half an identity is
+ * not an answer — git refuses to commit with a name and no address — so a file
+ * that only sets one of them is passed over rather than merged, keeping the
+ * result to a single deliberate source.
+ */
+function identityFromEnclosingConfig(cwd) {
+  let directory = path.resolve(cwd);
+  for (;;) {
+    const candidate = path.join(directory, ".gitconfig");
+    if (fs.existsSync(candidate)) {
+      const read = (key) => {
+        const result = runCommand("git", ["config", "-f", candidate, "--get", key], { cwd: directory });
+        return result.status === 0 ? result.stdout.trim() : "";
+      };
+      const identity = { name: read("user.name"), email: read("user.email") };
+      if (identity.name && identity.email) {
+        return identity;
+      }
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) {
+      return null;
+    }
+    directory = parent;
+  }
 }
 
 /**

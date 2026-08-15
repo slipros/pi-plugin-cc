@@ -359,6 +359,10 @@ Three kinds of tooling, three homes:
 - **Mounted from the host** — locally built binaries no registry has: `custom-gcl` (golangci-lint carrying house rules), `mockery`, protoc plugins. They live in `~/go/bin`, which the profile mounts read-only.
 - **Proxied, not copied** — the module cache. Bind mount the host download cache read-only and point Go at it: `GOPROXY=file:///host-gomod,https://proxy.golang.org,direct`. Gigabytes of already-fetched modules, private ones included, resolve instantly; the container never writes to the host cache and unpacks into its own volume. Verified with `--network none`: `go mod download` and `go test -race -count=1` both pass offline.
 
+### Containers inside the sandbox
+
+Integration tests that start a database container need a docker daemon of their own — the `go-dind` profile gives the run one, with no host socket and no `--privileged`. What it takes to run rootless docker inside a container, what stays parallel-safe with several such runs at once, and the one-time host setup that keeps image pulls cheap: **[docs/dind.md](docs/dind.md)**.
+
 ### The full inline form
 
 The profile is configurable per preset, in full:

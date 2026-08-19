@@ -9,8 +9,8 @@
 {
   "defaults": { "model": "openrouter/deepseek/deepseek-v4-flash-0731", "thinking": "high" },
   "presets": {
-    "fast":  { "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
-    "audit": { "model": "opencode-go/kimi-k3", "systemPrompt": "adversarial", "readOnly": true },
+    "fast":  { "description": "быстрые узкие вопросы без размышления", "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
+    "audit": { "description": "враждебный разбор готовой работы, ничего не правит", "model": "opencode-go/kimi-k3", "systemPrompt": "adversarial", "readOnly": true },
     "dba":   {
       "model": "opencode-go/kimi-k3",
       "systemPrompt": "@.claude/pi/prompts/dba.md",
@@ -22,7 +22,7 @@
 }
 ```
 
-**Пресет — это целый агент, а не только модель.** В нём можно задать любое поле запуска: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Задал один раз — дальше запускаешь `--preset dba`.
+**Пресет — это целый агент, а не только модель.** Дай ему `description` — одну строку о том, для чего он: её печатает `/pi:models` в списке пресетов, и по ней выбирают агента, не открывая системный промпт (чтение промпта ради выбора стоит дороже самого выбора). Кроме описания в пресете можно задать любое поле запуска: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`. Задал один раз — дальше запускаешь `--preset dba`.
 
 Один дефолт задан за тебя: `excludeTools: ["ask_question"]` — прогон неинтерактивный, спрашивать некого, и вопрос агента просто сожжёт ход. Вернуть инструмент: `"excludeTools": []` в любом слое.
 

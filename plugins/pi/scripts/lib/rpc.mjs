@@ -15,6 +15,7 @@ import {
   createTurnState,
   PI_BINARY,
   redactArgs,
+  recoveryDecision,
   summarizeTiming,
   truncationRetryLimit
 } from "./pi.mjs";
@@ -204,7 +205,13 @@ export async function runPiRpcTurn({
     // of that very session — so the run asks itself to continue instead of
     // ending and waiting for someone to notice.
     let lastStopReason = null;
-    let recoveries = 0;
+    // Лимит — на ПОДРЯД идущие обрывы: прогон живёт часами и сотнями ходов, и
+    // обрыв в его начале, после которого агент час работал нормально, ничего не
+    // говорит о том, застрял ли он сейчас. Счётчик обнуляется на каждом ответе,
+    // доведённом до конца. Общее число восстановлений только считается — для
+    // сообщения и журнала; ограничивают прогон его таймаут и бюджет.
+    let consecutiveRecoveries = 0;
+    let totalRecoveries = 0;
     const delivered = [];
 
     const send = (command) => {
@@ -266,13 +273,26 @@ export async function runPiRpcTurn({
         // every time, and each attempt costs a full ceiling of tokens. When the
         // attempts run out the run ends as truncated, which is what the job
         // phase and its warning icon are for.
-        if (lastStopReason === "length" && recoveries < truncationRetries && !closing && !aborted && !budgetStop) {
-          recoveries += 1;
+        const decision = recoveryDecision({
+          stopReason: lastStopReason,
+          consecutive: consecutiveRecoveries,
+          consecutiveLimit: truncationRetries,
+          blocked: closing || aborted || Boolean(budgetStop)
+        });
+        if (decision === "reset") {
+          // Агент довёл ответ до конца — прошлые обрывы больше ничего не
+          // предсказывают, и следующий получает полный лимит попыток.
+          consecutiveRecoveries = 0;
+        } else if (decision === "recover") {
+          consecutiveRecoveries += 1;
+          totalRecoveries += 1;
           report({
             phase: "working",
-            message: `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию (попытка ${recoveries} из ${truncationRetries}).`
+            message:
+              `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию ` +
+              `(попытка ${consecutiveRecoveries} из ${truncationRetries} подряд, ${totalRecoveries}-я за прогон).`
           });
-          if (send({ type: "prompt", message: CONTINUATION_PROMPT, id: `recover-${recoveries}` })) {
+          if (send({ type: "prompt", message: CONTINUATION_PROMPT, id: `recover-${totalRecoveries}` })) {
             lastStopReason = null;
             settledAt = null;
           }

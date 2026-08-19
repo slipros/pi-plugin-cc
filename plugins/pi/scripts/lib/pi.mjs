@@ -537,18 +537,53 @@ async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
  * each attempt costs a full ceiling of tokens. After the last attempt the run
  * returns as truncated, which is what the phase and the ⚠️ are for.
  */
+/**
+ * How many truncations in a row are worth continuing through.
+ *
+ * Generous on purpose: one attempt costs a ceiling of tokens and a few seconds,
+ * while the alternative is a run that ends mid-work and has to be picked up by
+ * hand. The counter resets on every answer the agent completes, so this is the
+ * allowance for being stuck right now — not a budget for the whole run.
+ */
+const DEFAULT_TRUNCATION_RETRIES = 10;
+
 export const CONTINUATION_PROMPT =
   "Твой предыдущий ответ был обрезан на потолке вывода: вызов инструмента не дошёл, " +
   "и часть работы осталась несделанной. Контекст сессии цел — продолжи ровно с места обрыва. " +
   "Не начинай задачу заново, не пересказывай уже сделанное и не повторяй длинных перечислений.";
 
+/**
+ * What to do when the agent has settled: continue it, or let the run end.
+ *
+ * "reset" — the answer completed, so earlier truncations no longer predict
+ * anything and the next one gets the full allowance again.
+ * "recover" — the last answer was cut off and there is allowance left.
+ * "stop" — nothing to recover, or the allowance is gone.
+ *
+ * The allowance counts CONSECUTIVE truncations only. A run lives for hours and
+ * hundreds of turns; a truncation it recovered from an hour ago says nothing
+ * about whether it is stuck now, and a counter that never reset would leave the
+ * rest of the run undefended. There is deliberately no second cap for the run
+ * as a whole: a run is bounded by its timeout and its budget, and another limit
+ * on top of those would only obscure which one actually stopped the work.
+ */
+export function recoveryDecision({ stopReason, consecutive = 0, consecutiveLimit = 0, blocked = false } = {}) {
+  if (stopReason !== "length") {
+    return "reset";
+  }
+  if (blocked || consecutive >= consecutiveLimit) {
+    return "stop";
+  }
+  return "recover";
+}
+
 export function truncationRetryLimit(env) {
   const raw = env?.PI_TRUNCATION_RETRIES;
   if (raw === undefined || raw === null || String(raw).trim() === "") {
-    return 2;
+    return DEFAULT_TRUNCATION_RETRIES;
   }
   const parsed = Number.parseInt(String(raw), 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_TRUNCATION_RETRIES;
 }
 
 /** Did the LAST answer of this run hit the ceiling? Mid-run truncation is not this. */

@@ -7,6 +7,7 @@ import {
   buildPiArgs,
   createTurnState,
   mergeRecoveredRun,
+  recoveryDecision,
   truncationRetryLimit,
   wasTruncated
 } from "../plugins/pi/scripts/lib/pi.mjs";
@@ -254,11 +255,11 @@ test("only a truncation on the LAST answer asks for a continuation", () => {
 });
 
 test("the retry limit is bounded, and a bad value does not disable it silently", () => {
-  assert.equal(truncationRetryLimit({}), 2, "default");
+  assert.equal(truncationRetryLimit({}), 10, "default");
   assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "0" }), 0, "off is a valid choice");
   assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "5" }), 5);
-  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "nonsense" }), 2, "garbage falls back, not to zero");
-  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "-3" }), 2, "negative is not 'never'");
+  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "nonsense" }), 10, "garbage falls back, not to zero");
+  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "-3" }), 10, "negative is not 'never'");
 });
 
 test("a recovered run is journalled as one job, not as the last leg alone", () => {
@@ -290,4 +291,42 @@ test("a recovered run is journalled as one job, not as the last leg alone", () =
 
   // Two recoveries in a row keep counting.
   assert.equal(mergeRecoveredRun(merged, next).recoveredTruncations, 2);
+});
+
+// The allowance is on CONSECUTIVE truncations, not on the run as a whole: a run
+// works for hours, and an early truncation that the agent recovered from says
+// nothing about whether it is stuck now.
+
+// The allowance is on CONSECUTIVE truncations, not on the run as a whole: a run
+// works for hours, and a truncation it recovered from an hour ago says nothing
+// about whether it is stuck now.
+test("a completed answer restores the full allowance", () => {
+  assert.equal(recoveryDecision({ stopReason: "stop", consecutive: 9, consecutiveLimit: 10 }), "reset");
+  assert.equal(recoveryDecision({ stopReason: "tool_calls", consecutive: 3, consecutiveLimit: 10 }), "reset");
+});
+
+test("consecutive truncations are continued until the allowance runs out", () => {
+  assert.equal(recoveryDecision({ stopReason: "length", consecutive: 0, consecutiveLimit: 10 }), "recover");
+  assert.equal(recoveryDecision({ stopReason: "length", consecutive: 9, consecutiveLimit: 10 }), "recover");
+  assert.equal(recoveryDecision({ stopReason: "length", consecutive: 10, consecutiveLimit: 10 }), "stop",
+    "ten in a row means stuck, not unlucky");
+});
+
+test("nothing else caps recoveries — the run's timeout and budget do", () => {
+  // A model that breaks every other turn keeps its allowance refreshed by the
+  // good answers in between, and that is intentional: it is making progress,
+  // and it pays for the breakage out of the same budget as everything else.
+  assert.equal(recoveryDecision({ stopReason: "length", consecutive: 0, consecutiveLimit: 10 }), "recover");
+});
+
+test("a run already ending is never continued", () => {
+  assert.equal(
+    recoveryDecision({ stopReason: "length", consecutive: 0, consecutiveLimit: 10, blocked: true }),
+    "stop",
+    "cancelled, over budget or shutting down"
+  );
+});
+
+test("turning recovery off leaves nothing to continue", () => {
+  assert.equal(recoveryDecision({ stopReason: "length", consecutive: 0, consecutiveLimit: 0 }), "stop");
 });

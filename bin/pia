@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# pia — короткий вход в pi-companion.
+#
+# Зачем: каждая команда к companion иначе начинается с полусотни символов пути
+# до node-скрипта, которые приходится писать заново в каждом вызове и держать
+# верными в брифах, хуках и документации. Одно имя вместо пути — и команда
+# становится предсказуемой: `pia delegate …`, `pia status`, `pia wait <job>`.
+#
+# Полный список команд — `pia` без аргументов.
+set -u
+
+# Путь до companion считается от расположения самого файла, через симлинки:
+# шим ставят симлинком в PATH, а лежать он может и в рабочей копии плагина, и в
+# каталоге установленного скилла. PI_COMPANION переопределяет резолв целиком —
+# чтобы гонять правки из другой копии, не трогая установленную.
+resolve_link() {
+  local target="$1" link
+  while [ -L "$target" ]; do
+    link=$(readlink "$target")
+    case "$link" in
+      /*) target="$link" ;;
+      *) target="$(dirname "$target")/$link" ;;
+    esac
+  done
+  printf '%s' "$target"
+}
+
+self=$(basename -- "$0")
+if [ -n "${PI_COMPANION:-}" ]; then
+  companion="$PI_COMPANION"
+else
+  root=$(cd -P -- "$(dirname -- "$(resolve_link "$0")")/.." && pwd)
+  companion="$root/plugins/pi/scripts/pi-companion.mjs"
+fi
+
+if [ ! -f "$companion" ]; then
+  echo "$self: не найден pi-companion: $companion" >&2
+  echo "     задай путь через PI_COMPANION=<путь к pi-companion.mjs>" >&2
+  exit 127
+fi
+
+# exec, а не вызов: сигналы, код возврата и stdin (бриф подаётся пайпом)
+# достаются самому companion без прослойки. Имя, под которым нас позвали,
+# уезжает в подсказку — иначе она учит длинной форме ровно там, где человек
+# ищет короткую.
+exec env "PI_INVOKED_AS=$self" node "$companion" "$@"

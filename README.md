@@ -12,7 +12,8 @@ Built in the shape of the official [Codex plugin](https://github.com/openai/code
 | `/pi:review` | Read-only code review of the working tree or a branch diff. |
 | `/pi:watch` | Watch what the agent is doing: turns, tool calls, answers. |
 | `/pi:steer` | Redirect a running agent mid-flight. |
-| `/pi:models` | List available models, presets and system prompts. |
+| `/pi:models` | The model catalogue: context window, output ceiling, thinking and image support. |
+| `/pi:presets` | The agents you configured — description, model, prompt, tools, sandbox — and the stored system prompts. |
 | `/pi:status` | Running and recent pi jobs — this workspace, or every one with `--global`. |
 | `/pi:result` | Stored output of a finished job, and `--diff` for what it changed. |
 | `/pi:wait` | Block until background jobs finish. |
@@ -46,6 +47,23 @@ ln -s "$PWD/skills/pi" ~/.claude/skills/pi
 /pi:setup
 ```
 
+### `pia` — the same companion from a shell
+
+Every slash command is a subcommand of one node script, and outside Claude Code
+— in a brief, in a hook, in a terminal — that script otherwise has to be named
+by a fifty-character path, kept correct in every place it is written down.
+[`bin/pia`](bin/pia) is a shim that works out the path itself, following
+symlinks, so it serves a checkout and an installed skill alike:
+
+```bash
+ln -s "$PWD/bin/pia" ~/.local/bin/pia
+pia presets      # the agents this setup offers, and what each is for
+pia status       # running and recent jobs
+```
+
+Run it with no arguments for the full command list. Every example in
+[`skills/pi/SKILL.md`](skills/pi/SKILL.md) is written for this entry point.
+
 ## Choosing a model
 
 Every run command takes the same selection flags:
@@ -61,7 +79,7 @@ Every run command takes the same selection flags:
 - `--preset <name>` applies a named bundle from your config (see below).
 - With no flags at all, pi uses its own configured default model.
 
-`/pi:models [search]` prints the catalogue with context windows and thinking support, followed by your presets and stored prompts.
+`/pi:models [search]` prints the catalogue with context windows and thinking support. Presets and stored prompts are `/pi:presets`, which answers a different question — not "what can answer me" but "who should do the work" — and answers it without walking several hundred catalogue entries.
 
 ## Choosing a system prompt
 
@@ -120,7 +138,9 @@ Optional. `~/.claude/pi/config.json` for personal defaults, `<repo>/.claude/pi/c
 }
 ```
 
-**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`, `budget`. Define them once and run `--preset dba`.
+**A preset is a whole agent, not just a model.** Every field a run understands can live in one: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `git`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`, `budget`. Define them once and run `--preset dba`.
+
+Give each one a `description` as well — a single line saying what it is for. `/pi:presets` prints it next to the profile, which is how an agent picks one without opening the system prompt behind it.
 
 ### Budgets: stopping a run that costs too much
 

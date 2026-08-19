@@ -26,7 +26,7 @@ Useful flags:
 - `--session last` — continue the previous pi session in this workspace.
 - `--timeout <seconds>` — hard limit; the default is 30 minutes.
 
-Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" models` first when you need to know what models exist, and `... setup` when something looks misconfigured.
+Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/pi-companion.mjs" presets` when you need to know which agents are configured and what each is for — it is the only command that lists them, and it answers without walking the model catalogue. `... models` lists the models themselves, and `... setup` reports what is misconfigured.
 
 ## Rules
 

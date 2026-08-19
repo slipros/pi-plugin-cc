@@ -134,7 +134,7 @@ export function resolvePromptValue(value, { workspaceRoot, pluginRoot = null, la
     if (named) {
       return { ...named, name: trimmed };
     }
-    const available = [...listNamedPrompts(pluginRoot, workspaceRoot).keys()].sort();
+    const available = [...listNamedPrompts(pluginRoot, workspaceRoot, homeDir).keys()].sort();
     throw new Error(
       `No system prompt named "${trimmed}". Available: ${available.join(", ") || "none"}. ` +
         `Pass inline text, @path/to/file.md, or add .claude/pi/prompts/${trimmed}.md.`
@@ -149,13 +149,13 @@ export function resolvePromptValue(value, { workspaceRoot, pluginRoot = null, la
  *
  * @returns {{ systemPrompt: string|null, appends: string[], sources: string[], name: string|null }}
  */
-export function buildSystemPrompt({ pluginRoot, workspaceRoot, settings }) {
+export function buildSystemPrompt({ pluginRoot, workspaceRoot, settings, homeDir = undefined }) {
   const sources = [];
   let systemPrompt = null;
   let name = null;
 
   if (settings.systemPrompt) {
-    const resolved = resolvePromptValue(settings.systemPrompt, { workspaceRoot, pluginRoot });
+    const resolved = resolvePromptValue(settings.systemPrompt, { workspaceRoot, pluginRoot, homeDir });
     systemPrompt = resolved.text;
     name = resolved.name;
     sources.push(
@@ -178,6 +178,7 @@ export function buildSystemPrompt({ pluginRoot, workspaceRoot, settings }) {
     const resolved = resolvePromptValue(value, {
       workspaceRoot,
       pluginRoot,
+      homeDir,
       label: "appended system prompt"
     });
     if (resolved.text) {

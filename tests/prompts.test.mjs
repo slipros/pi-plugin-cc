@@ -38,6 +38,23 @@ test("the built-in prompts ship with the plugin", () => {
   });
 });
 
+/**
+ * Пустой домашний каталог на время проверки.
+ *
+ * Резолв промптов ищет в трёх слоях, средний из которых — дом пользователя.
+ * Тест, не задавший его явно, читает настоящий: результат зависит от того,
+ * какие промпты человек завёл себе, и падает ровно там, где перекрытие
+ * работает как задумано.
+ */
+function withEmptyHome(run) {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-prompts-home-"));
+  try {
+    return run(homeDir);
+  } finally {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+}
+
 test("inline text stays inline", () => {
   withWorkspace((workspaceRoot) => {
     const resolved = resolvePromptValue("be extremely terse", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
@@ -138,15 +155,55 @@ test("an explicit prompt wins over the project SYSTEM.md", () => {
 
 test("APPEND_SYSTEM.md stacks on top of a named prompt", () => {
   withWorkspace((workspaceRoot) => {
-    writeFile(workspaceRoot, ".claude/pi/APPEND_SYSTEM.md", "always answer in Russian");
-    const built = buildSystemPrompt({
-      pluginRoot: PLUGIN_ROOT,
-      workspaceRoot,
-      settings: { systemPrompt: "fixer", appendSystemPrompt: ["and cite files"] }
+    withEmptyHome((homeDir) => {
+      writeFile(workspaceRoot, ".claude/pi/APPEND_SYSTEM.md", "always answer in Russian");
+      const built = buildSystemPrompt({
+        pluginRoot: PLUGIN_ROOT,
+        workspaceRoot,
+        homeDir,
+        settings: { systemPrompt: "fixer", appendSystemPrompt: ["and cite files"] }
+      });
+      assert.match(built.systemPrompt, /experienced engineer/i);
+      assert.equal(built.name, "fixer");
+      assert.deepEqual(built.appends, ["and cite files", "always answer in Russian"]);
     });
-    assert.match(built.systemPrompt, /experienced engineer/i);
-    assert.equal(built.name, "fixer");
-    assert.deepEqual(built.appends, ["and cite files", "always answer in Russian"]);
+  });
+});
+
+// Средний слой поиска: между проектом и плагином. До того как `homeDir` стал
+// параметром, проверить его было нечем — функция читала настоящий домашний
+// каталог, и результат зависел от того, что там завёл человек.
+test("a home prompt shadows the built-in one, and a project prompt shadows both", () => {
+  withWorkspace((workspaceRoot) => {
+    withEmptyHome((homeDir) => {
+      fs.mkdirSync(path.join(homeDir, ".claude/pi/prompts"), { recursive: true });
+      fs.writeFileSync(path.join(homeDir, ".claude/pi/prompts/explorer.md"), "home explorer", "utf8");
+
+      const fromHome = resolvePromptValue("explorer", { workspaceRoot, pluginRoot: PLUGIN_ROOT, homeDir });
+      assert.equal(fromHome.text, "home explorer", "домашний слой перекрывает плагинный");
+
+      writeFile(workspaceRoot, ".claude/pi/prompts/explorer.md", "project explorer");
+      const fromProject = resolvePromptValue("explorer", { workspaceRoot, pluginRoot: PLUGIN_ROOT, homeDir });
+      assert.equal(fromProject.text, "project explorer", "проектный слой перекрывает домашний");
+
+      const names = listNamedPrompts(PLUGIN_ROOT, workspaceRoot, homeDir);
+      assert.equal(names.get("explorer"), path.join(workspaceRoot, ".claude/pi/prompts/explorer.md"));
+    });
+  });
+});
+
+// Ошибка про неизвестное имя тоже перечисляет промпты по переданному дому, а не
+// по настоящему: иначе подсказка на чужой машине называет чужие имена.
+test("the list in the error respects the home directory it was given", () => {
+  withWorkspace((workspaceRoot) => {
+    withEmptyHome((homeDir) => {
+      fs.mkdirSync(path.join(homeDir, ".claude/pi/prompts"), { recursive: true });
+      fs.writeFileSync(path.join(homeDir, ".claude/pi/prompts/homely.md"), "home only", "utf8");
+      assert.throws(
+        () => resolvePromptValue("wizard", { workspaceRoot, pluginRoot: PLUGIN_ROOT, homeDir }),
+        /No system prompt named "wizard".*homely/s
+      );
+    });
   });
 });
 

@@ -1,6 +1,6 @@
 import { describeBudget } from "./budget.mjs";
 import { groupByProvider } from "./models.mjs";
-import { READ_ONLY_TOOLS } from "./pi.mjs";
+import { READ_ONLY_TOOLS, wasTruncated } from "./pi.mjs";
 
 function formatCost(cost) {
   if (typeof cost !== "number" || Number.isNaN(cost)) {
@@ -134,7 +134,7 @@ export function renderPresetsReport({ presets = {}, prompts = [] } = {}) {
   return joinLines(lines);
 }
 
-export function renderModelsReport({ models, presets, prompts, defaults, search, measured = null }) {
+export function renderModelsReport({ models, defaults, search, measured = null }) {
   const lines = ["# pi models", ""];
 
   if (!models.length) {
@@ -270,6 +270,25 @@ export function renderChangesSection(changes) {
   return lines;
 }
 
+/**
+ * The line a run has to carry when the ceiling had the last word.
+ *
+ * Two different facts, and the difference matters when reading the answer: a
+ * run that recovered has an answer in several pieces, a run that ended truncated
+ * has an answer that stops mid-thought.
+ */
+export function truncationWarning(execution) {
+  const recovered = Number(execution?.recoveredTruncations) || 0;
+  if (wasTruncated(execution)) {
+    return recovered
+      ? `The last answer hit the output ceiling and ${recovered} continuation(s) did not get past it — the work is probably unfinished.`
+      : "The last answer hit the output ceiling — the work is probably unfinished, whatever the exit code says.";
+  }
+  return recovered
+    ? `The answer hit the output ceiling ${recovered} time(s) and the run continued itself; the text below is joined from those pieces.`
+    : null;
+}
+
 export function renderRunResult({ title, job, settings, execution }) {
   const lines = renderRunHeader(title, { job, settings, execution });
   lines.push(...renderChangesSection(execution.changes));
@@ -285,10 +304,18 @@ export function renderRunResult({ title, job, settings, execution }) {
     lines.push("");
   }
 
-  if (execution.errors?.length) {
+  // A run cut off at the ceiling exits zero and reads as finished; the answer
+  // below it then ends on a sentence of intent. Said here because this report is
+  // where the answer is read, and `status` — which does carry the ⚠️ — is not
+  // where anyone looks once a job is done.
+  const truncationNote = truncationWarning(execution);
+  if (execution.errors?.length || truncationNote) {
     lines.push("## Problems", "");
-    for (const error of execution.errors) {
+    for (const error of execution.errors ?? []) {
       lines.push(`- ${error}`);
+    }
+    if (truncationNote) {
+      lines.push(`- ${truncationNote}`);
     }
     lines.push("");
   }
@@ -334,7 +361,7 @@ function jobLine(job) {
     `${icon} \`${job.id}\``,
     job.kind,
     job.status,
-    truncated ? "phase: truncated — ответ обрезан на потолке, работа скорее всего не доведена" : job.phase ? `phase: ${job.phase}` : null,
+    truncated ? "phase: truncated — the answer hit the output ceiling, the work is probably unfinished" : job.phase ? `phase: ${job.phase}` : null,
     job.model ? `model: ${job.model}` : null,
     job.elapsed ? `elapsed: ${job.elapsed}` : null
   ].filter(Boolean);

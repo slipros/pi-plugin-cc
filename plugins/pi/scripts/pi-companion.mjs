@@ -334,9 +334,9 @@ function canonicalFlag(token) {
 }
 
 function usage() {
-  // Под каким именем нас вызвали. Подсказка, печатающая путь к скрипту при
-  // вызове через короткую обёртку, учит длинной форме ровно там, где человек
-  // ищет короткую.
+  // The name we were called by. A hint that prints the path to the script when
+  // it was invoked through the short shim teaches the long form exactly where
+  // the reader is looking for the short one.
   const self = process.env.PI_INVOKED_AS || "pi-companion.mjs";
   return [
     "Usage:",
@@ -963,10 +963,12 @@ async function commandModels(argv, workspaceRoot) {
   const { config } = loadConfig(workspaceRoot);
   const models = listModels(PI_BINARY, { cwd: workspaceRoot, search });
 
+  // Presets and prompts live in `presets`, and that goes for `--json` too: a
+  // JSON payload richer than the report it accompanies is how the two answers
+  // drift apart, and the reason to split the commands was that walking the
+  // catalogue costs a second.
   const payload = {
     models,
-    presets: config.presets ?? {},
-    prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
     defaults: config.defaults ?? {},
     search,
     // What the catalogue cannot tell you: how these models actually behaved
@@ -1755,7 +1757,11 @@ async function commandWait(argv, workspaceRoot) {
     await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS));
   }
 
-  const failed = waited.filter((job) => job.status !== "completed");
+  // A job cut off at the output ceiling completed in the exit-code sense and did
+  // not finish in any sense that matters. `wait` is what a supervisor blocks on
+  // before treating work as done, so it must not answer zero here: the ⚠️ in
+  // `status` is no use to something that only reads the code.
+  const failed = waited.filter((job) => job.status !== "completed" || job.phase === "truncated");
   output(
     renderWaitReport(waited, { timedOut, waitSeconds }),
     { jobs: waited, timedOut },

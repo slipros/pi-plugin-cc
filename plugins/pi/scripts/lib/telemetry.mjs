@@ -1,4 +1,5 @@
 import { openDatabase } from "./db.mjs";
+import { isTruncationReason } from "./finish-reason.mjs";
 
 // Retention lives with the schema, in db.mjs; re-exported so the telemetry
 // module stays the one place that knows about `requests`.
@@ -86,11 +87,15 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
     ttft: [],
     genMs: 0,
     genOutTokens: 0,
-    // Why the LAST answer stopped. A run whose final response was cut off at
-    // the output ceiling did not finish: the truncated tool call is discarded
-    // by the agent and the text half becomes the answer, so the run reports
-    // success with the work undone. Only the last one matters — a truncation
-    // mid-run costs tokens and a retry, but the run goes on.
+    // Why the LAST REQUEST of this job stopped, and how many hit the output
+    // ceiling along the way.
+    //
+    // Read it for what it is: the last request, not the agent's last answer.
+    // Context compaction and other housekeeping go through the same proxy and
+    // legitimately end at their own ceiling, so a job that finished cleanly can
+    // still have `length` here. Deciding whether the WORK was cut off is done
+    // from the agent's own `stopReason` (see `wasTruncated` in pi.mjs); this
+    // number is a journal entry and a fallback for runs with no proxy events.
     lastFinishReason: null,
     truncated: 0
   };
@@ -159,10 +164,15 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
       pending.push(row);
 
       summary.count += 1;
-      if (request.finish_reason !== undefined && request.finish_reason !== null) {
-        summary.lastFinishReason = String(request.finish_reason);
-      }
-      if (String(request.finish_reason ?? "") === "length") {
+      // Written for every request, absent reason included. Keeping the previous
+      // value when a request ends without one made the field mean "the last
+      // reason anybody reported", so a stream that died right after a truncated
+      // answer left `length` standing and the job was filed as cut off.
+      summary.lastFinishReason =
+        request.finish_reason === undefined || request.finish_reason === null
+          ? null
+          : String(request.finish_reason);
+      if (isTruncationReason(request.finish_reason)) {
         summary.truncated += 1;
       }
       // "Failed" is anything the agent had to work around: a non-2xx answer, a

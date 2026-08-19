@@ -2,6 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { recordJobSafely } from "./db.mjs";
+import { wasTruncated } from "./pi.mjs";
 import {
   ensureStateDir,
   listJobs,
@@ -367,7 +368,12 @@ export async function runTrackedJob(job, runner) {
     // caught were caught by hand. A truncation earlier in the run is a
     // different thing — it costs tokens and a retry, and the run goes on —
     // which is why only the last one is judged here.
-    const truncated = status === "completed" && String(execution.proxyStats?.lastFinishReason ?? "") === "length";
+    //
+    // Judged on what the agent itself reported (`wasTruncated` prefers
+    // `stopReason`), not on the proxy's tally: the proxy exists only in a
+    // sandboxed run, so reading it alone left every unsandboxed run — the
+    // default — with a tick on work that stopped mid-sentence.
+    const truncated = status === "completed" && wasTruncated(execution);
     const completedAt = nowIso();
     const record = {
       ...running,
@@ -387,6 +393,10 @@ export async function runTrackedJob(job, runner) {
       timing: execution.timing ?? null,
       peakContext: execution.peakContext ?? 0,
       thinkingChars: execution.thinkingChars ?? 0,
+      // How many times the run continued itself past the output ceiling. A run
+      // rescued repeatedly finished, but it says something about the model that
+      // a clean run does not.
+      recoveredTruncations: execution.recoveredTruncations ?? 0,
       degraded,
       // What the run did to the working tree, measured while it still looked
       // the way the agent left it.

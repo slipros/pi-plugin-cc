@@ -21,14 +21,20 @@ import {
 } from "../plugins/pi/scripts/lib/jobs.mjs";
 import { listJobs, resolveJobFile, upsertJob, writeJobFile } from "../plugins/pi/scripts/lib/state.mjs";
 
-function withWorkspace(run) {
+// `async`, and awaiting the body, on purpose. Synchronous, it returned the
+// caller's promise and ran `finally` at the body's first `await`: the fixture
+// was deleted and CLAUDE_PLUGIN_DATA unset while the test was still running, so
+// everything after that point wrote to the real user state directory through the
+// homedir fallback — 168 stray job buckets in one afternoon, and three tests that
+// passed by reading a file they had written outside their own fixture.
+async function withWorkspace(run) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-jobs-"));
   const workspaceRoot = path.join(dataDir, "repo");
   fs.mkdirSync(workspaceRoot);
   const previous = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = dataDir;
   try {
-    return run(workspaceRoot);
+    return await run(workspaceRoot);
   } finally {
     if (previous === undefined) {
       delete process.env.CLAUDE_PLUGIN_DATA;
@@ -164,32 +170,33 @@ test("elapsed time is formatted for humans", () => {
 test("usage is recorded while the job runs, one write per assistant turn", async () => {
   const { createProgressReporter } = await import("../plugins/pi/scripts/lib/jobs.mjs");
   const { resolveJobFile, writeJobFile, ensureStateDir } = await import("../plugins/pi/scripts/lib/state.mjs");
-  const os = await import("node:os");
   const fsMod = await import("node:fs");
   const pathMod = await import("node:path");
 
-  const workspaceRoot = fsMod.mkdtempSync(pathMod.join(os.tmpdir(), "pi-usage-"));
-  ensureStateDir(workspaceRoot);
-  const jobId = "delegate-usage-1";
-  writeJobFile(workspaceRoot, jobId, { id: jobId, status: "running" });
-  const logFile = pathMod.join(workspaceRoot, "job.log");
-  const report = createProgressReporter({ workspaceRoot, jobId, logFile });
+  // Через ту же фикстуру, что и остальные: свой mkdtemp давал рабочий каталог,
+  // но не подменял CLAUDE_PLUGIN_DATA, и состояние джоба уезжало в настоящий
+  // каталог пользователя — там оно и оставалось после теста.
+  await withWorkspace(async (workspaceRoot) => {
+    ensureStateDir(workspaceRoot);
+    const jobId = "delegate-usage-1";
+    writeJobFile(workspaceRoot, jobId, { id: jobId, status: "running" });
+    const logFile = pathMod.join(workspaceRoot, "job.log");
+    const report = createProgressReporter({ workspaceRoot, jobId, logFile });
 
-  const read = () => JSON.parse(fsMod.readFileSync(resolveJobFile(workspaceRoot, jobId), "utf8"));
+    const read = () => JSON.parse(fsMod.readFileSync(resolveJobFile(workspaceRoot, jobId), "utf8"));
 
-  report({ phase: "working", message: "Turn 1 started.", usage: {} });
-  assert.equal(read().usage, undefined, "an empty usage object is not worth a write");
+    report({ phase: "working", message: "Turn 1 started.", usage: {} });
+    assert.equal(read().usage, undefined, "an empty usage object is not worth a write");
 
-  report({ phase: "working", message: "answer", usage: { input: 100, output: 20, cost: 0.5 } });
-  assert.deepEqual(read().usage, { input: 100, output: 20, cost: 0.5 });
+    report({ phase: "working", message: "answer", usage: { input: 100, output: 20, cost: 0.5 } });
+    assert.deepEqual(read().usage, { input: 100, output: 20, cost: 0.5 });
 
-  report({ phase: "working", message: "bash: ls", usage: { input: 100, output: 20, cost: 0.5 } });
-  assert.deepEqual(read().usage, { input: 100, output: 20, cost: 0.5 }, "unchanged counters do not rewrite");
+    report({ phase: "working", message: "bash: ls", usage: { input: 100, output: 20, cost: 0.5 } });
+    assert.deepEqual(read().usage, { input: 100, output: 20, cost: 0.5 }, "unchanged counters do not rewrite");
 
-  report({ phase: "working", message: "answer", usage: { input: 250, output: 40, cost: 1.5 } });
-  assert.deepEqual(read().usage, { input: 250, output: 40, cost: 1.5 });
-
-  fsMod.rmSync(workspaceRoot, { recursive: true, force: true });
+    report({ phase: "working", message: "answer", usage: { input: 250, output: 40, cost: 1.5 } });
+    assert.deepEqual(read().usage, { input: 250, output: 40, cost: 1.5 });
+  });
 });
 
 // The class this guards: a run whose last answer hit the output ceiling exits
@@ -232,5 +239,125 @@ test("a run without proxy telemetry keeps the old verdict", async () => {
     const job = { id: "pi-notel", kind: "delegate", title: "task", workspaceRoot, logFile: null };
     await runTrackedJob(job, async () => ({ exitStatus: 0, rendered: "ok", errors: [] }));
     assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-notel"), "utf8")).phase, "done");
+  });
+});
+
+// Сигнал берётся из самого прогона, а не из телеметрии прокси: прокси
+// поднимается только в песочнице, а несэндбоксный прогон — дефолт. Пока фаза
+// считалась по `proxyStats`, каждый такой обрыв уходил под галочку.
+test("an unsandboxed run reports truncation from its own stop reason", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-nosandbox", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 0,
+      rendered: "Now let me wire this up:",
+      errors: [],
+      stopReason: "length",
+      proxyStats: null
+    }));
+
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-nosandbox"), "utf8"));
+    assert.equal(stored.phase, "truncated");
+  });
+});
+
+// Провайдеры называют потолок по-разному: OpenAI `length`, Anthropic
+// `max_tokens`, Google `MAX_TOKENS`. Сравнение с одним написанием выключало
+// фичу для всех остальных.
+test("truncation is recognised in every provider's spelling", async () => {
+  for (const [id, stopReason] of [
+    ["pi-anthropic", "max_tokens"],
+    ["pi-google", "MAX_TOKENS"]
+  ]) {
+    await withWorkspace(async (workspaceRoot) => {
+      const job = { id, kind: "delegate", title: "task", workspaceRoot, logFile: null };
+      await runTrackedJob(job, async () => ({ exitStatus: 0, rendered: "…", errors: [], stopReason }));
+      assert.equal(
+        JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, id), "utf8")).phase,
+        "truncated",
+        `${stopReason} — тот же обрыв, что и length`
+      );
+    });
+  }
+});
+
+// Причина последнего ответа перебивает телеметрию прокси: компакция контекста
+// идёт через тот же прокси и штатно упирается в свой потолок, так что
+// `lastFinishReason` завершившегося прогона вполне может быть "length".
+test("a finished answer is not overruled by the proxy's last request", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-compaction", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 0,
+      rendered: "# отчёт\nСТАТУС\n",
+      errors: [],
+      stopReason: "stop",
+      proxyStats: { count: 40, failed: 0, lastFinishReason: "length", truncated: 1 }
+    }));
+
+    assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-compaction"), "utf8")).phase, "done");
+  });
+});
+
+test("a failed or cancelled run keeps its own phase, truncation or not", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const failed = { id: "pi-failed", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(failed, async () => ({
+      exitStatus: 1,
+      rendered: "",
+      errors: ["provider returned 500"],
+      stopReason: "length"
+    }));
+    const failedRecord = JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-failed"), "utf8"));
+    assert.equal(failedRecord.status, "failed");
+    assert.equal(failedRecord.phase, "failed", "обрыв не переписывает провал");
+
+    const cancelled = { id: "pi-cancelled", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(cancelled, async () => ({
+      exitStatus: 1,
+      rendered: "half",
+      errors: ["The run was aborted before pi finished."],
+      aborted: true,
+      stopReason: "length"
+    }));
+    const cancelledRecord = JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-cancelled"), "utf8"));
+    assert.equal(cancelledRecord.status, "cancelled");
+    assert.equal(cancelledRecord.phase, "failed");
+  });
+});
+
+// «Деградировавший» прогон — тот, что выдал работу и упал на косметике обрыва
+// потока; он считается completed, поэтому обрыв ответа для него значим так же.
+test("a degraded run still reports a truncated answer", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-degraded", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 1,
+      rendered: "Now let me wire this up:",
+      text: "Now let me wire this up:",
+      errors: ["stream ended without a finish_reason"],
+      stopReason: "length"
+    }));
+
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-degraded"), "utf8"));
+    assert.equal(stored.status, "completed", "работа доехала, падение косметическое");
+    assert.equal(stored.phase, "truncated");
+  });
+});
+
+test("how many times a run had to continue itself is kept in the record", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-recovered", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 0,
+      rendered: "# отчёт\nСТАТУС\n",
+      errors: [],
+      stopReason: "stop",
+      recoveredTruncations: 3
+    }));
+
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-recovered"), "utf8"));
+    assert.equal(stored.phase, "done", "прогон вытащил себя сам и закончился");
+    assert.equal(stored.recoveredTruncations, 3, "но чего это стоило — видно");
   });
 });

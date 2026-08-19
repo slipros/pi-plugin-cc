@@ -209,3 +209,49 @@ test("the rate is measured on generation windows, and short answers do not count
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Единственный производитель `lastFinishReason`, на котором держатся фаза
+// джоба и запасной сигнал восстановления. До этого поле не проверялось ничем:
+// downstream-тесты кормились рукописным `proxyStats`, и рекордер мог перестать
+// его заполнять незаметно.
+test("the summary reports why the LAST request ended, not the last reason seen", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-telemetry-finish-"));
+  const file = path.join(dir, "jobs.db");
+  try {
+    const recorder = createRequestRecorder("delegate-finish", { databaseFile: file });
+    recorder.record({ status: 200, stream: true, model: "m", finish_reason: "length" });
+    recorder.record({ status: 200, stream: true, model: "m", finish_reason: "tool_calls" });
+    recorder.record({ status: 200, stream: true, model: "m", finish_reason: "stop" });
+
+    const stats = recorder.stats();
+    assert.equal(stats.lastFinishReason, "stop");
+    assert.equal(stats.truncated, 1, "обрыв в середине прогона считается, но приговором не становится");
+
+    // Запрос без причины — это оборванное соединение, а не «как раньше».
+    // Пока значение залипало, прогон, у которого связь умерла после обрезанного
+    // ответа, получал фазу truncated по ответу, которого не было.
+    recorder.record({ status: 0, error_kind: "transport", stream: true, model: "m" });
+    assert.equal(recorder.stats().lastFinishReason, null);
+
+    recorder.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the truncation tally understands every provider's spelling", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-telemetry-spellings-"));
+  const file = path.join(dir, "jobs.db");
+  try {
+    const recorder = createRequestRecorder("delegate-spellings", { databaseFile: file });
+    recorder.record({ status: 200, stream: true, model: "m", finish_reason: "length" });
+    recorder.record({ status: 200, stream: true, model: "m", finish_reason: "max_tokens" });
+    recorder.record({ status: 200, stream: true, model: "m", finish_reason: "MAX_TOKENS" });
+    recorder.record({ status: 200, stream: true, model: "m", finish_reason: "stop" });
+
+    assert.equal(recorder.stats().truncated, 3);
+    recorder.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

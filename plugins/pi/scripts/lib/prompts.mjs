@@ -52,11 +52,18 @@ function readFileIfExists(filePath) {
   return null;
 }
 
-/** Directories searched for named prompts, most specific first. */
-export function promptSearchPath(pluginRoot, workspaceRoot) {
+/**
+ * Directories searched for named prompts, most specific first.
+ *
+ * `homeDir` is a parameter rather than a call to `os.homedir()` inside: a
+ * function that reads the real home directory cannot be tested for what it does
+ * with a name — the answer changes with whatever the person running the tests
+ * happens to have written there.
+ */
+export function promptSearchPath(pluginRoot, workspaceRoot, homeDir = os.homedir()) {
   return [
     path.join(workspaceRoot, ".claude", "pi", "prompts"),
-    path.join(os.homedir(), ".claude", "pi", "prompts"),
+    path.join(homeDir, ".claude", "pi", "prompts"),
     path.join(pluginRoot, "prompts", "system")
   ];
 }
@@ -65,9 +72,9 @@ export function promptSearchPath(pluginRoot, workspaceRoot) {
  * List the prompts available by name, project and user files shadowing the
  * built-in ones.
  */
-export function listNamedPrompts(pluginRoot, workspaceRoot) {
+export function listNamedPrompts(pluginRoot, workspaceRoot, homeDir) {
   const found = new Map();
-  for (const dir of promptSearchPath(pluginRoot, workspaceRoot)) {
+  for (const dir of promptSearchPath(pluginRoot, workspaceRoot, homeDir)) {
     if (!fs.existsSync(dir)) {
       continue;
     }
@@ -84,8 +91,8 @@ export function listNamedPrompts(pluginRoot, workspaceRoot) {
   return found;
 }
 
-function resolveNamedPrompt(name, { pluginRoot, workspaceRoot }) {
-  for (const dir of promptSearchPath(pluginRoot, workspaceRoot)) {
+function resolveNamedPrompt(name, { pluginRoot, workspaceRoot, homeDir }) {
+  for (const dir of promptSearchPath(pluginRoot, workspaceRoot, homeDir)) {
     for (const extension of PROMPT_FILE_EXTENSIONS) {
       const file = readFileIfExists(path.join(dir, `${name}${extension}`));
       if (file) {
@@ -101,7 +108,7 @@ function resolveNamedPrompt(name, { pluginRoot, workspaceRoot }) {
  *
  * @returns {{ text: string, source: string|null, name: string|null }}
  */
-export function resolvePromptValue(value, { workspaceRoot, pluginRoot = null, label = "system prompt" }) {
+export function resolvePromptValue(value, { workspaceRoot, pluginRoot = null, label = "system prompt", homeDir = undefined }) {
   const raw = String(value ?? "");
   if (!raw.trim()) {
     return { text: "", source: null, name: null };
@@ -123,7 +130,7 @@ export function resolvePromptValue(value, { workspaceRoot, pluginRoot = null, la
   }
 
   if (pluginRoot && NAME_PATTERN.test(trimmed)) {
-    const named = resolveNamedPrompt(trimmed, { pluginRoot, workspaceRoot });
+    const named = resolveNamedPrompt(trimmed, { pluginRoot, workspaceRoot, homeDir });
     if (named) {
       return { ...named, name: trimmed };
     }

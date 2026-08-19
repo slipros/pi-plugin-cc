@@ -47,11 +47,29 @@ test("inline text stays inline", () => {
   });
 });
 
+// Имя, которого заведомо нет ни в проекте, ни в домашнем каталоге: проверка
+// про механику резолва, а не про содержимое конкретного промпта. Прежняя версия
+// брала `explorer` и сверяла его текст — и краснела на машине, где такой промпт
+// заведён у пользователя, то есть ровно там, где перекрытие работает как задумано.
 test("a stored prompt is resolved by name", () => {
   withWorkspace((workspaceRoot) => {
-    const resolved = resolvePromptValue("explorer", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
-    assert.match(resolved.text, /codebase investigator/i);
-    assert.equal(resolved.name, "explorer");
+    const resolved = resolvePromptValue("fixer", { workspaceRoot, pluginRoot: PLUGIN_ROOT });
+    assert.equal(resolved.name, "fixer");
+    assert.ok(resolved.text.trim().length > 0, "имя развернулось в текст промпта");
+    assert.ok(resolved.source, "и в источник, из которого он взят");
+  });
+});
+
+test("the built-in prompt is what a name resolves to when nothing shadows it", () => {
+  withWorkspace((workspaceRoot) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-prompts-home-"));
+    try {
+      const resolved = resolvePromptValue("explorer", { workspaceRoot, pluginRoot: PLUGIN_ROOT, homeDir: home });
+      assert.equal(resolved.name, "explorer");
+      assert.match(resolved.text, /codebase investigator/i, "плагинный текст, а не пользовательский");
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

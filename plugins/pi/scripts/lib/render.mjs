@@ -157,7 +157,14 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
       ]
         .filter(Boolean)
         .join(", ");
-      lines.push(`- \`${name}\` — ${details || "no overrides"}`);
+      // `description` leads the line: picking a preset is a question of what the
+      // agent is FOR, and the caller should not have to open a system prompt to
+      // find that out — reading prompts to choose costs more than the choice.
+      lines.push(
+        preset.description
+          ? `- \`${name}\` — ${preset.description}${details ? ` · ${details}` : ""}`
+          : `- \`${name}\` — ${details || "no overrides"}`
+      );
     }
   } else {
     lines.push("- none configured (add a `presets` block to `.claude/pi/config.json`)");

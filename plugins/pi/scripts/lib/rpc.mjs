@@ -13,6 +13,7 @@ import {
   buildPiArgs,
   CONTINUATION_PROMPT,
   createTurnState,
+  joinRecoveredText,
   PI_BINARY,
   redactArgs,
   recoveryDecision,
@@ -26,6 +27,15 @@ import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } 
 
 const SETTLE_GRACE_MS = 1500;
 const SHUTDOWN_GRACE_MS = 5000;
+/**
+ * How long a continuation may go unanswered before the run stops waiting for it.
+ *
+ * Sending it takes away the finish detector; pi normally gives it back within
+ * milliseconds by starting a turn, and refuses it loudly when it cannot. This
+ * covers the third case — neither — which would otherwise hold the run until its
+ * hard timeout, hours after there was anything left to wait for.
+ */
+const RECOVERY_ACK_TIMEOUT_MS = 60_000;
 
 /**
  * Run one job against a live `pi --mode rpc` session.
@@ -95,6 +105,7 @@ export async function runPiRpcTurn({
   eventsFile = null,
   inboxFile = null,
   settleGraceMs = SETTLE_GRACE_MS,
+  recoveryAckMs = RECOVERY_ACK_TIMEOUT_MS,
   env = process.env,
   sandbox = null,
   jobId = null,
@@ -205,13 +216,44 @@ export async function runPiRpcTurn({
     // of that very session — so the run asks itself to continue instead of
     // ending and waiting for someone to notice.
     let lastStopReason = null;
-    // Лимит — на ПОДРЯД идущие обрывы: прогон живёт часами и сотнями ходов, и
-    // обрыв в его начале, после которого агент час работал нормально, ничего не
-    // говорит о том, застрял ли он сейчас. Счётчик обнуляется на каждом ответе,
-    // доведённом до конца. Общее число восстановлений только считается — для
-    // сообщения и журнала; ограничивают прогон его таймаут и бюджет.
+    // The allowance counts CONSECUTIVE truncations: a run lives for hours and
+    // hundreds of turns, and a truncation at its start, after which the agent
+    // worked fine for an hour, says nothing about whether it is stuck now. The
+    // counter resets on every answer carried to the end. The total is only
+    // counted — for the message and the job row; what bounds the run is its
+    // timeout and its budget.
     let consecutiveRecoveries = 0;
     let totalRecoveries = 0;
+    // Ответ, разорванный потолком, собирается обратно в один.
+    //
+    // Прогон отдаёт как ответ ПОСЛЕДНЕЕ сообщение, и это верно ровно до тех
+    // пор, пока последнее сообщение не оказывается продолжением: половина,
+    // написанная до обрыва, тогда просто пропадает. Для прогона, чей
+    // deliverable — сам текст (read-only исследователь, ревью), эта половина и
+    // есть работа. `answerAnchor` — индекс первого куска серии, `answersSeen` и
+    // `lastAnswerIndex` нужны, чтобы якорь не уехал на чужой ответ.
+    let answerAnchor = null;
+    let answersSeen = 0;
+    let lastAnswerIndex = null;
+    const foldRecoveredAnswer = () => {
+      if (answerAnchor === null) {
+        return;
+      }
+      const pieces = state.assistantTexts.slice(answerAnchor).filter(Boolean);
+      if (pieces.length > 1) {
+        state.assistantTexts.splice(answerAnchor, pieces.length, pieces.reduce(joinRecoveredText));
+      }
+      answerAnchor = null;
+      answersSeen = state.assistantTexts.length;
+      lastAnswerIndex = state.assistantTexts.length ? state.assistantTexts.length - 1 : null;
+    };
+
+    // When a continuation was handed to pi and has not been picked up yet.
+    // Sending it switches off the only "the run is over" detector (`settledAt`),
+    // so something has to switch it back on if the continuation goes nowhere —
+    // otherwise the run stands until the hard timeout, which on a three-hour
+    // preset means three hours of nothing.
+    let recoverySentAt = null;
     const delivered = [];
 
     const send = (command) => {
@@ -257,15 +299,18 @@ export async function runPiRpcTurn({
           const detail = event.error ?? event.message ?? "unknown error";
           state.errors.push(`pi rejected "${event.command}": ${detail}`);
           report({ phase: "working", message: `pi rejected ${event.command}: ${detail}` });
+          // A refused continuation must not leave the run waiting for a turn
+          // that will never start: the agent has settled and stays settled, so
+          // hand the finish detector back what sending the prompt took from it.
+          if (event.command === "prompt" && recoverySentAt !== null) {
+            recoverySentAt = null;
+            settledAt = Date.now();
+          }
         }
         return;
       }
 
       appendEvent(event);
-
-      if (event.type === "message_end" && event.message?.role === "assistant") {
-        lastStopReason = event.message.stopReason ?? null;
-      }
 
       if (event.type === "agent_settled") {
         settledAt = Date.now();
@@ -280,28 +325,48 @@ export async function runPiRpcTurn({
           blocked: closing || aborted || Boolean(budgetStop)
         });
         if (decision === "reset") {
-          // Агент довёл ответ до конца — прошлые обрывы больше ничего не
-          // предсказывают, и следующий получает полный лимит попыток.
+          // The agent carried an answer to the end — earlier truncations no
+          // longer predict anything, and the next one gets the full allowance.
           consecutiveRecoveries = 0;
+          foldRecoveredAnswer();
         } else if (decision === "recover") {
-          consecutiveRecoveries += 1;
-          totalRecoveries += 1;
-          report({
-            phase: "working",
-            message:
-              `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию ` +
-              `(попытка ${consecutiveRecoveries} из ${truncationRetries} подряд, ${totalRecoveries}-я за прогон).`
-          });
-          if (send({ type: "prompt", message: CONTINUATION_PROMPT, id: `recover-${totalRecoveries}` })) {
+          // Counted and announced only once the continuation is actually on the
+          // wire: a write that failed spends an attempt on nothing and puts a
+          // line in the log for work that was never asked for.
+          if (send({ type: "prompt", message: CONTINUATION_PROMPT, id: `recover-${totalRecoveries + 1}` })) {
+            consecutiveRecoveries += 1;
+            totalRecoveries += 1;
             lastStopReason = null;
             settledAt = null;
+            recoverySentAt = Date.now();
+            if (answerAnchor === null && lastAnswerIndex !== null) {
+              answerAnchor = lastAnswerIndex;
+            }
+            report({
+              phase: "working",
+              message:
+                `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию ` +
+                `(подряд идущая попытка ${consecutiveRecoveries} из ${truncationRetries}, всего за прогон: ${totalRecoveries}).`
+            });
           }
         }
       } else if (event.type === "agent_start" || event.type === "turn_start") {
         settledAt = null;
+        recoverySentAt = null;
       }
 
       const update = applyPiEvent(state, event);
+      // Читается ПОСЛЕ applyPiEvent: до него текст этого ответа ещё не в
+      // состоянии, и якорь склейки указал бы на чужой, более ранний ответ.
+      // Порядок обработчиков от этого не страдает — `agent_settled` приходит
+      // отдельным событием, когда `message_end` уже разобран целиком.
+      if (event.type === "message_end" && event.message?.role === "assistant") {
+        lastStopReason = event.message.stopReason ?? null;
+        const answered = state.assistantTexts.length;
+        // Ответ без текста индекса не даёт: склеивать в нём нечего.
+        lastAnswerIndex = answered > answersSeen ? answered - 1 : null;
+        answersSeen = answered;
+      }
       // The accumulated usage rides along with every progress event, so a job
       // that is still running can report what it has spent so far — until now
       // the number only existed in this process and landed on disk at the end.
@@ -417,6 +482,11 @@ export async function runPiRpcTurn({
           return;
         }
         inbox?.drain();
+        if (recoverySentAt !== null && Date.now() - recoverySentAt >= recoveryAckMs) {
+          state.errors.push("pi never picked up the continuation sent after a truncated answer.");
+          recoverySentAt = null;
+          settledAt = Date.now();
+        }
         const quietFor = Date.now() - Math.max(settledAt ?? 0, lastControlAt);
         if (settledAt !== null && (aborted || budgetStop || quietFor >= settleGraceMs)) {
           clearInterval(poll);
@@ -459,6 +529,9 @@ export async function runPiRpcTurn({
     }
 
 
+    // Попытки могли кончиться на обрезанном ответе — куски всё равно склеиваются:
+    // недоведённая работа читается целиком или не читается вовсе.
+    foldRecoveredAnswer();
     const text = state.assistantTexts.at(-1) ?? "";
     const errors = [...state.errors];
     if (spawnError) {
@@ -502,6 +575,11 @@ export async function runPiRpcTurn({
       proxyStats: proxy?.stats?.() ?? null,
       queue: state.queue,
       steering: delivered,
+      // How many times the run had to continue itself past the output ceiling.
+      // Without it a clean run and a run rescued seven times look identical in
+      // the journal, and "a series of truncations means change the executor" is
+      // a rule nobody can apply.
+      recoveredTruncations: totalRecoveries,
       aborted,
       budgetStop,
       thinkingLevel: state.thinkingLevel ?? null,

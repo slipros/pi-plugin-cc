@@ -266,24 +266,29 @@ test("a recovered run is journalled as one job, not as the last leg alone", () =
   const first = {
     text: "", sessionId: "s1", usage: { input: 100, output: 16384 }, turns: 13,
     toolCalls: ["read"], toolErrors: 700, peakContext: 170_000, thinkingChars: 10,
-    slotWaitMs: 5, timing: { generationMs: 1000, toolMs: 50 }, errors: ["cut off"],
+    slotWaitMs: 5, timing: { spanMs: 1000, modelMs: 950, toolMs: 50 }, errors: ["cut off"],
     proxyStats: { lastFinishReason: "length" }
   };
   const next = {
     text: "СТАТУС\ncommit: abc1234", sessionId: "s1", usage: { input: 40, output: 900 }, turns: 4,
     toolCalls: ["edit"], toolErrors: 0, peakContext: 180_000, thinkingChars: 3,
-    slotWaitMs: 2, timing: { generationMs: 300, toolMs: 20 }, errors: [],
+    slotWaitMs: 2, timing: { spanMs: 300, modelMs: 280, toolMs: 20 }, errors: [],
     proxyStats: { lastFinishReason: "stop" }
   };
   const merged = mergeRecoveredRun(first, next);
 
-  assert.equal(merged.text, "СТАТУС\ncommit: abc1234", "the answer is where the work ended up");
+  assert.equal(
+    merged.text,
+    "СТАТУС\ncommit: abc1234",
+    "первая половина пуста — склеивать нечего, остаётся ответ прохода восстановления"
+  );
   assert.deepEqual(merged.usage, { input: 140, output: 17284 }, "a recovery pass costs real tokens");
   assert.equal(merged.turns, 17);
   assert.deepEqual(merged.toolCalls, ["read", "edit"]);
   assert.equal(merged.toolErrors, 700);
   assert.equal(merged.peakContext, 180_000, "peaks are maxima, not sums");
-  assert.deepEqual(merged.timing, { generationMs: 1300, toolMs: 70 });
+  // Форма — та, что реально возвращает summarizeTiming: spanMs/modelMs/toolMs.
+  assert.deepEqual(merged.timing, { spanMs: 1300, modelMs: 1230, toolMs: 70 });
   assert.equal(merged.slotWaitMs, 7);
   assert.deepEqual(merged.errors, ["cut off"], "the reason it had to recover is not lost");
   assert.equal(merged.recoveredTruncations, 1);
@@ -292,10 +297,6 @@ test("a recovered run is journalled as one job, not as the last leg alone", () =
   // Two recoveries in a row keep counting.
   assert.equal(mergeRecoveredRun(merged, next).recoveredTruncations, 2);
 });
-
-// The allowance is on CONSECUTIVE truncations, not on the run as a whole: a run
-// works for hours, and an early truncation that the agent recovered from says
-// nothing about whether it is stuck now.
 
 // The allowance is on CONSECUTIVE truncations, not on the run as a whole: a run
 // works for hours, and a truncation it recovered from an hour ago says nothing

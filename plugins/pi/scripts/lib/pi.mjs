@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { budgetExceeded } from "./budget.mjs";
+import { isTruncationReason } from "./finish-reason.mjs";
 import { listModels } from "./models.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
@@ -536,21 +537,21 @@ async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
  * Bounded on purpose: a model stuck in a loop hits the ceiling every time, and
  * each attempt costs a full ceiling of tokens. After the last attempt the run
  * returns as truncated, which is what the phase and the ⚠️ are for.
- */
-/**
- * How many truncations in a row are worth continuing through.
  *
- * Generous on purpose: one attempt costs a ceiling of tokens and a few seconds,
- * while the alternative is a run that ends mid-work and has to be picked up by
- * hand. The counter resets on every answer the agent completes, so this is the
- * allowance for being stuck right now — not a budget for the whole run.
+ * How many in a row are worth continuing through is generous on purpose: one
+ * attempt costs a ceiling of tokens and a few seconds, while the alternative is
+ * a run that ends mid-work and has to be picked up by hand. The counter resets
+ * on every answer the agent completes, so this is the allowance for being stuck
+ * right now — not a budget for the whole run.
  */
 const DEFAULT_TRUNCATION_RETRIES = 10;
 
 export const CONTINUATION_PROMPT =
-  "Твой предыдущий ответ был обрезан на потолке вывода: вызов инструмента не дошёл, " +
-  "и часть работы осталась несделанной. Контекст сессии цел — продолжи ровно с места обрыва. " +
-  "Не начинай задачу заново, не пересказывай уже сделанное и не повторяй длинных перечислений.";
+  "Твой предыдущий ответ был обрезан на потолке вывода: конец ответа не дошёл, " +
+  "и если там был вызов инструмента — он не выполнен. Контекст сессии цел: продолжи ровно с места обрыва. " +
+  "Не начинай задачу заново и не пересказывай уже сделанную работу; " +
+  "если обрыв разорвал отчёт, выписку или перечисление — продолжи его с места разрыва.";
+
 
 /**
  * What to do when the agent has settled: continue it, or let the run end.
@@ -568,7 +569,7 @@ export const CONTINUATION_PROMPT =
  * on top of those would only obscure which one actually stopped the work.
  */
 export function recoveryDecision({ stopReason, consecutive = 0, consecutiveLimit = 0, blocked = false } = {}) {
-  if (stopReason !== "length") {
+  if (!isTruncationReason(stopReason)) {
     return "reset";
   }
   if (blocked || consecutive >= consecutiveLimit) {
@@ -586,9 +587,22 @@ export function truncationRetryLimit(env) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_TRUNCATION_RETRIES;
 }
 
-/** Did the LAST answer of this run hit the ceiling? Mid-run truncation is not this. */
+/**
+ * Did the LAST answer of this run hit the ceiling? Mid-run truncation is not this.
+ *
+ * The agent's own report of why its last message ended is the primary signal,
+ * because it exists in every run. The proxy's tally is the fallback and only
+ * that: it exists solely when the run went through the credential proxy — that
+ * is, only in a sandbox — and it names the last REQUEST of the job, which is not
+ * always the agent's last answer (context compaction runs through the same
+ * proxy and legitimately ends at its own ceiling).
+ */
+export function finishReasonOf(result) {
+  return result?.stopReason ?? result?.proxyStats?.lastFinishReason ?? null;
+}
+
 export function wasTruncated(result) {
-  return String(result?.proxyStats?.lastFinishReason ?? "") === "length";
+  return isTruncationReason(finishReasonOf(result));
 }
 
 /**
@@ -598,26 +612,61 @@ export function wasTruncated(result) {
  * job cost", and a recovery pass costs real tokens and real turns. The text and
  * the session come from the last pass, since that is where the work ended up.
  */
+/**
+ * Durations of both passes as durations of one job.
+ *
+ * The fields are named rather than summed by "every number I find": the shape
+ * comes from `summarizeTiming`, where all three happen to be durations today,
+ * and the day a timestamp or a percentile joins it, blind summing would put
+ * quiet nonsense in the journal instead of failing.
+ */
 function mergeTiming(first, next) {
   if (!first || typeof first !== "object") return next;
   if (!next || typeof next !== "object") return first;
-  const merged = { ...first };
-  for (const [key, value] of Object.entries(next)) {
-    merged[key] = typeof value === "number" && typeof first[key] === "number" ? first[key] + value : value;
+  const sum = (left, right) => (Number(left) || 0) + (Number(right) || 0);
+  return {
+    ...next,
+    spanMs: sum(first.spanMs, next.spanMs),
+    modelMs: sum(first.modelMs, next.modelMs),
+    toolMs: sum(first.toolMs, next.toolMs)
+  };
+}
+
+/** Two usage tallies as one. Numbers add up; anything else is taken from the later one. */
+export function sumUsage(first, next) {
+  const merged = { ...(first ?? {}) };
+  for (const [key, value] of Object.entries(next ?? {})) {
+    merged[key] = typeof value === "number" ? (Number(merged[key]) || 0) + value : value;
   }
   return merged;
 }
 
+/**
+ * The answer of a run that had to be continued.
+ *
+ * A run reports its LAST message as the answer (`state.assistantTexts.at(-1)`),
+ * which is right until the last message is a continuation: the half written
+ * before the ceiling cut in is then dropped. For a run whose deliverable is the
+ * text itself — a read-only explorer, a review — that dropped half is the work.
+ * So the halves are joined, and the seam is marked: the first one ends
+ * mid-sentence and a reader has to see why.
+ */
+export function joinRecoveredText(first, next) {
+  if (!next) {
+    return first ?? "";
+  }
+  if (!first) {
+    return next;
+  }
+  return `${first}\n\n[продолжение после обрыва на потолке вывода]\n\n${next}`;
+}
+
 export function mergeRecoveredRun(first, next) {
   const sum = (left, right) => (Number(left) || 0) + (Number(right) || 0);
-  const usage = { ...(first.usage ?? {}) };
-  for (const [key, value] of Object.entries(next.usage ?? {})) {
-    usage[key] = typeof value === "number" ? sum(usage[key], value) : value;
-  }
   return {
     ...next,
-    text: next.text || first.text,
-    usage,
+    text: joinRecoveredText(first.text, next.text),
+    usage: sumUsage(first.usage, next.usage),
     turns: sum(first.turns, next.turns),
     toolCalls: Array.isArray(first.toolCalls) && Array.isArray(next.toolCalls)
       ? [...first.toolCalls, ...next.toolCalls]
@@ -699,8 +748,19 @@ export async function runPiTurn({
   // from here on, not only the one that reaches the end: a slot wait that
   // gives up, a container that fails to spawn and a thrown budget stop all
   // used to leave a listener alive with a live forge token behind it.
-  const runTurn = async ({ resumeSession = null, resumePrompt = null } = {}) => {
-    const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
+  const runTurn = async ({
+    resumeSession = null,
+    resumePrompt = null,
+    // What is left of the run's own deadline, not a fresh one. A continuation
+    // finishes the work the first pass started, so it spends that work's time:
+    // a per-pass timeout would multiply the run's stated ceiling by the number
+    // of retries, and a three-hour preset would quietly become a day and a half.
+    turnTimeoutMs = timeoutMs,
+    // What earlier passes already spent. The budget bounds the JOB, so a pass
+    // that starts with the allowance already gone must not get a fresh one.
+    budgetBase = null
+  } = {}) => {
+    const slot = await awaitSandboxSlot(sandbox, { timeoutMs: turnTimeoutMs, onProgress });
     // A recovery pass reuses everything about the run except where it starts:
     // the session carries the whole context, so the continuation only has to say
     // where to pick up.
@@ -764,7 +824,10 @@ export async function runPiTurn({
       if (budgetStop) {
         return;
       }
-      const exceeded = budgetExceeded(budget, { usage: state.usage, turns: state.turns });
+      const exceeded = budgetExceeded(budget, {
+        usage: budgetBase ? sumUsage(budgetBase.usage, state.usage) : state.usage,
+        turns: (budgetBase?.turns ?? 0) + state.turns
+      });
       if (!exceeded) {
         return;
       }
@@ -781,7 +844,7 @@ export async function runPiTurn({
     };
 
     const timer =
-      timeoutMs > 0
+      turnTimeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
             try {
@@ -793,7 +856,7 @@ export async function runPiTurn({
             if (isSandboxed(sandbox)) {
               removeSandboxContainer(launch.containerName);
             }
-          }, timeoutMs)
+          }, turnTimeoutMs)
         : null;
 
     child.stdout.setEncoding("utf8");
@@ -856,7 +919,7 @@ export async function runPiTurn({
     const text = state.assistantTexts.at(-1) ?? "";
     const errors = [...state.errors];
     if (timedOut) {
-      errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
+      errors.push(`pi exceeded the ${Math.round(turnTimeoutMs / 1000)}s timeout and was terminated.`);
     }
     if (budgetStop) {
       errors.push(`Stopped by the run budget: ${budgetStop}.`);
@@ -895,21 +958,51 @@ export async function runPiTurn({
       timedOut,
       containerName: launch.containerName,
       command: `${launch.command} ${redactArgs(launch.args)}`
+    };
   };
 
+  // One deadline for the job, fixed before the first pass. `remainingMs` is
+  // what a continuation is allowed to spend, and a run that has already used up
+  // its time does not get another pass at all.
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
+  const remainingMs = () => (deadline === null ? 0 : deadline - Date.now());
+
   try {
-    let result = await runTurn();
-    for (let attempt = 1; attempt <= truncationRetries && wasTruncated(result) && result.sessionId; attempt += 1) {
+    let result = await runTurn({ turnTimeoutMs: timeoutMs });
+    let recovered = 0;
+    for (;;) {
+      const decision = recoveryDecision({
+        stopReason: finishReasonOf(result),
+        consecutive: recovered,
+        consecutiveLimit: truncationRetries,
+        // Everything that means "do not start another pass": the previous one
+        // was stopped rather than finished, there is nothing to resume from, or
+        // the run has no time left to spend. Without this a run killed by its
+        // budget would answer the ceiling with another full-priced pass.
+        blocked:
+          Boolean(result.budgetStop) ||
+          Boolean(result.timedOut) ||
+          !result.sessionId ||
+          (deadline !== null && remainingMs() <= 0)
+      });
+      if (decision !== "recover") {
+        break;
+      }
+      recovered += 1;
       onProgress?.({
         phase: "working",
-        message: `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию (попытка ${attempt} из ${truncationRetries}).`
+        message: `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию (попытка ${recovered} из ${truncationRetries}).`
       });
-      const next = await runTurn({ resumeSession: result.sessionId, resumePrompt: CONTINUATION_PROMPT });
+      const next = await runTurn({
+        resumeSession: result.sessionId,
+        resumePrompt: CONTINUATION_PROMPT,
+        turnTimeoutMs: deadline === null ? 0 : remainingMs(),
+        budgetBase: { usage: result.usage, turns: result.turns }
+      });
       result = mergeRecoveredRun(result, next);
     }
     return result;
   } finally {
     await closeProxies();
   }
-  };
 }

@@ -8,7 +8,16 @@ import { budgetExceeded } from "./budget.mjs";
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
 import { runCommand } from "./process.mjs";
-import { applyPiEvent, buildPiArgs, createTurnState, PI_BINARY, redactArgs, summarizeTiming } from "./pi.mjs";
+import {
+  applyPiEvent,
+  buildPiArgs,
+  CONTINUATION_PROMPT,
+  createTurnState,
+  PI_BINARY,
+  redactArgs,
+  summarizeTiming,
+  truncationRetryLimit
+} from "./pi.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
 import { openGitProxy, withGitProxy } from "./git-proxy.mjs";
 import { settleProxyPorts } from "./proxy-bind.mjs";
@@ -94,6 +103,7 @@ export async function runPiRpcTurn({
   if (!prompt || !String(prompt).trim()) {
     throw new Error("Refusing to start pi with an empty prompt.");
   }
+  const truncationRetries = truncationRetryLimit(env);
 
   // A profile may cap how many of its containers run at once, because the
   // provider behind it caps sessions. Queue here, before the container is
@@ -187,6 +197,14 @@ export async function runPiRpcTurn({
     let budgetStop = null;
     let closing = false;
     let lastControlAt = 0;
+    // Recovery after an answer cut off at the output ceiling. The failure is not
+    // cosmetic: the truncated answer loses its tool call, so if that was the
+    // last turn the agent stops mid-work and the run still exits successfully.
+    // Everything needed to carry on is already here — this is the live channel
+    // of that very session — so the run asks itself to continue instead of
+    // ending and waiting for someone to notice.
+    let lastStopReason = null;
+    let recoveries = 0;
     const delivered = [];
 
     const send = (command) => {
@@ -238,8 +256,27 @@ export async function runPiRpcTurn({
 
       appendEvent(event);
 
+      if (event.type === "message_end" && event.message?.role === "assistant") {
+        lastStopReason = event.message.stopReason ?? null;
+      }
+
       if (event.type === "agent_settled") {
         settledAt = Date.now();
+        // Bounded on purpose: a model stuck repeating itself hits the ceiling
+        // every time, and each attempt costs a full ceiling of tokens. When the
+        // attempts run out the run ends as truncated, which is what the job
+        // phase and its warning icon are for.
+        if (lastStopReason === "length" && recoveries < truncationRetries && !closing && !aborted && !budgetStop) {
+          recoveries += 1;
+          report({
+            phase: "working",
+            message: `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию (попытка ${recoveries} из ${truncationRetries}).`
+          });
+          if (send({ type: "prompt", message: CONTINUATION_PROMPT, id: `recover-${recoveries}` })) {
+            lastStopReason = null;
+            settledAt = null;
+          }
+        }
       } else if (event.type === "agent_start" || event.type === "turn_start") {
         settledAt = null;
       }

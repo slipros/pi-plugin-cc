@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  READ_ONLY_TOOLS,
   applyPiEvent,
   buildPiArgs,
   createTurnState,
-  READ_ONLY_TOOLS
+  mergeRecoveredRun,
+  truncationRetryLimit,
+  wasTruncated
 } from "../plugins/pi/scripts/lib/pi.mjs";
 
 test("a bare run only asks for non-interactive json output", () => {
@@ -236,4 +239,55 @@ test("a tool left open when the run ends does not swallow the run", async () => 
   const timing = summarizeTiming(state.timing);
   assert.equal(timing.toolMs, 0);
   assert.equal(timing.modelMs, 9000);
+});
+
+// A run whose last answer hit the output ceiling has not finished: the truncated
+// answer lost its tool call, and the work stopped mid-sentence. The run
+// continues itself from the session rather than waiting to be noticed.
+test("only a truncation on the LAST answer asks for a continuation", () => {
+  assert.equal(wasTruncated({ proxyStats: { lastFinishReason: "length" } }), true);
+  // Cut off earlier in the run: cost tokens and a retry, then finished normally.
+  assert.equal(wasTruncated({ proxyStats: { lastFinishReason: "tool_calls", truncated: 2 } }), false);
+  assert.equal(wasTruncated({ proxyStats: { lastFinishReason: "stop" } }), false);
+  assert.equal(wasTruncated({ proxyStats: null }), false, "no telemetry is not a truncation");
+  assert.equal(wasTruncated({}), false);
+});
+
+test("the retry limit is bounded, and a bad value does not disable it silently", () => {
+  assert.equal(truncationRetryLimit({}), 2, "default");
+  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "0" }), 0, "off is a valid choice");
+  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "5" }), 5);
+  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "nonsense" }), 2, "garbage falls back, not to zero");
+  assert.equal(truncationRetryLimit({ PI_TRUNCATION_RETRIES: "-3" }), 2, "negative is not 'never'");
+});
+
+test("a recovered run is journalled as one job, not as the last leg alone", () => {
+  const first = {
+    text: "", sessionId: "s1", usage: { input: 100, output: 16384 }, turns: 13,
+    toolCalls: ["read"], toolErrors: 700, peakContext: 170_000, thinkingChars: 10,
+    slotWaitMs: 5, timing: { generationMs: 1000, toolMs: 50 }, errors: ["cut off"],
+    proxyStats: { lastFinishReason: "length" }
+  };
+  const next = {
+    text: "СТАТУС\ncommit: abc1234", sessionId: "s1", usage: { input: 40, output: 900 }, turns: 4,
+    toolCalls: ["edit"], toolErrors: 0, peakContext: 180_000, thinkingChars: 3,
+    slotWaitMs: 2, timing: { generationMs: 300, toolMs: 20 }, errors: [],
+    proxyStats: { lastFinishReason: "stop" }
+  };
+  const merged = mergeRecoveredRun(first, next);
+
+  assert.equal(merged.text, "СТАТУС\ncommit: abc1234", "the answer is where the work ended up");
+  assert.deepEqual(merged.usage, { input: 140, output: 17284 }, "a recovery pass costs real tokens");
+  assert.equal(merged.turns, 17);
+  assert.deepEqual(merged.toolCalls, ["read", "edit"]);
+  assert.equal(merged.toolErrors, 700);
+  assert.equal(merged.peakContext, 180_000, "peaks are maxima, not sums");
+  assert.deepEqual(merged.timing, { generationMs: 1300, toolMs: 70 });
+  assert.equal(merged.slotWaitMs, 7);
+  assert.deepEqual(merged.errors, ["cut off"], "the reason it had to recover is not lost");
+  assert.equal(merged.recoveredTruncations, 1);
+  assert.equal(merged.proxyStats.lastFinishReason, "stop", "the verdict is about the final answer");
+
+  // Two recoveries in a row keep counting.
+  assert.equal(mergeRecoveredRun(merged, next).recoveredTruncations, 2);
 });

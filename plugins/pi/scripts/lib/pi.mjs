@@ -523,6 +523,82 @@ async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
   }
 }
 
+/**
+ * Recovery after an answer cut off at the output ceiling.
+ *
+ * The failure is not rare and not cosmetic: a model that slips into repeating
+ * itself generates until the ceiling, the truncated answer loses its tool call,
+ * and if that was the last turn the run exits zero with the work half done.
+ * Everything needed to carry on is still there — the session holds the whole
+ * context — so the run continues itself rather than waiting for someone to
+ * notice and type the continuation by hand.
+ *
+ * Bounded on purpose: a model stuck in a loop hits the ceiling every time, and
+ * each attempt costs a full ceiling of tokens. After the last attempt the run
+ * returns as truncated, which is what the phase and the ⚠️ are for.
+ */
+export const CONTINUATION_PROMPT =
+  "Твой предыдущий ответ был обрезан на потолке вывода: вызов инструмента не дошёл, " +
+  "и часть работы осталась несделанной. Контекст сессии цел — продолжи ровно с места обрыва. " +
+  "Не начинай задачу заново, не пересказывай уже сделанное и не повторяй длинных перечислений.";
+
+export function truncationRetryLimit(env) {
+  const raw = env?.PI_TRUNCATION_RETRIES;
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return 2;
+  }
+  const parsed = Number.parseInt(String(raw), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2;
+}
+
+/** Did the LAST answer of this run hit the ceiling? Mid-run truncation is not this. */
+export function wasTruncated(result) {
+  return String(result?.proxyStats?.lastFinishReason ?? "") === "length";
+}
+
+/**
+ * One run out of the original and its continuation.
+ *
+ * Counters are summed rather than replaced: the journal answers "what did this
+ * job cost", and a recovery pass costs real tokens and real turns. The text and
+ * the session come from the last pass, since that is where the work ended up.
+ */
+function mergeTiming(first, next) {
+  if (!first || typeof first !== "object") return next;
+  if (!next || typeof next !== "object") return first;
+  const merged = { ...first };
+  for (const [key, value] of Object.entries(next)) {
+    merged[key] = typeof value === "number" && typeof first[key] === "number" ? first[key] + value : value;
+  }
+  return merged;
+}
+
+export function mergeRecoveredRun(first, next) {
+  const sum = (left, right) => (Number(left) || 0) + (Number(right) || 0);
+  const usage = { ...(first.usage ?? {}) };
+  for (const [key, value] of Object.entries(next.usage ?? {})) {
+    usage[key] = typeof value === "number" ? sum(usage[key], value) : value;
+  }
+  return {
+    ...next,
+    text: next.text || first.text,
+    usage,
+    turns: sum(first.turns, next.turns),
+    toolCalls: Array.isArray(first.toolCalls) && Array.isArray(next.toolCalls)
+      ? [...first.toolCalls, ...next.toolCalls]
+      : sum(first.toolCalls, next.toolCalls),
+    toolErrors: sum(first.toolErrors, next.toolErrors),
+    errors: [...(first.errors ?? []), ...(next.errors ?? [])],
+    // Timings and peaks describe the whole job, not its last leg.
+    timing: mergeTiming(first.timing, next.timing),
+    peakContext: Math.max(Number(first.peakContext) || 0, Number(next.peakContext) || 0),
+    thinkingChars: sum(first.thinkingChars, next.thinkingChars),
+    slotWaitMs: sum(first.slotWaitMs, next.slotWaitMs),
+    recoveredTruncations: (Number(first.recoveredTruncations) || 0) + 1,
+    proxyStats: next.proxyStats ?? first.proxyStats
+  };
+}
+
 export async function runPiTurn({
   cwd,
   prompt,
@@ -538,6 +614,7 @@ export async function runPiTurn({
   if (!prompt || !String(prompt).trim()) {
     throw new Error("Refusing to start pi with an empty prompt.");
   }
+  const truncationRetries = truncationRetryLimit(env);
 
   // A profile may cap how many of its containers run at once, because the
   // provider behind it caps sessions. Queue here, before the container is
@@ -587,9 +664,14 @@ export async function runPiTurn({
   // from here on, not only the one that reaches the end: a slot wait that
   // gives up, a container that fails to spawn and a thrown budget stop all
   // used to leave a listener alive with a live forge token behind it.
-  const runTurn = async () => {
+  const runTurn = async ({ resumeSession = null, resumePrompt = null } = {}) => {
     const slot = await awaitSandboxSlot(sandbox, { timeoutMs, onProgress });
-    const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs, cwd, jobId, env });
+    // A recovery pass reuses everything about the run except where it starts:
+    // the session carries the whole context, so the continuation only has to say
+    // where to pick up.
+    const turnArgs = resumeSession ? buildPiArgs({ ...options, sessionId: resumeSession }) : piArgs;
+    const turnPrompt = resumePrompt ?? prompt;
+    const launch = resolveLaunch({ sandbox, binary: PI_BINARY, piArgs: turnArgs, cwd, jobId, env });
     const state = createTurnState();
     const report = (event) => {
       if (event && onProgress) {
@@ -709,7 +791,7 @@ export async function runPiTurn({
     // and without this handler that is an unhandled 'error' event that kills the
     // process before the job can be recorded as failed.
     child.stdin.on("error", () => {});
-    child.stdin.end(String(prompt));
+    child.stdin.end(String(turnPrompt));
 
     const exitStatus = await new Promise((resolve, reject) => {
       child.on("error", (error) => {
@@ -781,7 +863,16 @@ export async function runPiTurn({
   };
 
   try {
-    return await runTurn();
+    let result = await runTurn();
+    for (let attempt = 1; attempt <= truncationRetries && wasTruncated(result) && result.sessionId; attempt += 1) {
+      onProgress?.({
+        phase: "working",
+        message: `Ответ обрезан на потолке вывода — работа не доведена. Продолжаю сессию (попытка ${attempt} из ${truncationRetries}).`
+      });
+      const next = await runTurn({ resumeSession: result.sessionId, resumePrompt: CONTINUATION_PROMPT });
+      result = mergeRecoveredRun(result, next);
+    }
+    return result;
   } finally {
     await closeProxies();
   }

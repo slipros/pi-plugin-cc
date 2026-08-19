@@ -191,3 +191,46 @@ test("usage is recorded while the job runs, one write per assistant turn", async
 
   fsMod.rmSync(workspaceRoot, { recursive: true, force: true });
 });
+
+// The class this guards: a run whose last answer hit the output ceiling exits
+// zero with the work undone — the truncated tool call is dropped and a sentence
+// of intent becomes the final answer. Nothing else in the pipeline notices.
+test("a run cut off on its last answer is not reported as done", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-trunc", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 0,
+      rendered: "Now let me register it in the service and wire it up:",
+      errors: [],
+      proxyStats: { count: 13, failed: 0, lastFinishReason: "length", truncated: 1 }
+    }));
+
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-trunc"), "utf8"));
+    assert.equal(stored.status, "completed", "the process did exit zero — that part is not a lie");
+    assert.equal(stored.phase, "truncated", "but the work is not finished, and the record has to say so");
+  });
+});
+
+test("a truncation earlier in the run is not held against a finished job", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-mid", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 0,
+      rendered: "# отчёт\nСТАТУС\n",
+      errors: [],
+      // Cut off mid-run: costs tokens and a retry, then the run carried on and
+      // finished normally.
+      proxyStats: { count: 212, failed: 0, lastFinishReason: "tool_calls", truncated: 2 }
+    }));
+
+    assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-mid"), "utf8")).phase, "done");
+  });
+});
+
+test("a run without proxy telemetry keeps the old verdict", async () => {
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-notel", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({ exitStatus: 0, rendered: "ok", errors: [] }));
+    assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspaceRoot, "pi-notel"), "utf8")).phase, "done");
+  });
+});

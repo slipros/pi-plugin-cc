@@ -80,7 +80,20 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
   }
 
   const pending = [];
-  const summary = { count: 0, failed: 0, ttft: [], genMs: 0, genOutTokens: 0 };
+  const summary = {
+    count: 0,
+    failed: 0,
+    ttft: [],
+    genMs: 0,
+    genOutTokens: 0,
+    // Why the LAST answer stopped. A run whose final response was cut off at
+    // the output ceiling did not finish: the truncated tool call is discarded
+    // by the agent and the text half becomes the answer, so the run reports
+    // success with the work undone. Only the last one matters — a truncation
+    // mid-run costs tokens and a retry, but the run goes on.
+    lastFinishReason: null,
+    truncated: 0
+  };
   let seq = 0;
   let timer = null;
 
@@ -146,6 +159,12 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
       pending.push(row);
 
       summary.count += 1;
+      if (request.finish_reason !== undefined && request.finish_reason !== null) {
+        summary.lastFinishReason = String(request.finish_reason);
+      }
+      if (String(request.finish_reason ?? "") === "length") {
+        summary.truncated += 1;
+      }
       // "Failed" is anything the agent had to work around: a non-2xx answer, a
       // stream that ended early, a request that never reached the provider.
       if (request.error_kind || !(Number(request.status) >= 200 && Number(request.status) < 300)) {
@@ -176,7 +195,9 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
         failed: summary.failed,
         ttftP50Ms: median(summary.ttft) ?? 0,
         genMs: Math.round(summary.genMs),
-        genOutTokens: summary.genOutTokens
+        genOutTokens: summary.genOutTokens,
+        lastFinishReason: summary.lastFinishReason,
+        truncated: summary.truncated
       };
     },
 

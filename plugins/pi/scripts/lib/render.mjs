@@ -309,12 +309,17 @@ const STATUS_ICONS = {
 };
 
 function jobLine(job) {
-  const icon = STATUS_ICONS[job.status] ?? "•";
+  // A run cut off at the output ceiling exits zero, so it would otherwise carry
+  // a tick: the phase is one word in the middle of the line and the tick is
+  // what gets read. That misreading is what the phase exists to prevent, so
+  // here the warning takes the icon.
+  const truncated = job.phase === "truncated";
+  const icon = truncated ? "⚠️" : (STATUS_ICONS[job.status] ?? "•");
   const parts = [
     `${icon} \`${job.id}\``,
     job.kind,
     job.status,
-    job.phase ? `phase: ${job.phase}` : null,
+    truncated ? "phase: truncated — ответ обрезан на потолке, работа скорее всего не доведена" : job.phase ? `phase: ${job.phase}` : null,
     job.model ? `model: ${job.model}` : null,
     job.elapsed ? `elapsed: ${job.elapsed}` : null
   ].filter(Boolean);

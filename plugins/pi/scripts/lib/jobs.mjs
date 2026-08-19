@@ -358,11 +358,21 @@ export async function runTrackedJob(job, runner) {
       (execution.errors ?? []).every((message) => /finish_reason|stream ended/i.test(String(message)));
     const degraded = execution.exitStatus !== 0 && delivered && cosmetic && !execution.timedOut && !execution.aborted;
     const status = execution.exitStatus === 0 || degraded ? "completed" : execution.aborted ? "cancelled" : "failed";
+    // A run whose LAST answer was cut off at the output ceiling has not
+    // finished, whatever its exit code says. The truncated response ends mid
+    // tool call; the agent discards the call and keeps the text, so the run
+    // settles on a sentence of intent — "now let me wire this up" — and exits
+    // zero with the work undone. Every such run in one epic's journal reported
+    // success: nine of them were genuinely unfinished, and the ones that were
+    // caught were caught by hand. A truncation earlier in the run is a
+    // different thing — it costs tokens and a retry, and the run goes on —
+    // which is why only the last one is judged here.
+    const truncated = status === "completed" && String(execution.proxyStats?.lastFinishReason ?? "") === "length";
     const completedAt = nowIso();
     const record = {
       ...running,
       status,
-      phase: status === "completed" ? "done" : "failed",
+      phase: status === "completed" ? (truncated ? "truncated" : "done") : "failed",
       pid: null,
       completedAt,
       sessionId: execution.sessionId ?? null,

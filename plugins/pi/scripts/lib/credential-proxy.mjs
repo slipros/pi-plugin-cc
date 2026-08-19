@@ -265,12 +265,58 @@ export const MASKED_MODEL = "agent-model";
  * model answers it, and — more usefully — cannot ask for a different one: the
  * name it sends is overwritten on the way out.
  */
+/**
+ * Which field this provider takes the output ceiling in.
+ *
+ * pi infers it from the provider name and base URL, and the mask replaces both:
+ * behind it every provider looks like stock OpenAI and is sent
+ * `max_completion_tokens`. An OpenAI-compatible endpoint that only knows
+ * `max_tokens` then has no ceiling at all — it ignores the field it does not
+ * recognise rather than refusing it. Measured on one such provider: a request
+ * capped at 64 tokens came back with 15518, while the same cap in `max_tokens`
+ * stopped at exactly 64. With no ceiling a model that slips into repeating
+ * itself runs to the endpoint's own maximum, which cost one epic 46% of its
+ * output tokens across nineteen responses.
+ *
+ * Only endpoints MEASURED to need the older field are named — the list is not a
+ * guess about what OpenAI-compatible servers generally accept. Wrong in the
+ * other direction it breaks providers that reject the field they do not use,
+ * and a provider nobody has tested keeps pi's own inference.
+ */
+const LEGACY_MAX_TOKENS_HOSTS = ["ollama.com"];
+
+async function detectMaxTokensField(provider, endpoint) {
+  let host = "";
+  try {
+    host = new URL(endpoint.baseUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  const name = String(provider ?? "").toLowerCase();
+  if (LEGACY_MAX_TOKENS_HOSTS.some((known) => host === known || host.endsWith(`.${known}`)) || name.includes("ollama")) {
+    return "max_tokens";
+  }
+  return null;
+}
+
 async function maskedProviderEntry(homeDir, provider, realModel, endpoint) {
   const real = await findModelDefinition(homeDir, provider, realModel);
+  // The real provider name and address still resolve here, on the host, so the
+  // decision is made before the mask and carried across it. Same shape of bug
+  // as the prompt cache key above, and the same fix: what pi infers from the
+  // address, the mask has to restore. An explicit `compat` from the user wins —
+  // this fills a gap, it does not overrule a stated choice.
+  const compat = { ...(real?.compat ?? {}) };
+  if (compat.maxTokensField === undefined) {
+    const field = await detectMaxTokensField(provider, endpoint);
+    if (field) {
+      compat.maxTokensField = field;
+    }
+  }
   return {
     name: MASKED_PROVIDER,
     api: endpoint.api || real?.api || "openai-completions",
-    ...(real?.compat ? { compat: real.compat } : {}),
+    ...(Object.keys(compat).length ? { compat } : {}),
     models: [
       {
         id: MASKED_MODEL,
@@ -303,6 +349,52 @@ async function findModelDefinition(homeDir, provider, model) {
   }
   const catalogue = await loadBuiltInCatalogue();
   return catalogue?.[provider]?.[model] ?? null;
+}
+
+/**
+ * Deliver the model's declared `samplingParams` to the request pi never puts
+ * them in.
+ *
+ * pi validates the field in models.json and composes it onto the model object,
+ * but the agent loop calls the provider with the *agent config* as options, and
+ * nothing copies `model.samplingParams` there. The provider adapter reads
+ * `options.samplingParams`, finds nothing, and the request goes out without the
+ * ceiling the user declared. `maxTokens` fares no better: the agent config
+ * defaults it to 0, the adapter guards on truthiness, and the field is omitted.
+ *
+ * What that costs is not theoretical. With no `max_tokens` the server applies
+ * its own maximum; a model that slips into repeating itself then generates up
+ * to that maximum before anything stops it. Measured on one epic's journal:
+ * nineteen such responses — under one percent of all requests — burned 46% of
+ * all output tokens, minutes of stream each. Worse than the tokens is the
+ * shape of the failure: the truncated response ends mid tool call, the agent
+ * discards it, and if that was the last turn the text half becomes the final
+ * answer. The run then reports success with the work undone.
+ *
+ * Only missing keys are filled: whatever pi did set is its decision, and a
+ * proxy overriding an explicit request parameter would be a much harder failure
+ * to explain than the one this fixes.
+ */
+export function applySamplingParams(payload, samplingParams) {
+  if (!payload || typeof payload !== "object" || !samplingParams || typeof samplingParams !== "object") {
+    return payload;
+  }
+  for (const [key, value] of Object.entries(samplingParams)) {
+    if (value === undefined || key in payload) {
+      continue;
+    }
+    // The two spellings of one field: an API that wants the newer name rejects
+    // the older outright, so declaring `max_tokens` must not smuggle in a
+    // duplicate when pi already sent `max_completion_tokens`.
+    if (key === "max_tokens" && "max_completion_tokens" in payload) {
+      continue;
+    }
+    if (key === "max_completion_tokens" && "max_tokens" in payload) {
+      continue;
+    }
+    payload[key] = value;
+  }
+  return payload;
 }
 
 /** The credential a provider entry authenticates with, whatever its shape. */
@@ -343,6 +435,10 @@ export async function startCredentialProxy({
   // actually answers is decided here, so an agent cannot quietly move itself to
   // a bigger one — the bill for that arrives on the host, not in the sandbox.
   const realModel = modelIdFor(provider, model);
+  // `samplingParams` of the model as the user declared them. pi accepts the
+  // field in models.json and drops it on the agent loop — see
+  // `applySamplingParams` for what that costs.
+  const samplingParams = (await findModelDefinition(homeDir, provider, realModel))?.samplingParams ?? null;
   const upstream = new URL(endpoint.baseUrl);
   const transport = upstream.protocol === "http:" ? http : https;
 
@@ -525,6 +621,7 @@ export async function startCredentialProxy({
         if (payload && typeof payload === "object" && "model" in payload) {
           payload.model = realModel;
           restorePromptCacheKey(payload, upstream, token);
+          applySamplingParams(payload, samplingParams);
           // `stream` is read from the payload and nothing else is: without it
           // `ttfb_ms` cannot be read at all, since for a non-streaming request
           // it equals the whole generation.

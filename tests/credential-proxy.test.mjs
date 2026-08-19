@@ -326,3 +326,110 @@ test("masking does not silently disable prompt caching on OpenAI", async () => {
   }
   await upstream.close();
 });
+
+/** A home whose model declares sampling parameters, as a user would write them. */
+function homeWithSampling(port, samplingParams) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-proxy-home-"));
+  const agent = path.join(home, ".pi", "agent");
+  fs.mkdirSync(agent, { recursive: true });
+  fs.writeFileSync(
+    path.join(agent, "models.json"),
+    JSON.stringify({
+      providers: {
+        "test-provider": {
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          api: "openai-completions",
+          models: [{ id: "real-model-v2", samplingParams }]
+        }
+      }
+    })
+  );
+  return home;
+}
+
+async function withSamplingProxy(samplingParams, body) {
+  const upstream = await startUpstream();
+  const home = homeWithSampling(upstream.port, samplingParams);
+  const proxy = await startCredentialProxy({
+    homeDir: home,
+    provider: "test-provider",
+    model: "test-provider/real-model-v2",
+    authEntry: { type: "api_key", key: "REAL-SECRET-KEY" }
+  });
+  const local = proxy.url.replace("host.docker.internal", "127.0.0.1");
+  try {
+    await fetch(`${local}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${proxy.token}`, "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    return JSON.parse(upstream.seen[0].body);
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+// The failure this exists for: pi accepts `samplingParams` in models.json and
+// then never sends them, so a run goes out with no output ceiling at all and a
+// model that starts repeating itself generates until the server's own maximum.
+test("declared samplingParams reach the request pi omits them from", async () => {
+  const sent = await withSamplingProxy(
+    { max_tokens: 16384 },
+    { model: "agent-model", messages: [{ role: "user", content: "hi" }] }
+  );
+  assert.equal(sent.max_tokens, 16384, "the ceiling the user declared is on the wire");
+  assert.equal(sent.model, "real-model-v2", "masking still applies");
+});
+
+test("what pi did set is left alone — the proxy fills gaps, it does not overrule", async () => {
+  const sent = await withSamplingProxy(
+    { max_tokens: 16384, temperature: 0.2 },
+    { model: "agent-model", max_tokens: 512, messages: [] }
+  );
+  assert.equal(sent.max_tokens, 512, "an explicit request parameter wins");
+  assert.equal(sent.temperature, 0.2, "the untouched key is still delivered");
+});
+
+test("the two spellings of the output ceiling never both appear", async () => {
+  const sent = await withSamplingProxy(
+    { max_tokens: 16384 },
+    { model: "agent-model", max_completion_tokens: 4096, messages: [] }
+  );
+  assert.equal(sent.max_completion_tokens, 4096);
+  assert.ok(!("max_tokens" in sent), "an API that wants the newer name would reject the pair");
+});
+
+test("a model without samplingParams is passed through unchanged", async () => {
+  const sent = await withSamplingProxy(undefined, { model: "agent-model", messages: [{ role: "user", content: "hi" }] });
+  assert.deepEqual(Object.keys(sent).sort(), ["messages", "model"], "nothing invented");
+});
+
+// pi picks the ceiling field from the provider name and base URL; the mask
+// replaces both, so a provider that only understands `max_tokens` was being
+// sent `max_completion_tokens` and silently ran with no ceiling at all.
+test("the ceiling field survives the mask for a provider that needs the older one", async () => {
+  const upstream = await startUpstream();
+  // The provider has to be named as the user names it: the ceiling field is
+  // decided from the real name and address, before the mask replaces both.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-proxy-home-"));
+  fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".pi", "agent", "models.json"),
+    JSON.stringify({ providers: { "ollama-pro": { baseUrl: "https://ollama.com/v1", api: "openai-completions" } } })
+  );
+  const proxy = await startCredentialProxy({
+    homeDir: home,
+    provider: "ollama-pro",
+    model: "ollama-pro/some-model",
+    authEntry: { type: "api_key", key: "K" }
+  });
+  try {
+    assert.equal(proxy.providerEntry.compat?.maxTokensField, "max_tokens");
+  } finally {
+    await proxy.close();
+    await upstream.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

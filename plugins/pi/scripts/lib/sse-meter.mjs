@@ -80,6 +80,98 @@ export function hasUnknownUsageKeys(usage) {
 }
 
 /**
+ * Why the provider stopped, wherever that provider keeps it.
+ *
+ * Three spellings were read here and a fourth was not: Google puts the reason
+ * on the candidate, as `candidates[0].finishReason`, so a run on Gemini
+ * recorded nothing at all for the one field that says an answer was cut off at
+ * the ceiling. Whatever is found is kept as the provider wrote it — deciding
+ * what `MAX_TOKENS` means belongs to whoever reads the column, and a value
+ * normalised on the way in cannot be un-normalised later.
+ */
+function readFinishReason(frame) {
+  return (
+    frame?.choices?.[0]?.finish_reason ??
+    frame?.stop_reason ??
+    frame?.delta?.stop_reason ??
+    frame?.message?.stop_reason ??
+    frame?.candidates?.[0]?.finishReason ??
+    null
+  );
+}
+
+/** The JSON object starting at `open`, or null if it is not closed inside `text`. */
+function balancedObject(text, open) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = open; index < text.length; index += 1) {
+    const character = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+    } else if (character === "{") {
+      depth += 1;
+    } else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(open, index + 1);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The finish reason of a body that arrived cut, and its usage beside it.
+ *
+ * A non-streaming answer longer than the window kept for it reaches the meter
+ * as its tail, and `JSON.parse` refuses a fragment outright — so a 70 KB answer
+ * recorded neither its usage nor its finish reason while a 3 KB one recorded
+ * both. That is backwards: the long answer is the one that ran into the
+ * ceiling, and why it stopped is the whole point of asking. Both fields sit at
+ * the end of an answer, behind the text, which is exactly what a tail holds, so
+ * they are found by scanning rather than by parsing.
+ *
+ * The answer's own text cannot be mistaken for them: in a JSON body that text
+ * is a JSON string with its quotes escaped, so `"usage"` and `"finish_reason"`
+ * occur unescaped only where they are keys.
+ */
+function scanFinishReason(text) {
+  let reason = null;
+  for (const match of text.matchAll(/"(?:finish_reason|stop_reason|finishReason)"\s*:\s*"([^"\\]*)"/g)) {
+    // The last one is the real one: a tail may hold more than one answer's end.
+    reason = match[1];
+  }
+  return reason;
+}
+
+/** @see scanFinishReason */
+function scanUsage(text) {
+  const key = text.lastIndexOf('"usage"');
+  const open = key === -1 ? -1 : text.indexOf("{", key);
+  const object = open === -1 ? null : balancedObject(text, open);
+  if (!object) {
+    return null;
+  }
+  try {
+    return JSON.parse(object);
+  } catch {
+    // A `usage` object that is itself cut leaves the counts and the reason.
+    return null;
+  }
+}
+
+/**
  * A stateful meter fed the raw response bytes.
  *
  * @param {() => number} now injectable clock, so the tests are not timing races
@@ -113,8 +205,7 @@ export function createStreamMeter({ now = Date.now } = {}) {
     if (frame?.message?.usage) {
       usage = { ...(usage ?? {}), ...frame.message.usage };
     }
-    const reason =
-      frame?.choices?.[0]?.finish_reason ?? frame?.delta?.stop_reason ?? frame?.message?.stop_reason ?? null;
+    const reason = readFinishReason(frame);
     if (reason) {
       finishReason = String(reason);
     }
@@ -164,21 +255,27 @@ export function createStreamMeter({ now = Date.now } = {}) {
     },
 
     /**
-     * Whatever was not framed as SSE — a non-streaming JSON body. Read once at
-     * the end, and only for its usage.
+     * Whatever was not framed as SSE — a non-streaming JSON body, whole when it
+     * fits and otherwise its tail. Read once at the end, for its usage and for
+     * why the answer stopped.
      */
     finishNonStream(body) {
+      const text = String(body ?? "");
+      let parsed = null;
       try {
-        const parsed = JSON.parse(body);
-        if (parsed?.usage) {
-          usage = parsed.usage;
-        }
-        const reason = parsed?.choices?.[0]?.finish_reason ?? parsed?.stop_reason ?? null;
-        if (reason) {
-          finishReason = String(reason);
-        }
+        parsed = JSON.parse(text);
       } catch {
-        // Not JSON; the byte counts and timings still stand.
+        // Either not JSON at all, or a body too long to be kept whole.
+      }
+      const found =
+        parsed && typeof parsed === "object"
+          ? { usage: parsed.usage ?? null, reason: readFinishReason(parsed) }
+          : { usage: scanUsage(text), reason: scanFinishReason(text) };
+      if (found.usage) {
+        usage = found.usage;
+      }
+      if (found.reason) {
+        finishReason = String(found.reason);
       }
     },
 

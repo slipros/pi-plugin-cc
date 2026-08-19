@@ -36,6 +36,13 @@ const UPSTREAM_TIMEOUT_MS = 600_000;
 /** Ceiling on a buffered request body; prompts are large, but not this large. */
 const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
 
+/**
+ * How much of the end of a non-streaming answer is kept to measure it. Enough
+ * to hold the tail of any `choices` entry plus the `usage` object behind it,
+ * far too little to be a copy of the answer.
+ */
+const NON_STREAM_TAIL_BYTES = 64 * 1024;
+
 function parseInteger(value) {
   const number = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(number) ? number : null;
@@ -52,6 +59,89 @@ function parseRetryAfter(value) {
   }
   const when = Date.parse(String(value));
   return Number.isFinite(when) ? Math.max(0, when - Date.now()) : null;
+}
+
+/**
+ * An answer the container can read without learning anything about the host.
+ *
+ * Everything the proxy says for itself is worded this way: the agent is on the
+ * other side of the mask, and a refusal that names the provider, the address or
+ * the transport error undoes what the mask is for. The detail goes to the host
+ * — `onWarning` and the journal — where somebody can act on it.
+ */
+function refuse(response, status, message) {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify({ error: { message } }));
+}
+
+/**
+ * Response headers the container is allowed to see.
+ *
+ * Handing back `upstreamResponse.headers` as they came named the provider
+ * outright: `openai-organization`, `server: cloudflare`, a rate-limit family
+ * carrying the vendor's own prefix. Only what a client needs to read the answer
+ * crosses — the content headers (SSE lives or dies by `content-type`, and a
+ * compressed body is undecodable without `content-encoding`), caching, and the
+ * back-off fields the SDKs inside the container actually read. Hop-by-hop
+ * headers are this hop's to set, not the provider's, and everything else is
+ * dropped rather than listed: a header nobody knew about is exactly the kind
+ * that names a vendor.
+ */
+const FORWARDED_RESPONSE_HEADERS = new Set([
+  "content-type",
+  "content-length",
+  "content-encoding",
+  "content-language",
+  "cache-control",
+  "retry-after",
+  "retry-after-ms",
+  "x-should-retry"
+]);
+
+/**
+ * Rate-limit counters are useful to a client and generic in this spelling;
+ * `anthropic-ratelimit-*` and friends say who answered and are not forwarded.
+ */
+const FORWARDED_RESPONSE_HEADER_PREFIXES = ["x-ratelimit-"];
+
+function maskResponseHeaders(headers) {
+  const allowed = {};
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    const key = String(name).toLowerCase();
+    const byPrefix = FORWARDED_RESPONSE_HEADER_PREFIXES.some((prefix) => key.startsWith(prefix));
+    if (FORWARDED_RESPONSE_HEADERS.has(key) || byPrefix) {
+      allowed[key] = value;
+    }
+  }
+  return allowed;
+}
+
+/** The bare media type, without the parameters that follow it. */
+function mediaTypeOf(request) {
+  return String(request.headers["content-type"] ?? "").toLowerCase().split(";")[0].trim();
+}
+
+/** A body this proxy has no business reading: uploads, forms, raw bytes. */
+function isOpaqueMediaType(type) {
+  return (
+    type.startsWith("multipart/") ||
+    type.startsWith("image/") ||
+    type.startsWith("audio/") ||
+    type.startsWith("video/") ||
+    type === "application/x-www-form-urlencoded" ||
+    type === "application/octet-stream"
+  );
+}
+
+/** A body that claims to be JSON, in either spelling of the claim. */
+function isJsonMediaType(type) {
+  return type === "application/json" || type.endsWith("+json");
+}
+
+/** Anything but an unencoded body: the proxy cannot read what it cannot decode. */
+function isEncodedBody(request) {
+  const encoding = String(request.headers["content-encoding"] ?? "").toLowerCase().trim();
+  return encoding !== "" && encoding !== "identity";
 }
 
 /**
@@ -278,22 +368,65 @@ export const MASKED_MODEL = "agent-model";
  * itself runs to the endpoint's own maximum, which cost one epic 46% of its
  * output tokens across nineteen responses.
  *
- * Only endpoints MEASURED to need the older field are named — the list is not a
- * guess about what OpenAI-compatible servers generally accept. Wrong in the
- * other direction it breaks providers that reject the field they do not use,
- * and a provider nobody has tested keeps pi's own inference.
+ * The list is pi's own, copied: `detectCompat` in
+ * `@earendil-works/pi-ai/dist/api/openai-completions.js` builds `useMaxTokens`
+ * from exactly these provider names and base-URL fragments, and that inference
+ * is precisely what the mask breaks — so mirroring it restores what was lost
+ * rather than guessing what OpenAI-compatible servers generally accept. Copied
+ * and not imported because `detectCompat` is module-private: the file exports
+ * `stream`, `streamSimple` and `convertMessages` and nothing else. Matched the
+ * way pi matches — a substring of the whole base URL, not a parsed hostname —
+ * so a URL that fools this one fools pi identically.
+ *
+ * `ollama.com` is the one addition, and it is a measurement rather than a
+ * reading of pi: the endpoint ignores `max_completion_tokens` outright. Local
+ * Ollama is matched by address and port instead of by name, since a provider
+ * called `my-ollama-gateway` is as likely to be LiteLLM or vLLM in front of
+ * something else, and those want the newer field.
  */
-const LEGACY_MAX_TOKENS_HOSTS = ["ollama.com"];
+const LEGACY_MAX_TOKENS_PROVIDERS = new Set([
+  "deepseek",
+  "moonshotai",
+  "moonshotai-cn",
+  "together",
+  "cloudflare-ai-gateway",
+  "nvidia",
+  "ant-ling",
+  "zai",
+  "zai-coding-cn"
+]);
+const LEGACY_MAX_TOKENS_URL_MARKERS = [
+  "chutes.ai",
+  "deepseek.com",
+  "api.moonshot.",
+  "gateway.ai.cloudflare.com",
+  "api.together.ai",
+  "api.together.xyz",
+  "integrate.api.nvidia.com",
+  "api.ant-ling.com",
+  "api.z.ai",
+  "open.bigmodel.cn",
+  // Measured, not from pi's table.
+  "ollama.com"
+];
 
-async function detectMaxTokensField(provider, endpoint) {
-  let host = "";
-  try {
-    host = new URL(endpoint.baseUrl).hostname.toLowerCase();
-  } catch {
-    return null;
-  }
+/** Where local Ollama answers, and the only shape of it worth guessing at. */
+const OLLAMA_LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+const OLLAMA_LOCAL_PORT = "11434";
+
+/**
+ * Nothing here can throw: `startCredentialProxy` parsed this same base URL
+ * before it got here, and `resolveProviderEndpoint` only ever returns an entry
+ * that has one.
+ */
+function detectMaxTokensField(provider, endpoint) {
+  const baseUrl = String(endpoint.baseUrl).toLowerCase();
   const name = String(provider ?? "").toLowerCase();
-  if (LEGACY_MAX_TOKENS_HOSTS.some((known) => host === known || host.endsWith(`.${known}`)) || name.includes("ollama")) {
+  if (LEGACY_MAX_TOKENS_PROVIDERS.has(name) || LEGACY_MAX_TOKENS_URL_MARKERS.some((marker) => baseUrl.includes(marker))) {
+    return "max_tokens";
+  }
+  const url = new URL(endpoint.baseUrl);
+  if (OLLAMA_LOCAL_HOSTS.has(url.hostname.toLowerCase()) && url.port === OLLAMA_LOCAL_PORT) {
     return "max_tokens";
   }
   return null;
@@ -305,10 +438,12 @@ async function maskedProviderEntry(homeDir, provider, realModel, endpoint) {
   // decision is made before the mask and carried across it. Same shape of bug
   // as the prompt cache key above, and the same fix: what pi infers from the
   // address, the mask has to restore. An explicit `compat` from the user wins —
-  // this fills a gap, it does not overrule a stated choice.
-  const compat = { ...(real?.compat ?? {}) };
+  // this fills a gap, it does not overrule a stated choice — and it is read
+  // from the provider entry whether or not that entry happens to list the model
+  // being run, which is the usual case for a provider pi already knows.
+  const compat = resolveCompat(providerCompat(homeDir, provider), real);
   if (compat.maxTokensField === undefined) {
-    const field = await detectMaxTokensField(provider, endpoint);
+    const field = detectMaxTokensField(provider, endpoint);
     if (field) {
       compat.maxTokensField = field;
     }
@@ -342,13 +477,49 @@ async function findModelDefinition(homeDir, provider, model) {
     const entry = JSON.parse(fs.readFileSync(file, "utf8"))?.providers?.[provider];
     const found = entry?.models?.find((candidate) => candidate?.id === model);
     if (found) {
-      return { ...found, api: entry.api, compat: entry.compat };
+      return { ...found, api: entry.api, source: "models.json" };
     }
   } catch {
     // Fall through to the built-in catalogue.
   }
   const catalogue = await loadBuiltInCatalogue();
-  return catalogue?.[provider]?.[model] ?? null;
+  const known = catalogue?.[provider]?.[model];
+  return known ? { ...known, source: "catalogue" } : null;
+}
+
+/**
+ * The `compat` the user declared on the provider itself.
+ *
+ * Read on its own, because it applies on its own: pi composes a model out of
+ * the provider entry and the model entry (`provider-composer.js`), so a
+ * provider that states `maxTokensField` states it for every model it serves —
+ * including the ones it does not bother to list. Reading it only when the model
+ * id happened to appear in `models[]` meant a stated `max_completion_tokens`
+ * was dropped on the floor and the detected `max_tokens` put in its place —
+ * the proxy overruling the user, which is exactly backwards.
+ */
+function providerCompat(homeDir, provider) {
+  try {
+    const file = path.join(homeDir, ".pi", "agent", "models.json");
+    const compat = JSON.parse(fs.readFileSync(file, "utf8"))?.providers?.[provider]?.compat;
+    return compat && typeof compat === "object" ? compat : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Provider `compat` and model `compat`, merged the way pi merges them.
+ *
+ * `mergeCompat` in `provider-composer.js` lets the more specific of the two
+ * win — which for a model the user wrote out is the model, and for one of pi's
+ * own catalogue models is the user's provider entry, since that entry is the
+ * override applied on top of the catalogue.
+ */
+function resolveCompat(fromProvider, real) {
+  return real?.source === "catalogue"
+    ? { ...(real.compat ?? {}), ...(fromProvider ?? {}) }
+    : { ...(fromProvider ?? {}), ...(real?.compat ?? {}) };
 }
 
 /**
@@ -435,6 +606,16 @@ export async function startCredentialProxy({
   // actually answers is decided here, so an agent cannot quietly move itself to
   // a bigger one — the bill for that arrives on the host, not in the sandbox.
   const realModel = modelIdFor(provider, model);
+  if (!realModel) {
+    // A run with no model named — a preset that leaves the choice to pi — has
+    // no name to rewrite the body to, so requests cross unmasked: the agent
+    // picks the model, and the declared `samplingParams` cannot be applied
+    // because there is no parsed body to apply them to. The credential still
+    // stays on the host, which is the point of the proxy, but two of its other
+    // guarantees are simply absent — and a boundary that is quietly weaker on
+    // some runs than on others is worse than one that says so.
+    onWarning?.("Credential proxy: this run names no model — requests cross unmasked and no output ceiling is applied.");
+  }
   // `samplingParams` of the model as the user declared them. pi accepts the
   // field in models.json and drops it on the agent loop — see
   // `applySamplingParams` for what that costs.
@@ -447,8 +628,7 @@ export async function startCredentialProxy({
     // container on the host, so it is checked before anything else happens.
     const offered = String(request.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
     if (!sameToken(offered, token)) {
-      response.writeHead(401, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: { message: "Invalid run token." } }));
+      refuse(response, 401, "Invalid run token.");
       request.resume();
       return;
     }
@@ -458,8 +638,7 @@ export async function startCredentialProxy({
       // The path decided the destination host: `//elsewhere/v1` resolves as a
       // protocol-relative URL, and for a provider whose base URL carries no
       // path that turned this into an open relay handing out the real key.
-      response.writeHead(400, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: { message: "Invalid request path." } }));
+      refuse(response, 400, "Invalid request path.");
       request.resume();
       return;
     }
@@ -526,18 +705,22 @@ export async function startCredentialProxy({
             );
             meter = createStreamMeter();
           }
-          response.writeHead(status, upstreamResponse.headers);
+          response.writeHead(status, maskResponseHeaders(upstreamResponse.headers));
           // Piped rather than buffered: token streams arrive as they are
           // produced, and buffering would turn a live transcript into one late
           // blob. Only the request is ever held whole, and only to rename a
           // model — responses stay a stream.
           upstreamResponse.on("data", (chunk) => {
             meter?.push(chunk);
-            // A non-streaming answer carries its usage in one JSON body, so a
-            // bounded head of it is kept — long enough to reach `usage`, short
-            // enough not to be a copy of the answer.
-            if (measured && !measured.stream && nonStreamBody.length < 64 * 1024) {
-              nonStreamBody += chunk.toString("utf8");
+            // A non-streaming answer carries its `usage` and its finish reason
+            // in one JSON body, and both sit behind the whole answer — so a
+            // bounded TAIL is kept, not a head. A head lost exactly the
+            // responses worth measuring: the long ones, which are the ones that
+            // ran into the ceiling. Bounded all the same, so nothing here grows
+            // with the length of an answer.
+            if (measured && !measured.stream) {
+              const text = nonStreamBody + chunk.toString("utf8");
+              nonStreamBody = text.length > NON_STREAM_TAIL_BYTES ? text.slice(-NON_STREAM_TAIL_BYTES) : text;
             }
           });
           upstreamResponse.pipe(response);
@@ -567,14 +750,18 @@ export async function startCredentialProxy({
         proxied.destroy(new Error("upstream timed out"));
       });
       proxied.on("error", (error) => {
-        onWarning?.(`Model request failed: ${error.message}`);
+        // Which host refused the connection, and why, is the host's business:
+        // said here, on the host side, where it can be acted on. The container
+        // is told that the model could not be reached and nothing more — a
+        // failing address is as good a name for the provider as its own.
+        onWarning?.(`Model request failed (${upstream.host}): ${error.message}`);
         // Status 0, not 502: the provider never answered, and folding a
         // transport failure into its error rate would be a lie about it.
         finish({ status: 0, error_kind: "transport" });
         if (!response.headersSent) {
           response.writeHead(502, { "content-type": "application/json" });
         }
-        response.end(JSON.stringify({ error: { message: `Proxy could not reach ${upstream.host}: ${error.message}` } }));
+        response.end(JSON.stringify({ error: { message: "The model endpoint could not be reached." } }));
       });
 
       if (body == null) {
@@ -585,14 +772,30 @@ export async function startCredentialProxy({
     };
 
     if (!realModel) {
+      // No name to rewrite the body to, so nothing is read and nothing is
+      // masked — announced once at startup, where somebody can act on it.
       forward(null);
       return;
     }
 
     // The model name lives in the request body, so the body has to be read
-    // before it can be corrected. Anything that is not the JSON we expect is
-    // passed through untouched rather than rejected: the proxy is not the place
-    // to decide what a provider accepts.
+    // before it can be corrected. Bodies this proxy has no business reading —
+    // uploads and other non-JSON shapes — still pass through untouched: the
+    // proxy is not the place to decide what a provider accepts.
+    const mediaType = mediaTypeOf(request);
+    const opaque = isOpaqueMediaType(mediaType);
+    // A body the proxy cannot read is a body it cannot mask, and forwarding it
+    // anyway is the whole mask undone: measured, the same JSON sent with
+    // `content-encoding: gzip` reached the provider exactly as written — its
+    // `model` never rewritten, the declared ceiling never applied. An agent
+    // holding the run token could therefore pick its own model and take the
+    // ceiling off, and the bill would arrive on the host. Refused here rather
+    // than relayed blind, and refused before it is buffered.
+    if (isEncodedBody(request) && !opaque) {
+      refuse(response, 400, "Encoded request bodies are not accepted.");
+      request.resume();
+      return;
+    }
     const chunks = [];
     let size = 0;
     let refused = false;
@@ -603,8 +806,7 @@ export async function startCredentialProxy({
       // process with one large POST.
       if (size > MAX_REQUEST_BODY_BYTES && !refused) {
         refused = true;
-        response.writeHead(413, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: "Request body too large for the proxy." } }));
+        refuse(response, 413, "Request body too large for the proxy.");
         request.destroy();
         return;
       }
@@ -617,7 +819,7 @@ export async function startCredentialProxy({
       }
       const raw = Buffer.concat(chunks);
       try {
-        const payload = JSON.parse(raw.toString("utf8"));
+        const payload = raw.length ? JSON.parse(raw.toString("utf8")) : null;
         if (payload && typeof payload === "object" && "model" in payload) {
           payload.model = realModel;
           restorePromptCacheKey(payload, upstream, token);
@@ -629,7 +831,13 @@ export async function startCredentialProxy({
           return;
         }
       } catch {
-        // Not JSON, or not shaped as expected.
+        // JSON that is not JSON: the provider would read it no better than this
+        // did, unless it is more forgiving than the proxy — which is the same
+        // hole again, only quieter.
+        if (isJsonMediaType(mediaType) && raw.length) {
+          refuse(response, 400, "Request body could not be read as JSON.");
+          return;
+        }
       }
       forward(raw);
     });

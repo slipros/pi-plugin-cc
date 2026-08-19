@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { renderModelsReport } from "../plugins/pi/scripts/lib/render.mjs";
+import { renderModelsReport, renderPresetsReport } from "../plugins/pi/scripts/lib/render.mjs";
 
 const MODELS = [{ id: "some/model", context: 128000, maxOutput: 8192, thinking: true, images: false }];
 
 function report(presets) {
-  return renderModelsReport({ models: MODELS, presets, prompts: [], defaults: {}, search: null });
+  return renderPresetsReport({ presets, prompts: [] });
 }
 
 test("preset description leads its line, so choosing does not require opening a system prompt", () => {
@@ -39,4 +39,25 @@ test("preset with neither description nor overrides still renders", () => {
 
   const line = out.split("\n").find((l) => l.startsWith("- `bare`"));
   assert.equal(line, "- `bare` — no overrides");
+});
+
+// Списки разошлись намеренно: "чем ответить" и "кому поручить" — разные
+// вопросы, и ответ на второй не должен стоить прохода по каталогу моделей.
+test("the model catalogue no longer answers the question about agents", () => {
+  const out = renderModelsReport({ models: MODELS, presets: { qa: { description: "d" } }, prompts: ["p"], defaults: {}, search: null });
+  assert.doesNotMatch(out, /## Presets/);
+  assert.doesNotMatch(out, /- `qa`/);
+  assert.match(out, /presets/, "но указывает, где их искать");
+});
+
+test("the presets report stands on its own, without the catalogue", () => {
+  const out = renderPresetsReport({ presets: { qa: { description: "проверяет готовую работу" } }, prompts: ["reviewer"] });
+  assert.match(out, /- `qa` — проверяет готовую работу/);
+  assert.match(out, /## System prompts/);
+  assert.match(out, /- `reviewer`/);
+  assert.doesNotMatch(out, /Model id/, "каталог моделей сюда не приезжает");
+});
+
+test("no presets configured says so, instead of printing an empty list", () => {
+  assert.match(renderPresetsReport({ presets: {} }), /none configured/);
 });

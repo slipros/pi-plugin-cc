@@ -87,6 +87,7 @@ import {
   renderCancelAllReport,
   renderCancelReport,
   renderModelsReport,
+  renderPresetsReport,
   renderRunDetail,
   renderRunResult,
   renderRunsReport,
@@ -333,24 +334,29 @@ function canonicalFlag(token) {
 }
 
 function usage() {
+  // Под каким именем нас вызвали. Подсказка, печатающая путь к скрипту при
+  // вызове через короткую обёртку, учит длинной форме ровно там, где человек
+  // ищет короткую.
+  const self = process.env.PI_INVOKED_AS || "pi-companion.mjs";
   return [
     "Usage:",
-    "  pi-companion.mjs setup [--json]",
-    "  pi-companion.mjs models [search] [--stats [--days N]] [--json]",
-    "  pi-companion.mjs delegate [flags] <prompt>",
-    "  pi-companion.mjs review [flags] [focus text]",
-    "  pi-companion.mjs status [job-id] [--all] [--global] [--running]",
+    `  ${self} setup [--json]`,
+    `  ${self} models [search] [--stats [--days N]] [--json]`,
+    `  ${self} presets [--json]`,
+    `  ${self} delegate [flags] <prompt>`,
+    `  ${self} review [flags] [focus text]`,
+    `  ${self} status [job-id] [--all] [--global] [--running]`,
     "                          [--status <s,s>] [--preset <name>] [--model <id>] [--json]",
-    "  pi-companion.mjs result [job-id] [--diff] [--json]",
-    "  pi-companion.mjs wait [job-id...] [--all] [--for <seconds>] [--json]",
-    "  pi-companion.mjs runs [run-id] [--all] [--limit N] [--days N] [--model <id>]",
+    `  ${self} result [job-id] [--diff] [--json]`,
+    `  ${self} wait [job-id...] [--all] [--for <seconds>] [--json]`,
+    `  ${self} runs [run-id] [--all] [--limit N] [--days N] [--model <id>]`,
     "                        [--preset <name>] [--kind delegate|review] [--prune] [--json]",
-    "  pi-companion.mjs rerun <run-id> [--append <text>] [--prompt <text>|--stdin] [run flags]",
-    "  pi-companion.mjs cancel [job-id] [--all [--global]] [--json]",
-    "  pi-companion.mjs steer [job-id] [--follow-up] <message>",
-    "  pi-companion.mjs watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]",
-    "  pi-companion.mjs stats [--by day|model|preset|workspace|kind|status] [--days N|--all] [--json]",
-    "  pi-companion.mjs sandbox [status|build [name|--all]|clean] [--image <tag>]",
+    `  ${self} rerun <run-id> [--append <text>] [--prompt <text>|--stdin] [run flags]`,
+    `  ${self} cancel [job-id] [--all [--global]] [--json]`,
+    `  ${self} steer [job-id] [--follow-up] <message>`,
+    `  ${self} watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]`,
+    `  ${self} stats [--by day|model|preset|workspace|kind|status] [--days N|--all] [--json]`,
+    `  ${self} sandbox [status|build [name|--all]|clean] [--image <tag>]`,
     "                            [--dockerfile <name|path>] [--pi-version <v>]",
     "",
     "Run flags:",
@@ -930,6 +936,25 @@ async function commandSetup(argv, workspaceRoot) {
 
   output(renderSetupReport(payload), payload, Boolean(flags.json));
   return availability.installed ? 0 : 1;
+}
+
+/**
+ * The agents this setup offers, and what each is for.
+ *
+ * Deliberately does NOT touch the model catalogue: that call walks several
+ * hundred entries and takes over a second, while "which agent do I hand this
+ * to" is asked constantly — by a person choosing, and by the hook that answers
+ * the same question on every delegation.
+ */
+async function commandPresets(argv, workspaceRoot) {
+  const { flags } = parseArgs(argv, { booleans: ["json"] });
+  const { config } = loadConfig(workspaceRoot);
+  const payload = {
+    presets: config.presets ?? {},
+    prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort()
+  };
+  output(renderPresetsReport(payload), payload, Boolean(flags.json));
+  return 0;
 }
 
 async function commandModels(argv, workspaceRoot) {
@@ -1938,6 +1963,7 @@ async function commandRerun(argv, workspaceRoot) {
 const COMMANDS = {
   setup: commandSetup,
   models: commandModels,
+  presets: commandPresets,
   delegate: commandDelegate,
   review: commandReview,
   status: commandStatus,

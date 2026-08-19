@@ -89,6 +89,51 @@ export function renderSetupReport(report) {
   return joinLines(lines);
 }
 
+/**
+ * One line per preset: what the agent is FOR, then how it is configured.
+ *
+ * `description` leads because picking an agent is a question about the work,
+ * and the caller should not have to open a system prompt to answer it —
+ * reading prompts to choose costs more than the choice.
+ */
+export function presetLines(presets) {
+  const names = Object.keys(presets ?? {});
+  if (!names.length) {
+    return ["- none configured (add a `presets` block to `.claude/pi/config.json`)"];
+  }
+  return names.map((name) => {
+    const preset = presets[name] ?? {};
+    const details = [
+      preset.model ? `model \`${preset.model}\`` : null,
+      preset.provider ? `provider \`${preset.provider}\`` : null,
+      preset.thinking ? `thinking \`${preset.thinking}\`` : null,
+      preset.systemPrompt ? `prompt \`${preset.systemPrompt}\`` : null,
+      preset.readOnly ? "read-only" : null,
+      preset.sandbox?.profile ? `sandbox \`${preset.sandbox.profile}\`` : null
+    ]
+      .filter(Boolean)
+      .join(", ");
+    return preset.description
+      ? `- \`${name}\` — ${preset.description}${details ? ` · ${details}` : ""}`
+      : `- \`${name}\` — ${details || "no overrides"}`;
+  });
+}
+
+/**
+ * The agents this setup offers — without walking the model catalogue.
+ *
+ * Choosing an agent should not cost a pass over several hundred models: that
+ * call takes over a second, which is too slow for anything that asks on every
+ * invocation, such as a hook.
+ */
+export function renderPresetsReport({ presets = {}, prompts = [] } = {}) {
+  const lines = ["# pi presets", "", ...presetLines(presets)];
+  if (prompts.length) {
+    lines.push("", "## System prompts", "", prompts.map((name) => `- \`${name}\``).join("\n"));
+  }
+  return joinLines(lines);
+}
+
 export function renderModelsReport({ models, presets, prompts, defaults, search, measured = null }) {
   const lines = ["# pi models", ""];
 
@@ -141,40 +186,9 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
     }
   }
 
-  const presetNames = Object.keys(presets ?? {});
-  lines.push("");
-  lines.push("## Presets");
-  lines.push("");
-  if (presetNames.length) {
-    for (const name of presetNames) {
-      const preset = presets[name];
-      const details = [
-        preset.model ? `model \`${preset.model}\`` : null,
-        preset.provider ? `provider \`${preset.provider}\`` : null,
-        preset.thinking ? `thinking \`${preset.thinking}\`` : null,
-        preset.systemPrompt ? `prompt \`${preset.systemPrompt}\`` : null,
-        preset.readOnly ? "read-only" : null
-      ]
-        .filter(Boolean)
-        .join(", ");
-      // `description` leads the line: picking a preset is a question of what the
-      // agent is FOR, and the caller should not have to open a system prompt to
-      // find that out — reading prompts to choose costs more than the choice.
-      lines.push(
-        preset.description
-          ? `- \`${name}\` — ${preset.description}${details ? ` · ${details}` : ""}`
-          : `- \`${name}\` — ${details || "no overrides"}`
-      );
-    }
-  } else {
-    lines.push("- none configured (add a `presets` block to `.claude/pi/config.json`)");
-  }
-
-  lines.push("");
-  lines.push("## System prompts");
-  lines.push("");
-  lines.push(prompts.length ? prompts.map((name) => `- \`${name}\``).join("\n") : "- none");
-
+  // Presets and prompts live in `presets`: this report answers "what can answer
+  // me", that one answers "who should do the work". Keeping both here made the
+  // slower report the only way to see the faster answer.
   lines.push("");
   lines.push("## Defaults");
   lines.push("");
@@ -183,7 +197,8 @@ export function renderModelsReport({ models, presets, prompts, defaults, search,
   lines.push(`- system prompt: ${defaults.systemPrompt ? `\`${defaults.systemPrompt}\`` : "pi default"}`);
 
   lines.push("");
-  lines.push("Use `--model <id>`, `--provider <name>`, `--thinking <level>` or `--preset <name>` on `/pi:delegate` and `/pi:review`.");
+  lines.push("Use `--model <id>`, `--provider <name>` or `--thinking <level>` to pick one of these.");
+  lines.push("Agents to hand work to — and what each is for — are listed by `presets`.");
 
   return joinLines(lines);
 }

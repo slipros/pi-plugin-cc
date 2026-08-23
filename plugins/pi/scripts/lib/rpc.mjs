@@ -256,6 +256,13 @@ export async function runPiRpcTurn({
     // раздутые ходы идут ЧЕРЕЗ ОДИН, перемежаясь короткими, и требование серии
     // подряд не поймало бы ни одного из проверенных случаев.
     const bloatWindow = [];
+    // Сколько раз ниже был ОТПРАВЛЕН prompt-нудж в сессию — не сколько раз агент
+    // его подхватил. `send()` подтверждает только запись в stdin живого процесса;
+    // добрался ли текст до модели и изменил ли её поведение, protocol не говорит:
+    // response на команду `prompt` подтверждает приём pi, а не то, что модель
+    // прочла сообщение и поступила иначе. Надёжного признака подхвата в потоке
+    // событий нет — следующий ход мог перестать буксовать и сам по себе, без
+    // всякого вмешательства, — поэтому счётчик и не пытается его изображать.
     let loopNudges = 0;
     // Распределение рассуждения по ходам: одна суммарная цифра не отличает
     // «думал понемногу на каждом ходу» от «утонул на трёх», а лечится это разным.
@@ -650,6 +657,7 @@ export async function runPiRpcTurn({
       // the journal, and "a series of truncations means change the executor" is
       // a rule nobody can apply.
       recoveredTruncations: totalRecoveries,
+      // Отправлено, не подхвачено — см. комментарий у объявления `loopNudges`.
       loopNudges,
       thinkP50Chars: percentileOf(thinkPerTurn, 0.5),
       thinkMaxChars: thinkPerTurn.length ? Math.max(...thinkPerTurn) : 0,

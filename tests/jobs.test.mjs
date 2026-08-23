@@ -361,3 +361,63 @@ test("how many times a run had to continue itself is kept in the record", async 
     assert.equal(stored.recoveredTruncations, 3, "но чего это стоило — видно");
   });
 });
+
+// Движок json (runPiTurn) не кладёт thinkP50Chars/thinkMaxChars/turnsIdle/
+// loopNudges в execution вовсе — этой телеметрии там нет физически. Раньше
+// runTrackedJob подставлял `?? 0`, и в журнал уезжал ноль, неотличимый от
+// настоящего замера rpc-движка. Проверяется именно то, что доезжает до
+// SQLite-журнала, а не до job-файла: `?? 0` жил в аргументе recordJobSafely.
+test("прогон в форме движка json пишет в журнал NULL, а не 0, для непосчитанных метрик круга", async () => {
+  const { openDatabase, queryRun } = await import("../plugins/pi/scripts/lib/db.mjs");
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-json-engine-metrics", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 0,
+      rendered: "ok",
+      errors: [],
+      turns: 5
+      // Намеренно нет thinkP50Chars/thinkMaxChars/turnsIdle/loopNudges — так
+      // выглядит результат runPiTurn.
+    }));
+
+    const handle = openDatabase(process.env.PI_PLUGIN_DB);
+    try {
+      const row = queryRun(handle, "pi-json-engine-metrics");
+      assert.ok(row, "запись должна попасть в журнал");
+      assert.equal(row.think_p50_chars, null, "движок json это не считает — NULL, не 0");
+      assert.equal(row.think_max_chars, null);
+      assert.equal(row.turns_idle, null);
+      assert.equal(row.loop_nudges, null);
+    } finally {
+      handle.close();
+    }
+  });
+});
+
+test("прогон в форме движка rpc с настоящим нулём пишет в журнал 0, а не NULL", async () => {
+  const { openDatabase, queryRun } = await import("../plugins/pi/scripts/lib/db.mjs");
+  await withWorkspace(async (workspaceRoot) => {
+    const job = { id: "pi-rpc-engine-zero", kind: "delegate", title: "task", workspaceRoot, logFile: null };
+    await runTrackedJob(job, async () => ({
+      exitStatus: 0,
+      rendered: "ok",
+      errors: [],
+      turns: 5,
+      // Форма ответа runPiRpcTurn на чистом прогоне: поля есть и честно нулевые.
+      thinkP50Chars: 0,
+      thinkMaxChars: 0,
+      turnsIdle: 0,
+      loopNudges: 0
+    }));
+
+    const handle = openDatabase(process.env.PI_PLUGIN_DB);
+    try {
+      const row = queryRun(handle, "pi-rpc-engine-zero");
+      assert.equal(row.think_p50_chars, 0, "измерено и вышел настоящий ноль — не NULL");
+      assert.equal(row.turns_idle, 0);
+      assert.equal(row.loop_nudges, 0);
+    } finally {
+      handle.close();
+    }
+  });
+});

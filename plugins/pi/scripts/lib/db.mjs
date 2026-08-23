@@ -234,13 +234,25 @@ function addMissingColumns(db) {
     // приходилось выкапывать из журналов событий вручную, по одному прогону за
     // раз, а сравнивать модели между собой так нельзя вовсе.
     //
-    // Рассуждение на ход — сильнейший из найденных признаков вырождения:
-    // на живых прогонах у сорвавшихся оно было в 18 раз обильнее, чем у чистых,
-    // при одинаковом числе ходов.
-    ["think_p50_chars", "INTEGER DEFAULT 0"],
-    ["think_max_chars", "INTEGER DEFAULT 0"],
+    // Рассуждение на ход — сильнейший из найденных признаков вырождения: в
+    // docs/RESEARCH-truncation-flash-vs-glm.md у сорвавшихся прогонов оно было
+    // в 18 раз обильнее, чем у чистых, при одинаковом числе ходов — но то
+    // измерение на СРЕДНИХ по ходу, а не на медианах: эта колонка хранит p50 за
+    // прогон, число другое, соотношение здесь — ориентир, а не воспроизведённый
+    // факт.
+    //
+    // think_p50_chars/think_max_chars/turns_idle/loop_nudges — без DEFAULT 0,
+    // в отличие от соседей выше: движок json их не считает вовсе (см.
+    // jobToRow), и там, где для остальных полей ноль от ALTER TABLE честно
+    // читается как «этот прогон старше замера», здесь ноль был бы неотличим от
+    // «замерено и вышел настоящий ноль» — ноль рассуждения у модели без него,
+    // ноль пустых ходов у чистого прогона. На базах, где колонка уже была
+    // создана раньше с прежним DEFAULT 0, это ничего не меняет: ALTER TABLE
+    // ниже выполняется только один раз, при первом отсутствии столбца.
+    ["think_p50_chars", "INTEGER"],
+    ["think_max_chars", "INTEGER"],
     // Ход, ушедший целиком в размышление: ни текста, ни вызова инструмента.
-    ["turns_idle", "INTEGER DEFAULT 0"],
+    ["turns_idle", "INTEGER"],
     // Ответы, упёршиеся в потолок вывода, — не то же, что оборванный ПОСЛЕДНИЙ
     // ответ (тот виден в phase): счётчик показывает, сколько раз за прогон
     // генерация шла до упора.
@@ -248,8 +260,10 @@ function addMissingColumns(db) {
     // Самая длинная серия ответов одинаковой длины подряд: повтор, укладывающийся
     // в потолок, не меняет ни одного другого поля.
     ["repeat_run", "INTEGER DEFAULT 0"],
-    // Сколько раз плагин сам вмешался в круг.
-    ["loop_nudges", "INTEGER DEFAULT 0"]
+    // Сколько раз плагин ОТПРАВИЛ вмешательство в сессию — не сколько раз агент
+    // его подхватил: доехало ли сообщение до решения модели, RPC не сообщает
+    // (см. rpc.mjs). На движке json счётчика вовсе нет — этой логики там нет.
+    ["loop_nudges", "INTEGER"]
   ];
   for (const [name, definition] of additions) {
     if (!present.has(name)) {
@@ -393,12 +407,17 @@ export function jobToRow(job) {
     gen_ms: job.proxyStats?.genMs ?? 0,
     gen_out_tokens: job.proxyStats?.genOutTokens ?? 0,
     slot_wait_ms: job.slotWaitMs ?? 0,
-    think_p50_chars: job.thinkP50Chars ?? 0,
-    think_max_chars: job.thinkMaxChars ?? 0,
-    turns_idle: job.turnsIdle ?? 0,
+    // `?? null`, не `?? 0`: движок json не считает эти четыре метрики вовсе, и
+    // его прогон должен читаться как «нет данных», а не как «замерил и вышел
+    // ноль». rpc-движок передаёт настоящие числа, включая настоящие нули
+    // (модель без рассуждения, ни одного пустого хода) — они через `??`
+    // проходят как есть, потому что `??` подменяет только null/undefined.
+    think_p50_chars: job.thinkP50Chars ?? null,
+    think_max_chars: job.thinkMaxChars ?? null,
+    turns_idle: job.turnsIdle ?? null,
     answers_cut: job.proxyStats?.truncated ?? 0,
     repeat_run: job.proxyStats?.repeatRun ?? 0,
-    loop_nudges: job.loopNudges ?? 0
+    loop_nudges: job.loopNudges ?? null
   };
 }
 
@@ -550,6 +569,15 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               SUM(think_p50_chars > 0) AS think_runs,
               MAX(think_max_chars) AS think_worst,
               SUM(turns_idle)      AS turns_idle,
+              -- Знаменатель для доли «ходов впустую»: SUM(turns_idle) молчащий
+              -- NULL у прогонов на движке json (он эту метрику не считает) в
+              -- сумму просто не попадает — а вот row.turns ниже по коду суммирует
+              -- ходы ВСЕХ прогонов корзины, включая эти. Делить одно на другое
+              -- занижало долю тем сильнее, чем больше в корзине неизмеренных
+              -- прогонов — молча, потому что цифра при этом не выглядит сломанной.
+              -- Здесь — ходы только тех прогонов, где метрика вообще есть.
+              SUM(CASE WHEN turns_idle IS NOT NULL THEN turns ELSE 0 END) AS turns_idle_turns,
+              SUM(turns_idle IS NOT NULL) AS turns_idle_runs,
               SUM(answers_cut)     AS answers_cut,
               MAX(repeat_run)      AS repeat_worst,
               SUM(loop_nudges)     AS loop_nudges

@@ -425,10 +425,15 @@ export async function runTrackedJob(job, runner) {
       text: execution.text ?? null,
       proxyStats: execution.proxyStats ?? null,
       slotWaitMs: execution.slotWaitMs ?? 0,
-      thinkP50Chars: execution.thinkP50Chars ?? 0,
-      thinkMaxChars: execution.thinkMaxChars ?? 0,
-      turnsIdle: execution.turnsIdle ?? 0,
-      loopNudges: execution.loopNudges ?? 0
+      // Движок json (runPiTurn) эти четыре поля не считает вовсе — их нет в
+      // execution ни ключом, ни значением. `?? 0` здесь склеивал бы «не
+      // измерено» с настоящим нулём rpc-движка (модель без рассуждения, ни
+      // одного пустого хода); undefined честно доезжает до jobToRow, который
+      // превращает его в SQL NULL, а не в нуль, читаемый в отчёте как замер.
+      thinkP50Chars: execution.thinkP50Chars,
+      thinkMaxChars: execution.thinkMaxChars,
+      turnsIdle: execution.turnsIdle,
+      loopNudges: execution.loopNudges
     });
     appendLogBlock(job.logFile, "Final output", execution.rendered);
     return execution;

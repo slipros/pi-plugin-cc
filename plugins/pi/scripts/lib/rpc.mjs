@@ -11,7 +11,13 @@ import { runCommand } from "./process.mjs";
 import {
   applyPiEvent,
   buildPiArgs,
-  CONTINUATION_PROMPT,
+  continuationPrompt,
+  thinkingLength,
+  LOOP_NUDGE_PROMPT,
+  MAX_LOOP_NUDGES,
+  THINKING_BLOAT_CHARS,
+  THINKING_BLOAT_HITS,
+  THINKING_BLOAT_WINDOW,
   createTurnState,
   joinRecoveredText,
   PI_BINARY,
@@ -94,6 +100,15 @@ async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
     });
     return null;
   }
+}
+
+/** Медиана без сортировки исходного массива — он ещё нужен в исходном порядке. */
+function percentileOf(values, fraction) {
+  if (!values.length) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))];
 }
 
 export async function runPiRpcTurn({
@@ -235,6 +250,16 @@ export async function runPiRpcTurn({
     let answerAnchor = null;
     let answersSeen = 0;
     let lastAnswerIndex = null;
+    // Окно ходов, ушедших целиком в размышление: единица — такой ход, ноль — любой
+    // другой. Считается скользящим окном, а не подряд идущей серией: у вырождения
+    // раздутые ходы идут ЧЕРЕЗ ОДИН, перемежаясь короткими, и требование серии
+    // подряд не поймало бы ни одного из проверенных случаев.
+    const bloatWindow = [];
+    let loopNudges = 0;
+    // Распределение рассуждения по ходам: одна суммарная цифра не отличает
+    // «думал понемногу на каждом ходу» от «утонул на трёх», а лечится это разным.
+    const thinkPerTurn = [];
+    let turnsIdle = 0;
     const foldRecoveredAnswer = () => {
       if (answerAnchor === null) {
         return;
@@ -333,7 +358,11 @@ export async function runPiRpcTurn({
           // Counted and announced only once the continuation is actually on the
           // wire: a write that failed spends an attempt on nothing and puts a
           // line in the log for work that was never asked for.
-          if (send({ type: "prompt", message: CONTINUATION_PROMPT, id: `recover-${totalRecoveries + 1}` })) {
+          // Хвост берётся только из текста, пришедшего в ЭТОЙ серии: чужая
+          // концовка предыдущего доведённого ответа увела бы модель обратно в
+          // уже сделанную работу.
+          const cutTail = lastAnswerIndex !== null ? state.assistantTexts[lastAnswerIndex] ?? "" : "";
+          if (send({ type: "prompt", message: continuationPrompt(cutTail), id: `recover-${totalRecoveries + 1}` })) {
             consecutiveRecoveries += 1;
             totalRecoveries += 1;
             lastStopReason = null;
@@ -365,7 +394,44 @@ export async function runPiRpcTurn({
         const answered = state.assistantTexts.length;
         // Ответ без текста индекса не даёт: склеивать в нём нечего.
         lastAnswerIndex = answered > answersSeen ? answered - 1 : null;
+        const producedText = answered > answersSeen;
         answersSeen = answered;
+
+        // Ход, целиком ушедший в размышление, — единственный надёжный признак
+        // круга: обычная задумчивость всё равно заканчивается словом или вызовом.
+        const thought = thinkingLength(event.message);
+        thinkPerTurn.push(thought);
+        if (thought > 0 && !producedText) {
+          turnsIdle += 1;
+        }
+        bloatWindow.push(thought >= THINKING_BLOAT_CHARS && !producedText ? 1 : 0);
+        if (bloatWindow.length > THINKING_BLOAT_WINDOW) {
+          bloatWindow.shift();
+        }
+        const bloated = bloatWindow.reduce((sum, mark) => sum + mark, 0);
+        const nudgeOff = String(env?.PI_LOOP_NUDGE ?? "") === "0";
+        if (
+          !nudgeOff &&
+          bloated >= THINKING_BLOAT_HITS &&
+          loopNudges < MAX_LOOP_NUDGES &&
+          !closing &&
+          !aborted &&
+          !budgetStop
+        ) {
+          if (send({ type: "prompt", message: LOOP_NUDGE_PROMPT, id: `nudge-${loopNudges + 1}` })) {
+            loopNudges += 1;
+            // Окно обнуляется: иначе те же ходы вызвали бы второе вмешательство
+            // на следующем же шаге, ещё до того, как первое могло подействовать.
+            bloatWindow.length = 0;
+            report({
+              phase: "working",
+              message:
+                `Агент ${THINKING_BLOAT_HITS} раза за последние ${THINKING_BLOAT_WINDOW} ходов ` +
+                `потратил ход целиком на размышление — похоже на круг. Прошу принять решение или вернуть блокер ` +
+                `(вмешательство ${loopNudges} из ${MAX_LOOP_NUDGES}).`
+            });
+          }
+        }
       }
       // The accumulated usage rides along with every progress event, so a job
       // that is still running can report what it has spent so far — until now
@@ -580,6 +646,10 @@ export async function runPiRpcTurn({
       // the journal, and "a series of truncations means change the executor" is
       // a rule nobody can apply.
       recoveredTruncations: totalRecoveries,
+      loopNudges,
+      thinkP50Chars: percentileOf(thinkPerTurn, 0.5),
+      thinkMaxChars: thinkPerTurn.length ? Math.max(...thinkPerTurn) : 0,
+      turnsIdle,
       aborted,
       budgetStop,
       thinkingLevel: state.thinkingLevel ?? null,

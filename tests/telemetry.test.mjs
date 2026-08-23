@@ -255,3 +255,27 @@ test("the truncation tally understands every provider's spelling", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("серия ответов одинаковой длины подряд поднимает repeatRun", () => {
+  // Повтор, укладывающийся в потолок, ничем не помечен: finish_reason здоровый,
+  // джоб числится сделанным. Ловит его только одинаковая длина ответов подряд.
+  const recorder = createRequestRecorder("job-repeat", { databaseFile: ":memory:" });
+  for (const out of [1283, 1283, 1290, 1283, 1283]) {
+    recorder.record({ out_tokens: out, status: 200, finish_reason: "tool_calls" });
+  }
+  assert.ok(recorder.stats().repeatRun >= 5, `ждали серию, получили ${recorder.stats().repeatRun}`);
+
+  // Короткие подтверждения совпадают по длине сами собой — это не повтор.
+  const short = createRequestRecorder("job-short", { databaseFile: ":memory:" });
+  for (let i = 0; i < 8; i += 1) {
+    short.record({ out_tokens: 12, status: 200, finish_reason: "stop" });
+  }
+  assert.equal(short.stats().repeatRun, 0);
+
+  // Разные ответы серию рвут.
+  const varied = createRequestRecorder("job-varied", { databaseFile: ":memory:" });
+  for (const out of [900, 1500, 300, 2200, 700]) {
+    varied.record({ out_tokens: out, status: 200, finish_reason: "tool_calls" });
+  }
+  assert.ok(varied.stats().repeatRun <= 1, `ждали отсутствие серии, получили ${varied.stats().repeatRun}`);
+});

@@ -424,7 +424,11 @@ export async function runTrackedJob(job, runner) {
       ...record,
       text: execution.text ?? null,
       proxyStats: execution.proxyStats ?? null,
-      slotWaitMs: execution.slotWaitMs ?? 0
+      slotWaitMs: execution.slotWaitMs ?? 0,
+      thinkP50Chars: execution.thinkP50Chars ?? 0,
+      thinkMaxChars: execution.thinkMaxChars ?? 0,
+      turnsIdle: execution.turnsIdle ?? 0,
+      loopNudges: execution.loopNudges ?? 0
     });
     appendLogBlock(job.logFile, "Final output", execution.rendered);
     return execution;

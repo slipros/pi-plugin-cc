@@ -92,7 +92,7 @@ if (process.argv.includes("rpc")) {
 
 process.env.PI_PLUGIN_BINARY = FAKE_BINARY;
 
-const { CONTINUATION_PROMPT, runPiTurn } = await import("../plugins/pi/scripts/lib/pi.mjs");
+const { continuationPrompt, runPiTurn } = await import("../plugins/pi/scripts/lib/pi.mjs");
 const { runPiRpcTurn } = await import("../plugins/pi/scripts/lib/rpc.mjs");
 
 test.after(() => {
@@ -126,7 +126,9 @@ test("json-движок: обрыв продолжается в той же се
       ["--session", "sess-7"],
       "продолжение идёт в ту же сессию, а не начинает новую"
     );
-    assert.equal(passes[1].prompt, CONTINUATION_PROMPT);
+    assert.match(passes[1].prompt, /половина 1/,
+      "продолжение несёт хвост оборванного ответа: без него модели нечего продолжать");
+    assert.equal(passes[1].prompt, continuationPrompt("половина 1"));
 
     assert.match(result.text, /половина 1/, "написанное до обрыва не выбрасывается");
     assert.match(result.text, /конец/, "и продолжение тоже в ответе");
@@ -158,13 +160,32 @@ test("json-движок: попытки кончаются, а не идут б�
   });
 });
 
+test("продолжать нечего — промпт просит повторить шаг, а не продолжить его", async () => {
+  // Ход, целиком ушедший в вызовы инструментов, не оставляет текста: обрезанное
+  // сообщение отбрасывается вместе с ними, и «продолжи с места обрыва» отправляет
+  // модель искать в контексте то, чего там нет. Тогда честная просьба — другая.
+  const { continuationPrompt } = await import("../plugins/pi/scripts/lib/pi.mjs");
+  const empty = continuationPrompt("");
+  assert.match(empty, /НЕ СОХРАНЁН/);
+  assert.match(empty, /меньшими порциями/);
+  assert.doesNotMatch(empty, /продолжи ровно с этого места/i);
+  assert.equal(continuationPrompt("   "), empty, "пробельный хвост — это отсутствие хвоста");
+
+  // Длинный хвост обрезается: в промпт едет концовка, а не весь ответ.
+  const long = "x".repeat(5000) + "КОНЕЦ";
+  const prompt = continuationPrompt(long);
+  assert.match(prompt, /КОНЕЦ/);
+  assert.ok(prompt.length < 2000, `промпт продолжения не тащит весь ответ (${prompt.length})`);
+});
+
 test("rpc-движок: обрыв продолжается промптом в живой канал той же сессии", async () => {
   await withRun({ PI_FAKE_TRUNCATIONS: "2" }, async ({ cwd, calls, env }) => {
     const result = await runPiRpcTurn({ cwd, prompt: "исходная задача", sandbox: null, settleGraceMs: 200, env });
 
     const prompts = calls().filter((command) => command.type === "prompt");
     assert.equal(prompts.length, 2, "продолжение отправлено");
-    assert.equal(prompts[1].message, CONTINUATION_PROMPT);
+    assert.match(prompts[1].message, /обрыв 1/,
+      "продолжение несёт хвост оборванного ответа: без него модели нечего продолжать");
     assert.equal(prompts[1].id, "recover-1", "нумерация восстановлений видна в журнале команд");
     assert.equal(result.recoveredTruncations, 1, "прогон сообщает, сколько раз себя вытаскивал");
     assert.equal(result.stopReason, "stop");

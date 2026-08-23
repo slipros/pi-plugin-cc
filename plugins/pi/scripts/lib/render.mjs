@@ -289,6 +289,26 @@ export function truncationWarning(execution) {
     : null;
 }
 
+/** Ниже этой серии совпадение длин — совпадение, а не повтор. */
+const REPEAT_RUN_ALERT = 4;
+
+/**
+ * Прогон, который ходил по кругу, не упираясь в потолок.
+ *
+ * Обрыв на потолке заметен: он меняет stopReason и попадает в phase. Повтор,
+ * укладывающийся в потолок, не меняет ничего — ходы идут, ответы приходят, джоб
+ * закрывается галочкой, а работа при этом не движется и контекст растёт. Отсюда
+ * отдельное предупреждение: иначе такой прогон не отличить от полезного ни по
+ * одному полю.
+ */
+export function repetitionWarning(execution) {
+  const run = Number(execution?.proxyStats?.repeatRun) || 0;
+  if (run < REPEAT_RUN_ALERT) {
+    return null;
+  }
+  return `${run} answers in a row came back the same length — the agent was likely repeating a turn rather than making progress; check what it actually changed.`;
+}
+
 export function renderRunResult({ title, job, settings, execution }) {
   const lines = renderRunHeader(title, { job, settings, execution });
   lines.push(...renderChangesSection(execution.changes));
@@ -309,13 +329,17 @@ export function renderRunResult({ title, job, settings, execution }) {
   // where the answer is read, and `status` — which does carry the ⚠️ — is not
   // where anyone looks once a job is done.
   const truncationNote = truncationWarning(execution);
-  if (execution.errors?.length || truncationNote) {
+  const repetitionNote = repetitionWarning(execution);
+  if (execution.errors?.length || truncationNote || repetitionNote) {
     lines.push("## Problems", "");
     for (const error of execution.errors ?? []) {
       lines.push(`- ${error}`);
     }
     if (truncationNote) {
       lines.push(`- ${truncationNote}`);
+    }
+    if (repetitionNote) {
+      lines.push(`- ${repetitionNote}`);
     }
     lines.push("");
   }
@@ -776,6 +800,35 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
         `${formatTokens(row.output)} | ${formatCompact(row.avg_context)} | ${formatCompact(row.max_context)} | ` +
         `${formatRate(row.tokensPerSecond)}${row.unreported_reasoning ? "*" : ""} | ${formatCompact(row.outputPerRun)} | ${formatSeconds(row.p50Seconds)} | ` +
         `${formatSeconds(row.p90Seconds)} | ${row.tool_calls ?? 0} | ${row.tool_errors ?? 0} | ${formatCost(row.cost) ?? "—"} |`
+    );
+  }
+
+  // Вторая таблица — про то, КАК модель ломается. Она отвечает на другой вопрос,
+  // чем первая, и склеивать их в одну строку из двадцати колонок значит не дать
+  // прочитать ни ту, ни другую.
+  if (rows.some((row) => row.think_typical || row.turns_idle || row.answers_cut || row.repeat_worst || row.loop_nudges)) {
+    lines.push(
+      "",
+      `| ${by} | думает/ход | худший ход | ходов впустую | ответов в потолок | серия повторов | вмешательств |`,
+      "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
+    for (const row of rows) {
+      const idle = Number(row.turns) ? `${row.turns_idle ?? 0} (${Math.round((100 * (row.turns_idle ?? 0)) / row.turns)}%)` : `${row.turns_idle ?? 0}`;
+      lines.push(
+        `| ${row.bucket} | ${formatCompact(Math.round(Number(row.think_typical) || 0))} | ` +
+          `${formatCompact(Number(row.think_worst) || 0)} | ${idle} | ${row.answers_cut ?? 0} | ` +
+          `${row.repeat_worst ?? 0} | ${row.loop_nudges ?? 0} |`
+      );
+    }
+    lines.push(
+      "",
+      "Вторая таблица — профиль поломки, а не стоимости. «Думает/ход» — типичное число знаков рассуждения на один " +
+        "ход, усреднённое по прогонам: сумма за прогон растёт с его длиной и о модели не говорит ничего, а вот " +
+        "рассуждение на ход у сорвавшихся прогонов было на порядок обильнее, чем у чистых. «Ходов впустую» — ходы, " +
+        "ушедшие целиком в размышление, без единого слова и вызова инструмента. «Ответов в потолок» — сколько раз " +
+        "генерация шла до упора (не то же, что оборванный последний ответ: тот виден в phase). «Серия повторов» — " +
+        "самая длинная цепочка ответов одинаковой длины подряд, единственный признак повтора, который укладывается " +
+        "в потолок и потому не меняет никаких других полей. «Вмешательств» — сколько раз плагин сам прервал круг."
     );
   }
 

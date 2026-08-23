@@ -75,6 +75,11 @@ function median(values) {
  * @param {string|null} jobId  a run with no id is not recorded at all: an
  *   orphaned row answers no question and cannot be joined to anything.
  */
+/** Ниже этой длины совпадение ответов ничего не значит: подтверждения совпадают сами собой. */
+const REPEAT_MIN_TOKENS = 200;
+/** Насколько две длины считаются «той же»: генерация одного и того же не совпадает до токена. */
+const REPEAT_TOLERANCE = 0.01;
+
 export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_MS, databaseFile = null } = {}) {
   if (!jobId) {
     return null;
@@ -97,10 +102,14 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
     // from the agent's own `stopReason` (see `wasTruncated` in pi.mjs); this
     // number is a journal entry and a fallback for runs with no proxy events.
     lastFinishReason: null,
-    truncated: 0
+    truncated: 0,
+    // Самая длинная серия ответов одинаковой длины подряд — см. REPEAT_* ниже.
+    repeatRun: 0
   };
   let seq = 0;
   let timer = null;
+  let repeatLastOut = null;
+  let repeatRun = 0;
 
   const flush = () => {
     if (!pending.length) {
@@ -175,6 +184,28 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
       if (isTruncationReason(request.finish_reason)) {
         summary.truncated += 1;
       }
+      // Повтор, укладывающийся в потолок, не помечается НИЧЕМ: finish_reason
+      // здоровый, ходы идут, джоб числится сделанным. Между тем это тот же срыв,
+      // просто не дотянувший до обрыва: модель повторяет один и тот же ход, а
+      // контекст при этом растёт — то есть работа не движется, а платится за неё
+      // полная цена. Единственный видимый признак — серия ответов одинаковой
+      // длины подряд (замерено на живом прогоне: пять ответов ровно по 1283
+      // токена при равномерно растущем входе).
+      //
+      // Короткие ответы исключены: «готово», «ок», подтверждение вызова
+      // естественно совпадают по длине и повтором не являются.
+      const out = Number(request.out_tokens);
+      if (Number.isFinite(out) && out >= REPEAT_MIN_TOKENS) {
+        const same =
+          Number.isFinite(repeatLastOut) &&
+          Math.abs(out - repeatLastOut) <= Math.max(1, out * REPEAT_TOLERANCE);
+        repeatRun = same ? repeatRun + 1 : 1;
+        summary.repeatRun = Math.max(summary.repeatRun, repeatRun);
+        repeatLastOut = out;
+      } else if (Number.isFinite(out)) {
+        repeatRun = 0;
+        repeatLastOut = null;
+      }
       // "Failed" is anything the agent had to work around: a non-2xx answer, a
       // stream that ended early, a request that never reached the provider.
       if (request.error_kind || !(Number(request.status) >= 200 && Number(request.status) < 300)) {
@@ -207,7 +238,8 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
         genMs: Math.round(summary.genMs),
         genOutTokens: summary.genOutTokens,
         lastFinishReason: summary.lastFinishReason,
-        truncated: summary.truncated
+        truncated: summary.truncated,
+        repeatRun: summary.repeatRun
       };
     },
 

@@ -228,7 +228,28 @@ function addMissingColumns(db) {
     ["gen_out_tokens", "INTEGER DEFAULT 0"],
     // Time this run spent queued for a slot of its own pool — already measured
     // by `awaitSandboxSlot` and thrown away until now.
-    ["slot_wait_ms", "INTEGER DEFAULT 0"]
+    ["slot_wait_ms", "INTEGER DEFAULT 0"],
+    // Профиль того, КАК модель ломается. Счётчики выше говорят, сколько работа
+    // стоила; эти — по какой причине она буксовала, и это разные вопросы. Их
+    // приходилось выкапывать из журналов событий вручную, по одному прогону за
+    // раз, а сравнивать модели между собой так нельзя вовсе.
+    //
+    // Рассуждение на ход — сильнейший из найденных признаков вырождения:
+    // на живых прогонах у сорвавшихся оно было в 18 раз обильнее, чем у чистых,
+    // при одинаковом числе ходов.
+    ["think_p50_chars", "INTEGER DEFAULT 0"],
+    ["think_max_chars", "INTEGER DEFAULT 0"],
+    // Ход, ушедший целиком в размышление: ни текста, ни вызова инструмента.
+    ["turns_idle", "INTEGER DEFAULT 0"],
+    // Ответы, упёршиеся в потолок вывода, — не то же, что оборванный ПОСЛЕДНИЙ
+    // ответ (тот виден в phase): счётчик показывает, сколько раз за прогон
+    // генерация шла до упора.
+    ["answers_cut", "INTEGER DEFAULT 0"],
+    // Самая длинная серия ответов одинаковой длины подряд: повтор, укладывающийся
+    // в потолок, не меняет ни одного другого поля.
+    ["repeat_run", "INTEGER DEFAULT 0"],
+    // Сколько раз плагин сам вмешался в круг.
+    ["loop_nudges", "INTEGER DEFAULT 0"]
   ];
   for (const [name, definition] of additions) {
     if (!present.has(name)) {
@@ -294,7 +315,13 @@ const COLUMNS = [
   "ttft_p50_ms",
   "gen_ms",
   "gen_out_tokens",
-  "slot_wait_ms"
+  "slot_wait_ms",
+  "think_p50_chars",
+  "think_max_chars",
+  "turns_idle",
+  "answers_cut",
+  "repeat_run",
+  "loop_nudges"
 ];
 
 /** Ceiling on any single stored text field. */
@@ -365,7 +392,13 @@ export function jobToRow(job) {
     ttft_p50_ms: job.proxyStats?.ttftP50Ms ?? 0,
     gen_ms: job.proxyStats?.genMs ?? 0,
     gen_out_tokens: job.proxyStats?.genOutTokens ?? 0,
-    slot_wait_ms: job.slotWaitMs ?? 0
+    slot_wait_ms: job.slotWaitMs ?? 0,
+    think_p50_chars: job.thinkP50Chars ?? 0,
+    think_max_chars: job.thinkMaxChars ?? 0,
+    turns_idle: job.turnsIdle ?? 0,
+    answers_cut: job.proxyStats?.truncated ?? 0,
+    repeat_run: job.proxyStats?.repeatRun ?? 0,
+    loop_nudges: job.loopNudges ?? 0
   };
 }
 
@@ -502,7 +535,16 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               SUM(degraded)       AS degraded,
               -- A provider that streams thinking but reports reasoning = 0 has
               -- its generated tokens missing from any rate's numerator.
-              SUM(thinking_chars > 0 AND reasoning = 0) AS unreported_reasoning
+              SUM(thinking_chars > 0 AND reasoning = 0) AS unreported_reasoning,
+              -- Профиль поломки: не сколько работа стоила, а по какой причине
+              -- буксовала. Рассуждение усредняется по прогонам, а не суммируется:
+              -- сумма растёт с длиной прогона и ничего не говорит о модели.
+              AVG(NULLIF(think_p50_chars, 0)) AS think_typical,
+              MAX(think_max_chars) AS think_worst,
+              SUM(turns_idle)      AS turns_idle,
+              SUM(answers_cut)     AS answers_cut,
+              MAX(repeat_run)      AS repeat_worst,
+              SUM(loop_nudges)     AS loop_nudges
        FROM jobs ${where}
        GROUP BY bucket
        ORDER BY (SUM(input) + SUM(output)) DESC, bucket DESC

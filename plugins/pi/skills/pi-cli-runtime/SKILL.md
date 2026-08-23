@@ -52,7 +52,7 @@ Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
 
 ### Sandboxing
 
-The companion's `--sandbox docker` runs the whole pi process in a container built from the plugin's Dockerfile (`sandbox build` builds it, pinned to the installed pi version). Only the workspace is bind mounted, at `/workspace`; the agent directory is a named volume with the host `auth.json` mounted read-only, and the container runs under the caller's uid so files written through the mount stay owned by them.
+The companion's `--sandbox docker` runs the whole pi process in a container built from the plugin's Dockerfile (`sandbox build` builds it, pinned to the installed pi version). Only the workspace is bind mounted, at `/workspace/<dirname>` (the directory keeps its name); the agent directory is a named volume with the host `auth.json` mounted read-only, and the container runs under the caller's uid so files written through the mount stay owned by them.
 
 Consequences worth knowing before using it:
 

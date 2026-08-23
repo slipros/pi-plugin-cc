@@ -231,7 +231,7 @@ What the container gets:
 
 | | |
 | --- | --- |
-| Workspace | bind mounted at `/workspace`, read-write — edits land in your tree as usual |
+| Workspace | bind mounted at `/workspace/<dirname>`, read-write — the directory keeps its name, so build recipes reading `$(notdir $(CURDIR))` compute the same value inside and out |
 | Agent directory | a named docker volume, so host settings, sessions and installed pi packages stay out |
 | Credentials | Never enter the container: a run-scoped proxy on the host holds the real key and the agent gets a token that dies with the run. The container also sees a generic `sandbox/agent-model` rather than the real provider and model, so a run cannot move itself to a pricier one — the proxy decides what answers |
 | Provider definitions | `~/.pi/agent/models.json` bind mounted read-only, so custom providers (a local gateway, ollama, llama.cpp) resolve to the same models as on the host |
@@ -259,7 +259,7 @@ For a workspace **not** covered by either:
 
 The reason is one vector: those volumes outlive the run and are shared by every other one. A module or a build object written by a repository you cloned from the internet would be picked up by the next run, in a different repository. An untrusted run pays for it with a cold build cache — modules still resolve instantly from the host download cache, which is mounted read-only through `GOPROXY=file://`.
 
-Sessions are split per workspace regardless of trust, through `PI_CODING_AGENT_SESSION_DIR`: pi buckets them by working directory, but every container sees the same `/workspace`, so one bucket used to hold the transcripts of every repository this machine had ever touched — and `--session last` could resume a session from a different project. Sessions recorded before this are still in the old shared bucket; nothing migrates them, they simply stop being visible to new runs.
+Sessions are split per workspace regardless of trust, through `PI_CODING_AGENT_SESSION_DIR`: pi buckets them by working directory, but containers used to share one flat `/workspace`, so one bucket used to hold the transcripts of every repository this machine had ever touched — and `--session last` could resume a session from a different project. Sessions recorded before this are still in the old shared bucket; nothing migrates them, they simply stop being visible to new runs.
 
 ### Sandbox profiles: giving an agent its toolchain
 
@@ -315,7 +315,7 @@ Mechanics worth knowing:
 - `env` entries take both forms: `"NAME"` forwards the host value, `"NAME=value"` sets one for the container. A mounted binary is useless until `PATH` names its directory.
 - Named volumes (`pi-plugin-gomod:/home/pi/go/pkg/mod`) keep module and build caches between runs; without them every run recompiles the world.
 - `"sandbox": {"profile": "go", "network": "none"}` starts from a profile and overrides single fields. Equipment (`mounts`, `env`, `extensions`, `skills`, `args`) adds to the profile rather than replacing it, so `{"profile": "go", "env": ["PI_HOOKS=…"]}` keeps the profile's `PATH` — without which every mounted binary is unreachable. An entry colliding with an inherited one still wins its slot.
-- A profile may itself name a `profile`, so `go-mem` is `go` plus the memory CLI instead of a copy of it. A cycle is reported, not hung.
+- A profile may itself name a `profile`, so `agent` is `agent-base` plus the docker daemon instead of a copy of it. A cycle is reported, not hung.
 
 `--sandbox <name>` also takes a profile name on the command line, so `--sandbox go` works for a one-off run.
 
@@ -328,7 +328,7 @@ Mechanics worth knowing:
 /pi:review --cwd ../other-repo
 ```
 
-Only the agent moves. The directory is what gets bind mounted at `/workspace`, what pi runs in, and the tree `review` diffs — while the job records stay in the workspace you typed the command in, so `status`, `watch`, `steer` and `result` keep finding the job without you leaving your own repository. The run header and `status` show a `Working directory` line, and a directory outside your workspace also raises a warning: the edits land there, not here.
+Only the agent moves. The directory is what gets bind mounted at `/workspace/<dirname>`, what pi runs in, and the tree `review` diffs — while the job records stay in the workspace you typed the command in, so `status`, `watch`, `steer` and `result` keep finding the job without you leaving your own repository. The run header and `status` show a `Working directory` line, and a directory outside your workspace also raises a warning: the edits land there, not here.
 
 A missing path is an error before the job exists, because the usual cause is a typo and an agent started in the wrong tree is worse than one not started. Relative and `~` paths resolve against your current directory, then expand to the enclosing git root.
 
@@ -350,7 +350,7 @@ A profile may name its own image and the Dockerfile that builds it:
 
 ```json
 "sandboxProfiles": {
-  "go":   { "image": "pi-sandbox-go:latest",   "dockerfile": "go" },
+  "agent-base": { "image": "pi-sandbox-agent:latest", "dockerfile": "agent" },
   "node": { "image": "pi-sandbox-node:latest", "dockerfile": "node" }
 }
 ```
@@ -391,7 +391,7 @@ The skill file (`skills/pi/SKILL.md`) is what an agent loads on every invocation
 
 ### Containers inside the sandbox
 
-Integration tests that start a database container need a docker daemon of their own — the `go-dind` profile gives the run one, with no host socket and no `--privileged`. What it takes to run rootless docker inside a container, what stays parallel-safe with several such runs at once, and the one-time host setup that keeps image pulls cheap: **[docs/dind.md](docs/dind.md)**.
+Integration tests that start a database container need a docker daemon of their own — the `agent` profile (`PI_DIND=1`) gives the run one, with no host socket and no `--privileged`. What it takes to run rootless docker inside a container, what stays parallel-safe with several such runs at once, and the one-time host setup that keeps image pulls cheap: **[docs/dind.md](docs/dind.md)**.
 
 ### The full inline form
 
@@ -425,12 +425,12 @@ The profile is configurable per preset, in full:
 ```json
 "concurrencyPools": { "ollama-pro": 3 },
 "sandboxProfiles": {
-  "go":     { "image": "pi-sandbox-go:latest", "concurrencyGroup": "ollama-pro" },
-  "go-mem": { "profile": "go" }
+  "agent-base": { "image": "pi-sandbox-agent:latest", "concurrencyGroup": "ollama-pro" },
+  "agent":      { "profile": "agent-base" }
 }
 ```
 
-`go` and `go-mem` now draw from the same three slots instead of three each. Keeping the number with the pool means profiles cannot disagree about how many sessions the provider allows, and a reference to an undefined pool is an error before the run starts rather than a silent "no limit". All of it is optional: without `concurrencyGroup` a profile falls back to its own `maxConcurrent`, and without that there is no cap at all.
+`agent-base` and `agent` now draw from the same three slots instead of three each. Keeping the number with the pool means profiles cannot disagree about how many sessions the provider allows, and a reference to an undefined pool is an error before the run starts rather than a silent "no limit". All of it is optional: without `concurrencyGroup` a profile falls back to its own `maxConcurrent`, and without that there is no cap at all.
 
 The run header shows occupancy at launch — `Slots: 2/3 in use · pool ollama-pro`, and `— this run waits for a free slot` when none is left.
 
@@ -548,7 +548,7 @@ Name and email come as a pair: half an identity is refused before the run starts
 	path = ~/work/client/.gitconfig
 ```
 
-Rules apply top to bottom, so the narrower one goes below the general one. The lookup happens **on the host, before the container starts** — inside it never could: the repository is at `/workspace` there, and the path the rule matches on does not exist.
+Rules apply top to bottom, so the narrower one goes below the general one. The lookup happens **on the host, before the container starts** — inside it never could: the repository is under `/workspace/` there, and the path the rule matches on does not exist.
 
 ## Token accounting
 

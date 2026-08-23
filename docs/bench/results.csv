@@ -1,0 +1,4 @@
+key,rep,job,phase,status,turns,output_tokens,duration_s,truncs,max_out,repeat_run
+flash-boxed,1,delegate-mt5t0m34-y3m4a2,done,completed,76,46464,611,0,8242,1
+flash-boxed,2,delegate-mt5u64yz-pf60x3,done,completed,115,80411,681,0,6152,1
+flash-boxed,3,delegate-mt5ukrb3-752mgy,done,completed,150,91393,875,0,4648,1

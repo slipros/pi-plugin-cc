@@ -814,8 +814,15 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
     );
     for (const row of rows) {
       const idle = Number(row.turns) ? `${row.turns_idle ?? 0} (${Math.round((100 * (row.turns_idle ?? 0)) / row.turns)}%)` : `${row.turns_idle ?? 0}`;
+      // Среднее рассуждения считается не по всей корзине, если часть прогонов его
+      // не отдаёт вовсе. Без пометки «12k знаков» читается как свойство корзины,
+      // хотя может стоять на одном прогоне из двадцати.
+      const thinkRuns = Number(row.think_runs ?? 0);
+      const totalRuns = Number(row.runs ?? 0);
+      const think = formatCompact(Math.round(Number(row.think_typical) || 0)) +
+        (thinkRuns && totalRuns && thinkRuns < totalRuns ? ` (по ${thinkRuns} из ${totalRuns})` : "");
       lines.push(
-        `| ${row.bucket} | ${formatCompact(Math.round(Number(row.think_typical) || 0))} | ` +
+        `| ${row.bucket} | ${think} | ` +
           `${formatCompact(Number(row.think_worst) || 0)} | ${idle} | ${row.answers_cut ?? 0} | ` +
           `${row.repeat_worst ?? 0} | ${row.loop_nudges ?? 0} |`
       );
@@ -823,7 +830,8 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
     lines.push(
       "",
       "Вторая таблица — профиль поломки, а не стоимости. «Думает/ход» — типичное число знаков рассуждения на один " +
-        "ход, усреднённое по прогонам: сумма за прогон растёт с его длиной и о модели не говорит ничего, а вот " +
+        "ход, усреднённое по прогонам, которые рассуждение отдают (модели без него в среднее не входят — сколько прогонов "
+        + "вошло, стоит в скобках): сумма за прогон растёт с его длиной и о модели не говорит ничего, а вот " +
         "рассуждение на ход у сорвавшихся прогонов было на порядок обильнее, чем у чистых. «Ходов впустую» — ходы, " +
         "ушедшие целиком в размышление, без единого слова и вызова инструмента. «Ответов в потолок» — сколько раз " +
         "генерация шла до упора (не то же, что оборванный последний ответ: тот виден в phase). «Серия повторов» — " +

@@ -27,6 +27,7 @@ const log = process.env.PI_FAKE_LOG;
 const turns = Number(process.env.PI_FAKE_TURNS ?? 5);
 const bloatChars = Number(process.env.PI_FAKE_THINK ?? 8000);
 const withText = process.env.PI_FAKE_WITH_TEXT === "1";
+const withTool = process.env.PI_FAKE_WITH_TOOL === "1";
 const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
 const note = (entry) => fs.appendFileSync(log, JSON.stringify(entry) + "\\n");
 
@@ -52,6 +53,12 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   for (let i = 0; i < turns; i += 1) {
     const content = [{ type: "thinking", thinking: "думаю ".repeat(Math.ceil(bloatChars / 6)) }];
     if (withText) content.push({ type: "text", text: "и вот что решил " + i });
+    // Ход с одним вызовом инструмента: pi шлёт его как [thinking, toolCall],
+    // текста в нём нет вовсе — так выглядит обычная пофайловая работа.
+    if (withTool) {
+      content.push({ type: "toolCall", toolCallId: "call-" + i, toolName: "edit", args: { path: "file" + i + ".go" } });
+      say({ type: "tool_execution_start", toolCallId: "call-" + i, toolName: "edit", args: { path: "file" + i + ".go" } });
+    }
     say({ type: "turn_start" });
     say({ type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { input: 10, output: 20 }, content } });
   }
@@ -99,6 +106,22 @@ test("размышление с ответом кругом не считает�
     assert.equal(nudges().length, 0);
     assert.equal(result.loopNudges, 0);
   });
+});
+
+test("ход с вызовом инструмента — работа, а не круг", async () => {
+  // Самый частый вид работы под высоким уровнем рассуждения: длинное thinking и
+  // один вызов инструмента, прозы нет ни в одном ходе. По тексту такой прогон
+  // неотличим от круга — вмешательства уходили бы в исправно работающего агента,
+  // а «ходов впустую» показывало бы 100% у прогона, правящего файл за файлом.
+  await withRun(
+    { PI_FAKE_TURNS: "6", PI_FAKE_THINK: "9000", PI_FAKE_WITH_TOOL: "1" },
+    async ({ cwd, nudges, env }) => {
+      const result = await runPiRpcTurn({ cwd, prompt: "задача", sandbox: null, settleGraceMs: 200, env });
+      assert.equal(nudges().length, 0, "в живую сессию ничего не отправлено");
+      assert.equal(result.loopNudges, 0);
+      assert.equal(result.turnsIdle, 0, "ходы с вызовом инструмента пустыми не считаются");
+    }
+  );
 });
 
 test("двух пустых ходов мало — порог не срабатывает", async () => {

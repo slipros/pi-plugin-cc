@@ -128,8 +128,29 @@ function contextTokens(usage) {
 export function thinkingLength(message) {
   const content = Array.isArray(message?.content) ? message.content : [];
   return content
-    .filter((block) => block?.type === "thinking")
+    .filter((block) => THINKING_BLOCK_TYPES.has(block?.type))
     .reduce((total, block) => total + String(block.thinking ?? block.text ?? "").length, 0);
+}
+
+const THINKING_BLOCK_TYPES = new Set(["thinking", "redacted_thinking"]);
+
+/**
+ * Did this turn produce work, or did it go entirely into reasoning?
+ *
+ * Work is any block that is not hidden reasoning: prose for the supervisor OR a
+ * tool call. A turn that only calls a tool carries no text at all — pi ships it
+ * as `content: [thinking, toolCall]` — so counting text alone marks ordinary
+ * work as an idle turn: file-by-file refactoring, reading a test run, a series
+ * of similar edits. That is the loop detector's worst failure mode, because it
+ * spends its nudges interrupting an agent that is working correctly.
+ *
+ * Unknown block types count as work on purpose: a new content type is far more
+ * likely to be an action than another flavour of reasoning, and the safe error
+ * here is to stay silent.
+ */
+export function producedWork(message) {
+  const content = Array.isArray(message?.content) ? message.content : [];
+  return content.some((block) => block?.type && !THINKING_BLOCK_TYPES.has(block.type));
 }
 
 /** Pairs a tool_execution_end with its start; ids differ per pi version. */
@@ -553,7 +574,14 @@ const DEFAULT_TRUNCATION_RETRIES = 10;
  * никогда не доходит до этой величины, а у сорвавшихся такие ходы идут через один.
  */
 export const THINKING_BLOAT_CHARS = 6000;
-/** Окно и порог: сколько таких ходов из последних N считать кругом, а не задумчивостью. */
+/**
+ * Окно и порог: сколько таких ходов из последних N считать кругом, а не задумчивостью.
+ *
+ * Числа выбраны, а не выведены: распределения рассуждения по ОТДЕЛЬНЫМ ходам у нас
+ * не замерено (в исследовании есть только средние по ходу), поэтому 6000/10/3 —
+ * консервативная догадка, а не порог из данных. Менять их стоит по замеру, а не по
+ * впечатлению; выключается всё целиком через PI_LOOP_NUDGE=0.
+ */
 export const THINKING_BLOAT_WINDOW = 10;
 export const THINKING_BLOAT_HITS = 3;
 /** Больше двух вмешательств за прогон — это уже разговор, а не подсказка. */
@@ -564,10 +592,12 @@ export const MAX_LOOP_NUDGES = 2;
  *
  * Простое «ты зациклился, попробуй иначе» на этом классе не работает: сообщение
  * ничего не добавляет к тому, что модель уже знает, и она возвращается к тому же
- * рассуждению следующим ходом. Замеры на публичном наборе показывают и худшее —
- * вмешательство без точного триггера в среднем УХУДШАЕТ результат, а с точным
- * даёт спасение почти всегда; поэтому здесь и строгий детектор, и текст, который
- * несёт не совет, а выход.
+ * рассуждению следующим ходом. Отсюда и строгий детектор, и текст, который несёт
+ * не совет, а выход: цена ложного вмешательства выше цены пропуска — прерванный
+ * агент теряет ход и нить, а незамеченный круг стоит нескольких ходов, которые
+ * и так были бы потрачены впустую. Замера, который сравнил бы вмешательство с
+ * бездействием на этом классе, у нас НЕТ (docs/RESEARCH-truncation-flash-vs-glm.md
+ * меряет другое — обрывы на потолке вывода); это соображение, а не результат.
  *
  * Выход в том, что у исполнителя он уже есть по инструкции: упёрся — верни
  * блокер. Круг в рассуждении означает, что нужного факта в контексте нет, и

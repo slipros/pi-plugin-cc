@@ -12,6 +12,7 @@ import {
   applyPiEvent,
   buildPiArgs,
   continuationPrompt,
+  producedWork,
   thinkingLength,
   LOOP_NUDGE_PROMPT,
   MAX_LOOP_NUDGES,
@@ -394,17 +395,20 @@ export async function runPiRpcTurn({
         const answered = state.assistantTexts.length;
         // Ответ без текста индекса не даёт: склеивать в нём нечего.
         lastAnswerIndex = answered > answersSeen ? answered - 1 : null;
-        const producedText = answered > answersSeen;
         answersSeen = answered;
 
         // Ход, целиком ушедший в размышление, — единственный надёжный признак
         // круга: обычная задумчивость всё равно заканчивается словом или вызовом.
+        // Считать надо ИМЕННО работу, а не текст: ход с одним вызовом инструмента
+        // текста не несёт вовсе, и по тексту вся пофайловая работа выглядит
+        // пустой — вмешательства уходили бы в исправно работающего агента.
+        const worked = producedWork(event.message);
         const thought = thinkingLength(event.message);
         thinkPerTurn.push(thought);
-        if (thought > 0 && !producedText) {
+        if (thought > 0 && !worked) {
           turnsIdle += 1;
         }
-        bloatWindow.push(thought >= THINKING_BLOAT_CHARS && !producedText ? 1 : 0);
+        bloatWindow.push(thought >= THINKING_BLOAT_CHARS && !worked ? 1 : 0);
         if (bloatWindow.length > THINKING_BLOAT_WINDOW) {
           bloatWindow.shift();
         }

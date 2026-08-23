@@ -212,7 +212,7 @@ def main():
     parser.add_argument("--model", default="deepseek-v4-flash:0731")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--system", default=os.path.expanduser("~/.claude/pi/prompts/go-developer.md"))
+    parser.add_argument("--system", default=os.path.expanduser("~/.claude/pi/prompts/developer.md"))
     parser.add_argument("--out", default=None)
     parser.add_argument("--label", default="")
     # Прод шлёт больше, чем история сессии: каталог инструментов и системный

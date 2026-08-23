@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { budgetExceeded } from "./budget.mjs";
+import { isTruncationReason } from "./finish-reason.mjs";
 import { createInboxWatcher } from "./inbox.mjs";
 import { attachJsonlReader, parseJsonLine } from "./jsonl.mjs";
 import { runCommand } from "./process.mjs";
@@ -264,6 +265,19 @@ export async function runPiRpcTurn({
     // событий нет — следующий ход мог перестать буксовать и сам по себе, без
     // всякого вмешательства, — поэтому счётчик и не пытается его изображать.
     let loopNudges = 0;
+    // Круг замечен, но сообщение ещё не отправлено: ход оборвался на потолке, и
+    // отправлять надо на `agent_settled`, а не здесь. Причины две. Отправка
+    // ВМЕСТО продолжения — на один обрыв уходит ровно одно сообщение: «продолжи
+    // с места обрыва» и «не продолжай, прими решение» в одном ходе противоречат
+    // друг другу, и модель отвечает на это словами «сообщения сбивают с толку».
+    // И доставка: обрезанный ход pi отбрасывает целиком, steer-очередь этого
+    // хода уходит в никуда вместе с ним, а `prompt` на settled-агенте открывает
+    // новый ход.
+    let nudgePending = false;
+    // Нудж отправлен и ещё не подхвачен — сторож ровно того же смысла, что
+    // `recoverySentAt` ниже: отправка гасит детектор завершения, и вернуть его
+    // некому, если сообщение никуда не доехало.
+    let nudgeSentAt = null;
     // Распределение рассуждения по ходам: одна суммарная цифра не отличает
     // «думал понемногу на каждом ходу» от «утонул на трёх», а лечится это разным.
     const thinkPerTurn = [];
@@ -335,9 +349,29 @@ export async function runPiRpcTurn({
           // A refused continuation must not leave the run waiting for a turn
           // that will never start: the agent has settled and stays settled, so
           // hand the finish detector back what sending the prompt took from it.
-          if (event.command === "prompt" && recoverySentAt !== null) {
+          //
+          // Сверяется ИМЕННО id: отказов на команду `prompt` в прогоне два вида —
+          // продолжение после обрыва и вмешательство в круг, — и они летят по
+          // очереди. Без сверки отказ одного гасил бы сторож другого: отбитый
+          // нудж объявлял бы агента settled, пока продолжение ещё в полёте, и
+          // прогон закрывался бы посреди работы.
+          // id в ответе не гарантирован протоколом (pi возвращает тот, что нёс
+          // отказанный command). Отказ без id разбирается по-старому — сторож
+          // возвращает тот, кто его снял; сверка нужна ровно там, где отправок
+          // две и перепутать их можно.
+          const refusedId = String(event.id ?? "");
+          const refusedNudge = refusedId.startsWith("nudge-");
+          if (event.command === "prompt" && !refusedNudge && recoverySentAt !== null) {
             recoverySentAt = null;
             settledAt = Date.now();
+          }
+          if (event.command === "prompt" && refusedNudge && nudgeSentAt !== null) {
+            nudgeSentAt = null;
+            // Продолжение в полёте само вернёт сторож, когда решится его судьба;
+            // трогать `settledAt` за него отсюда нельзя.
+            if (recoverySentAt === null) {
+              settledAt = Date.now();
+            }
           }
         }
         return;
@@ -345,7 +379,34 @@ export async function runPiRpcTurn({
 
       appendEvent(event);
 
-      if (event.type === "agent_settled") {
+      if (event.type === "agent_settled" && nudgePending) {
+        // Круг, замеченный на ходе, который оборвался на потолке: сообщение
+        // уходит здесь и ЗАМЕНЯЕТ продолжение. Продолжать нечего — ход целиком
+        // ушёл в размышление, работы в нём нет, и просьба «продолжи» вернула бы
+        // модель в тот же круг ещё на один потолок вывода.
+        settledAt = Date.now();
+        nudgePending = false;
+        if (send({ type: "prompt", message: LOOP_NUDGE_PROMPT, id: `nudge-${loopNudges + 1}` })) {
+          loopNudges += 1;
+          // Обрыв закрыт вмешательством: причина не должна достаться
+          // следующему `agent_settled` и превратиться там в продолжение.
+          lastStopReason = null;
+          settledAt = null;
+          nudgeSentAt = Date.now();
+          // Половина, написанная до обрыва, всё равно склеивается с тем, что
+          // придёт дальше: вмешательство не делает её ненаписанной.
+          if (answerAnchor === null && lastAnswerIndex !== null) {
+            answerAnchor = lastAnswerIndex;
+          }
+          report({
+            phase: "working",
+            message:
+              `Ход целиком ушёл в размышление и оборвался на потолке вывода — похоже на круг. ` +
+              `Вместо продолжения прошу принять решение или вернуть блокер ` +
+              `(вмешательство ${loopNudges} из ${MAX_LOOP_NUDGES}).`
+          });
+        }
+      } else if (event.type === "agent_settled") {
         settledAt = Date.now();
         // Bounded on purpose: a model stuck repeating itself hits the ceiling
         // every time, and each attempt costs a full ceiling of tokens. When the
@@ -390,6 +451,7 @@ export async function runPiRpcTurn({
       } else if (event.type === "agent_start" || event.type === "turn_start") {
         settledAt = null;
         recoverySentAt = null;
+        nudgeSentAt = null;
       }
 
       const update = applyPiEvent(state, event);
@@ -425,14 +487,32 @@ export async function runPiRpcTurn({
           !nudgeOff &&
           bloated >= THINKING_BLOAT_HITS &&
           loopNudges < MAX_LOOP_NUDGES &&
+          !nudgePending &&
           !closing &&
           !aborted &&
           !budgetStop
         ) {
-          if (send({ type: "prompt", message: LOOP_NUDGE_PROMPT, id: `nudge-${loopNudges + 1}` })) {
+          // Окно обнуляется в обеих ветках: иначе те же ходы вызвали бы второе
+          // вмешательство на следующем же шаге, ещё до того, как первое могло
+          // подействовать.
+          if (isTruncationReason(lastStopReason)) {
+            // Ход оборвался на потолке — отправка ждёт `agent_settled`, где она
+            // заменит собой продолжение (см. `nudgePending`).
+            nudgePending = true;
+            bloatWindow.length = 0;
+          } else if (
+            send({
+              type: "prompt",
+              message: LOOP_NUDGE_PROMPT,
+              id: `nudge-${loopNudges + 1}`,
+              // Ход кончился, но прогон идёт: агент СТРИМИТ, и голый `prompt` pi
+              // отвергает — «Agent is already processing. Specify
+              // streamingBehavior». Поле снимает отказ и ничего не меняет для
+              // settled-агента: pi смотрит на него, только когда стримит.
+              streamingBehavior: "steer"
+            })
+          ) {
             loopNudges += 1;
-            // Окно обнуляется: иначе те же ходы вызвали бы второе вмешательство
-            // на следующем же шаге, ещё до того, как первое могло подействовать.
             bloatWindow.length = 0;
             report({
               phase: "working",
@@ -562,6 +642,11 @@ export async function runPiRpcTurn({
         if (recoverySentAt !== null && Date.now() - recoverySentAt >= recoveryAckMs) {
           state.errors.push("pi never picked up the continuation sent after a truncated answer.");
           recoverySentAt = null;
+          settledAt = Date.now();
+        }
+        if (nudgeSentAt !== null && Date.now() - nudgeSentAt >= recoveryAckMs) {
+          state.errors.push("pi never picked up the message sent after a loop in the agent's thinking.");
+          nudgeSentAt = null;
           settledAt = Date.now();
         }
         const quietFor = Date.now() - Math.max(settledAt ?? 0, lastControlAt);

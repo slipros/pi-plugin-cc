@@ -28,10 +28,74 @@ const turns = Number(process.env.PI_FAKE_TURNS ?? 5);
 const bloatChars = Number(process.env.PI_FAKE_THINK ?? 8000);
 const withText = process.env.PI_FAKE_WITH_TEXT === "1";
 const withTool = process.env.PI_FAKE_WITH_TOOL === "1";
+// Ходы обрываются на потолке вывода: pi отбрасывает обрезанное сообщение
+// целиком и оседает после КАЖДОГО такого хода — так выглядит живой срыв.
+const truncate = process.env.PI_FAKE_TRUNCATE === "1";
 const say = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
 const note = (entry) => fs.appendFileSync(log, JSON.stringify(entry) + "\\n");
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 let prompts = 0;
+// Настоящий pi отвергает голый prompt, пока агент занят, и подсказывает поле,
+// которым сообщение ставится в очередь. Двойник, принимающий его всегда, не
+// поймал бы ровно тот дефект, из-за которого вмешательство не доезжало.
+let streaming = false;
+let heard = false;
+
+const turnContent = (i) => {
+  const content = [{ type: "thinking", thinking: "думаю ".repeat(Math.ceil(bloatChars / 6)) }];
+  if (withText) content.push({ type: "text", text: "и вот что решил " + i });
+  // Ход с одним вызовом инструмента: pi шлёт его как [thinking, toolCall],
+  // текста в нём нет вовсе — так выглядит обычная пофайловая работа.
+  if (withTool) {
+    content.push({ type: "toolCall", toolCallId: "call-" + i, toolName: "edit", args: { path: "file" + i + ".go" } });
+  }
+  return content;
+};
+
+async function runLoop() {
+  streaming = true;
+  for (let i = 0; i < turns; i += 1) {
+    if (withTool) {
+      say({ type: "tool_execution_start", toolCallId: "call-" + i, toolName: "edit", args: { path: "file" + i + ".go" } });
+    }
+    say({ type: "turn_start" });
+    note({ type: "fake_turn" });
+    say({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: truncate ? "length" : "stop",
+        usage: { input: 10, output: 20 },
+        content: turnContent(i)
+      }
+    });
+    // Пауза даёт плагину увидеть ход и успеть вмешаться, пока агент ещё занят.
+    await sleep(15);
+    if (truncate) {
+      // Обрыв заканчивает не только ход, но и весь заход агента.
+      streaming = false;
+      say({ type: "agent_settled" });
+      return;
+    }
+    if (heard && process.env.PI_FAKE_KEEP_LOOPING !== "1") {
+      break;
+    }
+  }
+  streaming = false;
+  say({ type: "agent_settled" });
+}
+
+async function answer() {
+  streaming = true;
+  say({ type: "turn_start" });
+  say({ type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { input: 10, output: 20 }, content: [{ type: "text", text: "решение принято" }] } });
+  await sleep(5);
+  streaming = false;
+  say({ type: "agent_settled" });
+}
+
+let chain = Promise.resolve();
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const command = JSON.parse(line);
   note(command);
@@ -40,29 +104,34 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     return;
   }
   if (command.type !== "prompt") return;
-  prompts += 1;
-  say({ type: "response", command: "prompt", success: true });
-  // Агент, послушавший вмешательство, перестаёт крутиться — если тест не просит
-  // обратного (PI_FAKE_KEEP_LOOPING=1 нужен для проверки лимита).
-  if (prompts > 1 && process.env.PI_FAKE_KEEP_LOOPING !== "1") {
-    say({ type: "turn_start" });
-    say({ type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { input: 10, output: 20 }, content: [{ type: "text", text: "решение принято" }] } });
-    say({ type: "agent_settled" });
+  if (process.env.PI_FAKE_REJECT_NUDGE === "1" && String(command.id ?? "").startsWith("nudge-")) {
+    say({ type: "response", command: "prompt", success: false, id: command.id, error: "nope" });
     return;
   }
-  for (let i = 0; i < turns; i += 1) {
-    const content = [{ type: "thinking", thinking: "думаю ".repeat(Math.ceil(bloatChars / 6)) }];
-    if (withText) content.push({ type: "text", text: "и вот что решил " + i });
-    // Ход с одним вызовом инструмента: pi шлёт его как [thinking, toolCall],
-    // текста в нём нет вовсе — так выглядит обычная пофайловая работа.
-    if (withTool) {
-      content.push({ type: "toolCall", toolCallId: "call-" + i, toolName: "edit", args: { path: "file" + i + ".go" } });
-      say({ type: "tool_execution_start", toolCallId: "call-" + i, toolName: "edit", args: { path: "file" + i + ".go" } });
-    }
-    say({ type: "turn_start" });
-    say({ type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { input: 10, output: 20 }, content } });
+  if (streaming && !command.streamingBehavior) {
+    say({
+      type: "response",
+      command: "prompt",
+      success: false,
+      id: command.id,
+      error: "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
+    });
+    return;
   }
-  say({ type: "agent_settled" });
+  prompts += 1;
+  say({ type: "response", command: "prompt", success: true, id: command.id });
+  if (prompts > 1) {
+    heard = true;
+  }
+  if (command.streamingBehavior) {
+    // Поставлено в очередь текущего хода — нового захода агента не будет.
+    return;
+  }
+  // Агент, послушавший вмешательство, перестаёт крутиться — если тест не просит
+  // обратного (PI_FAKE_KEEP_LOOPING=1 нужен для проверки лимита).
+  chain = chain.then(() =>
+    prompts > 1 && process.env.PI_FAKE_KEEP_LOOPING !== "1" ? answer() : runLoop()
+  );
 });
 `,
   { encoding: "utf8", mode: 0o755 }
@@ -78,14 +147,19 @@ function withRun(env, run) {
   const dir = fs.mkdtempSync(path.join(FAKE_ROOT, "run-"));
   const log = path.join(dir, "calls.jsonl");
   fs.writeFileSync(log, "", "utf8");
-  const nudges = () =>
+  const entries = () =>
     fs
       .readFileSync(log, "utf8")
       .split("\n")
       .filter(Boolean)
-      .map((line) => JSON.parse(line))
-      .filter((command) => command.type === "prompt" && command.message === LOOP_NUDGE_PROMPT);
-  return run({ cwd: dir, nudges, env: { ...process.env, PI_FAKE_LOG: log, ...env } });
+      .map((line) => JSON.parse(line));
+  const nudges = () => entries().filter((command) => command.type === "prompt" && command.message === LOOP_NUDGE_PROMPT);
+  const continuations = () =>
+    entries().filter(
+      (command) => command.type === "prompt" && command.id !== "prompt-1" && command.message !== LOOP_NUDGE_PROMPT
+    );
+  const turns = () => entries().filter((entry) => entry.type === "fake_turn");
+  return run({ cwd: dir, nudges, continuations, turns, env: { ...process.env, PI_FAKE_LOG: log, ...env } });
 }
 
 test("три хода целиком в размышление — плагин сам вмешивается", async () => {
@@ -153,4 +227,75 @@ test("off-switch выключает вмешательство", async () => {
     assert.equal(nudges().length, 0);
     assert.equal(result.loopNudges, 0);
   });
+});
+
+test("вмешательство доезжает до работающего агента, а не отбивается", async () => {
+  // Голый prompt в занятого агента pi отвергает — «Agent is already processing.
+  // Specify streamingBehavior» — и вмешательство не случается вовсе. Дефект был
+  // невидим: команда уходила в stdin, счётчик её засчитывал, а до модели она не
+  // доезжала.
+  await withRun({ PI_FAKE_TURNS: "5", PI_FAKE_THINK: "8000" }, async ({ cwd, nudges, env }) => {
+    const result = await runPiRpcTurn({ cwd, prompt: "задача", sandbox: null, settleGraceMs: 200, env });
+    assert.equal(nudges().length, 1);
+    assert.equal(nudges()[0].streamingBehavior, "steer", "занятому агенту сообщение ставится в очередь хода");
+    assert.deepEqual(
+      result.errors.filter((line) => line.includes("rejected")),
+      [],
+      "pi ничего не отверг"
+    );
+    assert.equal(result.loopNudges, 1);
+  });
+});
+
+test("на обрыв, признанный кругом, уходит вмешательство ВМЕСТО продолжения", async () => {
+  // «Продолжи ровно с места обрыва» и «не продолжай, прими решение» в одном
+  // ходе противоречат друг другу: на живом прогоне модель ответила на это
+  // словами «сообщения сбивают с толку» и осталась в круге.
+  await withRun(
+    {
+      PI_FAKE_TURNS: "1",
+      PI_FAKE_THINK: "8000",
+      PI_FAKE_TRUNCATE: "1",
+      PI_FAKE_KEEP_LOOPING: "1",
+      PI_TRUNCATION_RETRIES: "6"
+    },
+    async ({ cwd, nudges, continuations, turns, env }) => {
+      const result = await runPiRpcTurn({ cwd, prompt: "задача", sandbox: null, settleGraceMs: 200, env });
+      assert.ok(nudges().length >= 1, "круг из обрывов замечен");
+      assert.equal(nudges()[0].streamingBehavior, undefined, "осевшему агенту сообщение уходит обычным промптом");
+      assert.deepEqual(
+        result.errors.filter((line) => line.includes("rejected")),
+        [],
+        "pi ничего не отверг"
+      );
+      // Ровно одно сообщение на обрыв, и ни одного лишнего: сумма продолжений и
+      // вмешательств не превышает числа оборванных ходов. Строгого равенства
+      // здесь нет — на последнем обрыве лимит продолжений уже исчерпан, и
+      // прогон честно заканчивается обрезанным, ничего не отправляя.
+      assert.ok(
+        continuations().length + nudges().length <= turns().length,
+        `продолжений ${continuations().length} + вмешательств ${nudges().length} против ходов ${turns().length}`
+      );
+      assert.equal(result.loopNudges, nudges().length);
+    }
+  );
+});
+
+test("отказ на вмешательство не обрывает прогон и не подменяет отказ продолжения", async () => {
+  // Отказать pi может и по своей причине (расширение, компакция). Обработчик
+  // отказа сверяет id: без сверки отбитый нудж возвращал бы детектор завершения
+  // вместо продолжения — и прогон закрывался бы, пока продолжение ещё в полёте.
+  await withRun(
+    { PI_FAKE_TURNS: "5", PI_FAKE_THINK: "8000", PI_FAKE_REJECT_NUDGE: "1" },
+    async ({ cwd, nudges, env }) => {
+      const result = await runPiRpcTurn({ cwd, prompt: "задача", sandbox: null, settleGraceMs: 200, env });
+      assert.equal(nudges().length, 1, "вмешательство отправлено");
+      assert.ok(
+        result.errors.some((line) => line.includes("rejected")),
+        "отказ виден в ошибках прогона, а не проглочен"
+      );
+      // Прогон доходит до конца сам: агент оседает, ничего не ждёт впустую.
+      assert.ok(!result.errors.some((line) => line.includes("never picked up")), result.errors.join(" | "));
+    }
+  );
 });

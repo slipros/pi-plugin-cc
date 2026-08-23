@@ -88,14 +88,32 @@ test("docker run mounts the workspace and keeps the agent dir container-local", 
   assert.deepEqual(args.slice(0, 4), ["run", "--rm", "-i", "--init"]);
   assert.equal(valueAfter(args, "--name"), "pi-plugin-job");
   assert.equal(valueAfter(args, "--user"), "1000:1000");
-  assert.equal(valueAfter(args, "-w"), "/workspace");
-  assert.ok(mounts(args).includes("/home/me/project:/workspace"));
+  assert.equal(valueAfter(args, "-w"), "/workspace/project");
+  assert.ok(mounts(args).includes("/home/me/project:/workspace/project"));
   assert.ok(mounts(args).includes(`${DEFAULT_SANDBOX_VOLUME}:/pi-agent`));
   assert.ok(args.includes("HOME=/home/pi"));
   assert.ok(args.includes("PI_CODING_AGENT_DIR=/pi-agent"));
 
   // The image comes last, right before the arguments handed to pi.
   assert.deepEqual(args.slice(-3), [DEFAULT_SANDBOX_IMAGE, "--mode", "rpc"]);
+});
+
+test("the workspace keeps its own directory name inside the container", () => {
+  // A build recipe that derives the target from the directory name — the common
+  // case is `$(notdir $(CURDIR))` in a Makefile — computes a name that exists
+  // nowhere when the mount renames the directory, and the gate quietly measures
+  // something else or nothing at all.
+  for (const cwd of ["/srv/advertising-api", "/home/me/work/lk-api/"]) {
+    const args = buildDockerRunArgs({
+      sandbox: normalizeSandbox("docker"),
+      cwd,
+      identity: IDENTITY,
+      homeDir: "/nonexistent-home",
+      env: {}
+    });
+    const name = cwd.replace(/\/+$/, "").split("/").pop();
+    assert.equal(valueAfter(args, "-w"), `/workspace/${name}`);
+  }
 });
 
 test("agentDir host shares the host agent directory instead of a volume", () => {

@@ -298,6 +298,22 @@ export function sessionDirFor(cwd) {
 }
 
 /**
+ * Where the workspace lands inside the container.
+ *
+ * Mounting it flat at the workdir root renames the directory, and a build
+ * recipe that derives anything from the directory name stops being true: the
+ * common one is a Makefile computing the service name from `$(notdir
+ * $(CURDIR))`, which then builds a target that exists nowhere. The failure is
+ * quiet in the worst way — the agent reaches for an equivalent command, reports
+ * the gate as green, and the gate never ran. Keeping the repository's own
+ * directory name makes host recipes hold inside the sandbox unchanged.
+ */
+export function containerWorkdir(cwd) {
+  const name = path.basename(path.resolve(cwd));
+  return name && name !== path.sep ? `${WORKDIR}/${name}` : WORKDIR;
+}
+
+/**
  * Whether this run must not share writable state with runs in other workspaces.
  *
  * Set for workspaces the user has not vouched for: their code runs with write
@@ -411,7 +427,8 @@ export function buildDockerRunArgs({
     }
   }
 
-  args.push("-v", `${cwd}:${WORKDIR}`, "-w", WORKDIR);
+  const workdir = containerWorkdir(cwd);
+  args.push("-v", `${cwd}:${workdir}`, "-w", workdir);
 
   const agent = resolveAgentMount(sandbox, homeDir, cwd);
   args.push("-v", `${agent.source}:${AGENT_DIR}`);
@@ -583,7 +600,7 @@ function writeRunGitconfig(gitProxy) {
  * Identity is deliberately absent: it arrives as the GIT_AUTHOR and
  * GIT_COMMITTER variables, resolved on the host, where an `includeIf
  * "gitdir:…"` rule still matches a real path — inside the container the
- * repository is /workspace and no such rule could ever fire.
+ * repository lives under /workspace and no such rule could ever fire.
  */
 function hostCheckoutSettings() {
   const lines = [];

@@ -279,3 +279,27 @@ test("серия ответов одинаковой длины подряд п�
   }
   assert.ok(varied.stats().repeatRun <= 1, `ждали отсутствие серии, получили ${varied.stats().repeatRun}`);
 });
+
+test("плавный дрейф длины серией не считается", () => {
+  // Каждый ответ на процент длиннее предыдущего: при сравнении с предыдущим
+  // допуск накапливается и шесть РАЗНЫХ ответов (1000 → 1045) выглядят как один
+  // повторённый. Сравнение с первым ответом серии этого не допускает.
+  const drift = createRequestRecorder("job-drift", { databaseFile: ":memory:" });
+  for (const out of [1000, 1009, 1018, 1027, 1036, 1045]) {
+    drift.record({ out_tokens: out, status: 200, finish_reason: "tool_calls" });
+  }
+  assert.ok(drift.stats().repeatRun < 5, `дрейф принят за повтор: ${drift.stats().repeatRun}`);
+});
+
+test("неудачные запросы рвут серию, а не склеивают её", () => {
+  // Два одинаковых ответа, разделённые пятью ошибками провайдера, — это пауза,
+  // а не повтор: выдавать сбой сети за вырождение модели значит отправить
+  // владельца чинить промпт вместо сети.
+  const broken = createRequestRecorder("job-broken", { databaseFile: ":memory:" });
+  broken.record({ out_tokens: 1283, status: 200, finish_reason: "tool_calls" });
+  for (let i = 0; i < 5; i += 1) {
+    broken.record({ status: 503, error_kind: "upstream" });
+  }
+  broken.record({ out_tokens: 1283, status: 200, finish_reason: "tool_calls" });
+  assert.equal(broken.stats().repeatRun, 1, "серия должна была прерваться на ошибках");
+});

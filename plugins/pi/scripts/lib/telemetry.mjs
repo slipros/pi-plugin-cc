@@ -194,21 +194,37 @@ export function createRequestRecorder(jobId, { flushIntervalMs = FLUSH_INTERVAL_
       //
       // Короткие ответы исключены: «готово», «ок», подтверждение вызова
       // естественно совпадают по длине и повтором не являются.
+      //
+      // Длина сравнивается с ПЕРВЫМ ответом серии, а не с предыдущим: при
+      // цепочечном сравнении допуск накапливается, и плавный дрейф (1000 → 1045
+      // шагами по 0.9%) выглядит как пять одинаковых ответов, хотя одинаковых
+      // среди них нет. Неудачный запрос серию РВЁТ: между двумя ответами по 1283
+      // токена, разделёнными пятью ошибками провайдера, повтора не было —
+      // была пауза, и склеивать их в серию значит выдавать сбой сети за
+      // вырождение модели.
+      const failedRequest = Boolean(request.error_kind) ||
+        !(Number(request.status) >= 200 && Number(request.status) < 300);
       const out = Number(request.out_tokens);
-      if (Number.isFinite(out) && out >= REPEAT_MIN_TOKENS) {
+      if (failedRequest) {
+        repeatRun = 0;
+        repeatLastOut = null;
+      } else if (Number.isFinite(out) && out >= REPEAT_MIN_TOKENS) {
         const same =
           Number.isFinite(repeatLastOut) &&
-          Math.abs(out - repeatLastOut) <= Math.max(1, out * REPEAT_TOLERANCE);
+          Math.abs(out - repeatLastOut) <= Math.max(1, repeatLastOut * REPEAT_TOLERANCE);
         repeatRun = same ? repeatRun + 1 : 1;
         summary.repeatRun = Math.max(summary.repeatRun, repeatRun);
-        repeatLastOut = out;
+        // Якорь держится на первом ответе серии и обновляется только при её сбросе.
+        if (!same) {
+          repeatLastOut = out;
+        }
       } else if (Number.isFinite(out)) {
         repeatRun = 0;
         repeatLastOut = null;
       }
       // "Failed" is anything the agent had to work around: a non-2xx answer, a
       // stream that ended early, a request that never reached the provider.
-      if (request.error_kind || !(Number(request.status) >= 200 && Number(request.status) < 300)) {
+      if (failedRequest) {
         summary.failed += 1;
       }
       if (Number.isFinite(request.ttft_ms)) {

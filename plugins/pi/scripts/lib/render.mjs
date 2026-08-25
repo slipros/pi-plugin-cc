@@ -96,20 +96,26 @@ export function renderSetupReport(report) {
  * and the caller should not have to open a system prompt to answer it —
  * reading prompts to choose costs more than the choice.
  */
-export function presetLines(presets) {
+export function presetLines(presets, capabilities = {}) {
   const names = Object.keys(presets ?? {});
   if (!names.length) {
     return ["- none configured (add a `presets` block to `.claude/pi/config.json`)"];
   }
   return names.map((name) => {
     const preset = presets[name] ?? {};
+    const caps = capabilities[name] ?? {};
     const details = [
       preset.model ? `model \`${preset.model}\`` : null,
       preset.provider ? `provider \`${preset.provider}\`` : null,
       preset.thinking ? `thinking \`${preset.thinking}\`` : null,
       preset.systemPrompt ? `prompt \`${preset.systemPrompt}\`` : null,
       preset.readOnly ? "read-only" : null,
-      preset.sandbox?.profile ? `sandbox \`${preset.sandbox.profile}\`` : null
+      preset.sandbox?.profile ? `sandbox \`${preset.sandbox.profile}\`` : null,
+      // Capabilities the preset does not state and the model does not carry:
+      // a skill the profile mounts is invisible in both, and a caller that
+      // cannot see it will route the work by the model's limits instead.
+      caps.vision ? `vision \`${caps.vision}\`` : null,
+      caps.tags?.length ? `tags \`${caps.tags.join(", ")}\`` : null
     ]
       .filter(Boolean)
       .join(", ");
@@ -126,8 +132,8 @@ export function presetLines(presets) {
  * call takes over a second, which is too slow for anything that asks on every
  * invocation, such as a hook.
  */
-export function renderPresetsReport({ presets = {}, prompts = [] } = {}) {
-  const lines = ["# pi presets", "", ...presetLines(presets)];
+export function renderPresetsReport({ presets = {}, prompts = [], capabilities = {} } = {}) {
+  const lines = ["# pi presets", "", ...presetLines(presets, capabilities)];
   if (prompts.length) {
     lines.push("", "## System prompts", "", prompts.map((name) => `- \`${name}\``).join("\n"));
   }

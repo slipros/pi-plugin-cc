@@ -15,6 +15,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { allPresetCapabilities } from "./lib/capabilities.mjs";
 import { loadConfig, resolveRunSettings, userConfigPath, workspaceIsTrusted } from "./lib/config.mjs";
 import {
   captureTreeSnapshot,
@@ -951,7 +952,11 @@ async function commandPresets(argv, workspaceRoot) {
   const { config } = loadConfig(workspaceRoot);
   const payload = {
     presets: config.presets ?? {},
-    prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort()
+    prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
+    // Kept beside the presets rather than merged into them: these values are
+    // derived, and a reader that cannot tell them apart from what the user
+    // wrote will eventually write one back into the config.
+    capabilities: allPresetCapabilities(config)
   };
   output(renderPresetsReport(payload), payload, Boolean(flags.json));
   return 0;

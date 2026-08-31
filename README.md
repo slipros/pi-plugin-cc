@@ -606,13 +606,15 @@ Each request is recorded as one row: status, `error_kind` (`transport`, `timeout
 
 What is never recorded: messages, system prompts, tool definitions, response text, or request headers. The body is parsed a few lines away to rewrite the model name, so this is a discipline rather than a limitation — the same line `redactArgs` draws for command lines. Rows expire with the same 90-day retention.
 
-Job state lives outside your repository, bucketed per workspace, and survives Claude Code restarts. Each record keeps the pi session id, so any run can be picked up in pi itself:
+Job state lives outside your repository, bucketed per workspace, and survives Claude Code restarts. Each record keeps the pi session id, so any run of an unsandboxed job can be picked up in pi itself — a sandboxed one keeps its session in the agent volume, where the host cannot see it:
 
 ```bash
 pi --session <session-id>
 ```
 
-`/pi:delegate --session last` continues the most recent pi session in the workspace from Claude Code instead.
+`/pi:continue last "<what next>"` continues the most recent session from Claude Code instead, with the preset, model and sandbox of the run that owns it. `/pi:sessions` lists what can be continued.
+
+Continuing replays the whole history to the provider, which is nearly free while the provider still caches it and full price once it does not — so a session older than the configured cache TTL (`cacheTtl`, 40 minutes by default) is refused rather than silently re-billed. `--stale-ok` pays for the replay on purpose; `--fresh` keeps the agent and drops the history.
 
 ## How it works
 

@@ -52,6 +52,14 @@ import { buildSystemPrompt, interpolate, listNamedPrompts, loadTaskTemplate } fr
 import { inboxPath, pushControlMessage } from "./lib/inbox.mjs";
 import { parseJsonLine } from "./lib/jsonl.mjs";
 import { runPiRpcTurn } from "./lib/rpc.mjs";
+import {
+  cacheState,
+  collectSessions,
+  findSession,
+  isSessionReference,
+  resolveCacheTtlMs,
+  staleSessionMessage
+} from "./lib/sessions.mjs";
 import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
   attachMounts,
@@ -76,6 +84,7 @@ import {
   eventsPath,
   generateJobId,
   listJobs,
+  listJobsEverywhere,
   nowIso,
   resolveDetachedLogFile,
   resolvePromptFile,
@@ -92,6 +101,7 @@ import {
   renderRunDetail,
   renderRunResult,
   renderRunsReport,
+  renderSessionsReport,
   renderSandboxReport,
   renderSetupReport,
   renderStatsReport,
@@ -120,6 +130,10 @@ const DETACHED_ENV = "PI_PLUGIN_DETACHED";
 const DETACHED_JOB_ENV = "PI_PLUGIN_JOB_ID";
 // Where the parent left the task text for the detached copy to pick up.
 const DETACHED_PROMPT_ENV = "PI_PLUGIN_PROMPT_FILE";
+// The session a detached `continue` was already told to resume: the child
+// re-executes the command line, and "last" would resolve against a job list
+// that now includes the child's own pending record.
+const DETACHED_SESSION_ENV = "PI_PLUGIN_CONTINUE_SESSION";
 
 /**
  * Incremental reader over a job's event file.
@@ -238,6 +252,9 @@ const RUN_FLAGS = {
     "write",
     "json",
     "fresh",
+    // Continue a session whose provider cache has aged out, paying for the
+    // whole history again on purpose.
+    "stale-ok",
     "stdin",
     "no-tools",
     "no-builtin-tools",
@@ -353,6 +370,8 @@ function usage() {
     `  ${self} runs [run-id] [--all] [--limit N] [--days N] [--model <id>]`,
     "                        [--preset <name>] [--kind delegate|review] [--prune] [--json]",
     `  ${self} rerun <run-id> [--append <text>] [--prompt <text>|--stdin] [run flags]`,
+    `  ${self} continue [session-id|job-id|last] [run flags] <what to do next>`,
+    `  ${self} sessions [session-id] [--all] [--global] [--json]`,
     `  ${self} cancel [job-id] [--all [--global]] [--json]`,
     `  ${self} steer [job-id] [--follow-up] <message>`,
     `  ${self} watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]`,
@@ -371,6 +390,8 @@ function usage() {
     "  --write                 allow edit/write/bash even when the preset is read-only",
     "  --session <id>          continue an existing pi session ('last' = latest job)",
     "  --fresh                 ignore --session and start a new pi session",
+    "  --stale-ok              continue a session whose provider cache has aged out,",
+    "                          re-sending its whole history at the full input rate",
     "  --timeout <seconds>     hard limit for the run",
     "  --max-cost <usd>        stop the run once it has cost this much",
     "  --max-tokens <n>        stop the run once it has used this many tokens",
@@ -684,7 +705,7 @@ function gitIdentityEnv(git) {
  *
  * @returns {boolean} true when the run was handed off and this process is done
  */
-function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settings }) {
+function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settings, env: extraEnv = {} }) {
   const detachedLog = resolveDetachedLogFile(workspaceRoot, jobId);
   ensureStateDir(workspaceRoot);
   const handle = fs.openSync(detachedLog, "a");
@@ -706,7 +727,11 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
       ...process.env,
       [DETACHED_ENV]: "1",
       [DETACHED_JOB_ENV]: jobId,
-      [DETACHED_PROMPT_ENV]: promptFile
+      [DETACHED_PROMPT_ENV]: promptFile,
+      // Decisions the parent already made and the child must not remake: it
+      // re-executes the same command line, and "last" or a cache TTL can
+      // resolve differently by the time it does.
+      ...extraEnv
     }
   });
   child.unref();
@@ -1045,6 +1070,185 @@ function measuredModels({ days = null, search = null } = {}) {
   }
 }
 
+/**
+ * Sessions of a workspace, each with the context it grew to.
+ *
+ * The size comes from the job file rather than the index: the index never had
+ * it, and it is the number that says what continuing a cold session costs.
+ */
+function workspaceSessions(workspaceRoot, { global: everywhere = false } = {}) {
+  const jobs = everywhere ? listJobsEverywhere() : listJobs(workspaceRoot);
+  return collectSessions(jobs).map((session) => ({
+    ...session,
+    contextTokens: readStoredJob(session.workspaceRoot ?? workspaceRoot, session.jobId)?.peakContext ?? null
+  }));
+}
+
+/**
+ * The gate in front of every continuation.
+ *
+ * Resuming a session replays its whole history. Inside the provider's cache
+ * window that is nearly free; past it the same tokens are paid for again, and
+ * the longer the session the larger that bill — which is why a cold session is
+ * refused by default instead of quietly continued.
+ */
+function guardSessionAge(session, { config, flags, command }) {
+  const ttlMs = resolveCacheTtlMs(config, { provider: session.provider });
+  const state = cacheState(session, ttlMs);
+  if (state === "cold" && !flags["stale-ok"]) {
+    throw new Error(staleSessionMessage(session, { ttlMs, contextTokens: session.contextTokens, command }));
+  }
+  return {
+    jobId: session.jobId,
+    sessionId: session.sessionId,
+    ageMs: session.ageMs,
+    cache: state,
+    staleOk: state === "cold"
+  };
+}
+
+/**
+ * Continue a recorded session with the agent it already had.
+ *
+ * The contour travels with the session — preset, model, sandbox, working
+ * directory — because a continuation resumed under different equipment is a
+ * different agent reading the same history, and in the sandboxed case it is not
+ * even that: the session lives in the agent volume, so a continuation without
+ * the sandbox cannot see it at all.
+ */
+async function commandContinue(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, RUN_FLAGS);
+  const words = [...positional];
+  // `continue last "…"`: a positional is taken as the reference only when it
+  // cannot be mistaken for the first word of the task.
+  const reference = flags.session ?? (words.length > 1 && isSessionReference(words[0]) ? words.shift() : null);
+
+  const handedOver = takeDetachedPrompt();
+  const piped = !handedOver && flags.stdin ? readStdin().trim() : "";
+  const prompt = handedOver ?? [words.join(" ").trim(), piped].filter(Boolean).join("\n\n");
+  if (!prompt) {
+    throw new Error(
+      "Nothing to continue with. Usage: continue [<session-id|job-id|last>] <what to do next>. " +
+        "What can be continued here is listed by `sessions`."
+    );
+  }
+
+  const { config, warnings: configWarnings } = loadConfig(workspaceRoot);
+  // The detached copy re-executes this command line; the session its parent
+  // resolved travels in the environment so "last" cannot drift under it.
+  const inherited = process.env[DETACHED_SESSION_ENV] || null;
+  const sessions = workspaceSessions(workspaceRoot);
+  const session = findSession(sessions, inherited ?? reference);
+  if (!session) {
+    throw new Error(
+      sessions.length
+        ? `No session here matches "${reference}". Sessions recorded for this workspace: ${sessions
+            .slice(0, 5)
+            .map((entry) => entry.sessionId.slice(0, 8))
+            .join(", ")}. Full list: \`sessions\`.`
+        : "No pi session recorded for this workspace. Job state is bucketed by the directory a run was started from, " +
+            "so a session started elsewhere is not lost — run `sessions --global` to find its workspace, or start a " +
+            "run here with `delegate`."
+    );
+  }
+  if (session.live) {
+    throw new Error(
+      `Job ${session.jobId} is still running on session \`${session.sessionId}\`. Send it a message with ` +
+        `\`steer ${session.jobId} "…"\`, or wait for it with \`wait ${session.jobId}\` and continue after.`
+    );
+  }
+
+  const continuation = guardSessionAge(session, {
+    config,
+    flags: inherited ? { ...flags, "stale-ok": true } : flags,
+    command: "continue"
+  });
+
+  // The recipe of the run that owns the session is the floor; flags override it
+  // the way they do on `rerun`.
+  const recipe = session.recipe ?? {};
+  const runRoot = resolveRunRoot(flags.cwd ?? session.runRoot ?? null);
+  const merged = {
+    ...flags,
+    preset: flags.preset ?? recipe.preset,
+    model: flags.model ?? recipe.model,
+    provider: flags.provider ?? recipe.provider,
+    thinking: flags.thinking ?? recipe.thinking,
+    engine: flags.engine ?? recipe.engine,
+    sandbox: flags.sandbox ?? recipe.sandbox,
+    ...(recipe.readOnly && !flags.write ? { "read-only": true } : {}),
+    timeout: flags.timeout ?? (recipe.timeoutMs ? String(Math.round(recipe.timeoutMs / 1000)) : undefined)
+  };
+
+  const settings = buildRunSettings({
+    command: "delegate",
+    flags: merged,
+    workspaceRoot,
+    runRoot,
+    config,
+    trusted: workspaceIsTrusted(runRoot)
+  });
+  settings.budget = settings.budget ?? recipe.budget ?? null;
+  settings.warnings = [...(configWarnings ?? []), ...settings.warnings];
+  settings.continuation = continuation;
+
+  const title = `Continue ${session.jobId}: ${prompt.split("\n")[0].slice(0, 100)}`;
+  const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("delegate");
+  if (flags.background && process.env[DETACHED_ENV] !== "1") {
+    detachBackgroundRun({
+      kind: "delegate",
+      workspaceRoot,
+      jobId,
+      title,
+      prompt,
+      settings,
+      env: { [DETACHED_SESSION_ENV]: session.sessionId }
+    });
+    return 0;
+  }
+
+  const { job, execution } = await executeRun({
+    kind: "delegate",
+    jobId,
+    title,
+    prompt,
+    settings,
+    workspaceRoot,
+    runRoot,
+    flags,
+    resultTitle: "pi continued session",
+    // `--fresh` keeps the agent and drops the history: the way out when the
+    // session is too cold to be worth re-sending.
+    sessionId: flags.fresh ? null : session.sessionId
+  });
+
+  output(execution.rendered, { job: job.id, ...execution }, Boolean(flags.json));
+  return execution.exitStatus === 0 ? 0 : 1;
+}
+
+/** What can be continued here, and how warm the cache behind each still is. */
+async function commandSessions(argv, workspaceRoot) {
+  const { flags, positional } = parseArgs(argv, { booleans: ["json", "all", "global"] });
+  const { config } = loadConfig(workspaceRoot);
+  const everywhere = Boolean(flags.global);
+  const found = workspaceSessions(workspaceRoot, { global: everywhere });
+  const filtered = positional.length ? [findSession(found, positional[0])].filter(Boolean) : found;
+  const rows = (flags.all || positional.length ? filtered : filtered.slice(0, 10)).map((session) => ({
+    ...session,
+    // Each row is judged against its own provider's window, since that is what
+    // decides whether continuing it reads from cache.
+    ttlMs: resolveCacheTtlMs(config, { provider: session.provider })
+  }));
+
+  const rendered = renderSessionsReport(rows, {
+    workspace: workspaceRoot,
+    global: everywhere,
+    ttlMs: resolveCacheTtlMs(config, {})
+  });
+  output(rendered, { sessions: rows, total: found.length }, Boolean(flags.json));
+  return 0;
+}
+
 async function commandDelegate(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
   // A detached run gets the text its parent already assembled: re-reading stdin
@@ -1071,6 +1275,19 @@ async function commandDelegate(argv, workspaceRoot) {
   // silently ignored setting looks exactly like one that did not work.
   settings.warnings = [...(configWarnings ?? []), ...settings.warnings];
   const sessionId = flags.fresh ? null : resolveSessionReference(workspaceRoot, flags.session);
+  // A session named here is continued as-is: `delegate` keeps the flags it was
+  // given and inherits nothing from the run that owns the session. The age of
+  // the cache is still checked — it costs the same money either way.
+  const continued = sessionId ? findSession(workspaceSessions(workspaceRoot), sessionId) : null;
+  if (continued) {
+    settings.continuation = guardSessionAge(continued, { config, flags, command: "delegate" });
+    if (continued.preset && !flags.preset) {
+      settings.warnings.push(
+        `Session \`${continued.sessionId.slice(0, 8)}\` last ran under preset \`${continued.preset}\`, which ` +
+          "`delegate --session` does not inherit — `continue` does, sandbox included."
+      );
+    }
+  }
 
   const title = prompt.split("\n")[0].slice(0, 120);
   const jobId = process.env[DETACHED_JOB_ENV] || generateJobId("delegate");
@@ -1279,7 +1496,7 @@ async function commandSteer(argv, workspaceRoot) {
   }
   if (target.status !== "running") {
     throw new Error(
-      `Job ${target.id} is ${target.status}, so it cannot be steered. Start a new run with --session ${target.sessionId ?? "last"} instead.`
+      `Job ${target.id} is ${target.status}, so it cannot be steered. Continue its session instead: \`continue ${target.sessionId ?? "last"} "…"\`.`
     );
   }
   if (target.engine === "json") {
@@ -1981,6 +2198,8 @@ const COMMANDS = {
   result: commandResult,
   runs: commandRuns,
   rerun: commandRerun,
+  continue: commandContinue,
+  sessions: commandSessions,
   wait: commandWait,
   cancel: commandCancel,
   steer: commandSteer,

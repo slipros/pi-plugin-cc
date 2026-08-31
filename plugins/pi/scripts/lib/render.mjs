@@ -1,6 +1,7 @@
 import { describeBudget } from "./budget.mjs";
 import { groupByProvider } from "./models.mjs";
 import { READ_ONLY_TOOLS, wasTruncated } from "./pi.mjs";
+import { cacheState, formatDuration as formatAge } from "./sessions.mjs";
 
 function formatCost(cost) {
   if (typeof cost !== "number" || Number.isNaN(cost)) {
@@ -209,6 +210,20 @@ export function renderModelsReport({ models, defaults, search, measured = null }
   return joinLines(lines);
 }
 
+/**
+ * Where the session this run leaves behind can be picked up.
+ *
+ * A sandboxed run keeps its session inside the agent volume, so the obvious
+ * `pi --session <id>` on the host finds nothing — the hint has to say which
+ * door actually opens.
+ */
+function formatSessionLine(sessionId, settings) {
+  const how = settings.sandboxLabel
+    ? "it lives in the sandbox volume, not on the host"
+    : `or \`pi --session ${sessionId}\` yourself`;
+  return `- pi session: \`${sessionId}\` (continue with \`continue ${sessionId}\`; ${how})`;
+}
+
 function renderRunHeader(title, { job, settings, execution }) {
   // The effective thinking level comes back from pi's own state; the requested
   // one is only a fallback for engines that never report it.
@@ -227,7 +242,11 @@ function renderRunHeader(title, { job, settings, execution }) {
     // The run works in a worktree, so the repository it belongs to came along.
     settings.worktreeMount ? `- Worktree: shared \`${settings.worktreeMount.split(":")[0]}\` mounted` : null,
     settings.git ? `- Commits as: ${settings.git.name} <${settings.git.email}>` : null,
-    execution?.sessionId ? `- pi session: \`${execution.sessionId}\` (resume with \`pi --session ${execution.sessionId}\`)` : null,
+    settings.continuation
+      ? `- Continues: \`${settings.continuation.jobId}\` (last active ${formatAge(settings.continuation.ageMs)} ago, ` +
+        `cache ${settings.continuation.cache}${settings.continuation.staleOk ? ", continued past the TTL on `--stale-ok`" : ""})`
+      : null,
+    execution?.sessionId ? formatSessionLine(execution.sessionId, settings) : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,
     // Printed whether or not it was reached: a run that stopped early is easier
     // to read when the ceiling it was given is on the same page.
@@ -878,4 +897,65 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
     `Journal: \`${database}\` · group by \`--by day|model|preset|workspace|kind|status\` · \`--days N\` or \`--all\`.`
   );
   return joinLines(lines);
+}
+
+/** Contour a session was last run with — what a continuation inherits. */
+function sessionContour(session) {
+  const parts = [session.preset ? `\`${session.preset}\`` : (session.model ?? "—")];
+  if (session.sandbox) {
+    // The label carries the whole sandbox descriptor; the column only has room
+    // for the part that identifies it.
+    parts.push(String(session.sandbox).split(",")[0].replace(/^docker\s+/, ""));
+  }
+  if (session.readOnly) {
+    parts.push("read-only");
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * The sessions of one workspace and the state of the cache behind each.
+ *
+ * `age` is time since the provider last saw the session, which is what decides
+ * whether continuing it replays from cache or pays for the whole history again.
+ */
+export function renderSessionsReport(sessions, { workspace = null, ttlMs, global: everywhere = false } = {}) {
+  const scope = everywhere ? "every workspace" : `\`${workspace}\``;
+  if (!sessions.length) {
+    return joinLines([
+      "# pi sessions",
+      "",
+      `No pi session recorded for ${scope} yet.`,
+      "",
+      "Sessions are bucketed by the directory a run was started from: one started elsewhere is not missing, it is " +
+        "just in another bucket. `--global` looks across all of them."
+    ]);
+  }
+
+  const rows = sessions.map((session) => {
+    const state = cacheState(session, session.ttlMs ?? ttlMs);
+    const age = session.live ? "running" : formatAge(session.ageMs);
+    const context = session.contextTokens ? formatTokens(session.contextTokens) : "—";
+    return (
+      `| \`${session.sessionId.slice(0, 8)}…${session.sessionId.slice(-4)}\` | ${age} | ${state} | ` +
+      `${sessionContour(session)} | ${context} | \`${session.jobId}\` |`
+    );
+  });
+
+  const warm = sessions.find((session) => cacheState(session, session.ttlMs ?? ttlMs) === "warm");
+  return joinLines([
+    `# pi sessions — ${scope}`,
+    "",
+    "| session | age | cache | contour | context | last job |",
+    "|---|---|---|---|---|---|",
+    ...rows,
+    "",
+    `Cache TTL in force: ${formatAge(ttlMs)} — a \`cold\` session still holds all its history, but continuing ` +
+      "it re-sends that history at the full input rate instead of reading it from the provider's cache.",
+    warm
+      ? `Continue one with \`continue ${warm.sessionId.slice(0, 8)} "<task>"\` — the preset, model and sandbox of its ` +
+        "last run come along."
+      : "Every session here is past the TTL: continue one with `--stale-ok` if its history is worth the re-billing, " +
+        "or start a fresh run."
+  ]);
 }

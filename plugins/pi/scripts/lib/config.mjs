@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { normalizeBudget } from "./budget.mjs";
+import { DEFAULT_CACHE_TTL } from "./sessions.mjs";
 
 /**
  * Plugin configuration.
@@ -46,6 +47,11 @@ const BUILT_IN = {
   // `"concurrencyGroup": "ollama-pro"` draws from the same three slots. Optional
   // — a profile can also cap itself with `maxConcurrent` and share nothing.
   concurrencyPools: {},
+  // How long a provider is assumed to keep a cached prompt. A continued
+  // session replays its whole history: inside this window the provider reads
+  // it from cache, past it the same tokens are billed again at the input rate.
+  // `{"default": "40m", "providers": {"anthropic": "5m"}}` — see `sessions.mjs`.
+  cacheTtl: { default: DEFAULT_CACHE_TTL, providers: {} },
   // Forges a sandboxed run may fetch from, keyed by host. The credential stays
   // on the host and the container is given a run token instead; see
   // `git-proxy.mjs`.
@@ -168,6 +174,7 @@ export function mergeConfigLayer(base, layer) {
     presets: mergeNamed(base.presets, layer.presets),
     sandboxProfiles: mergeNamed(base.sandboxProfiles, layer.sandboxProfiles),
     concurrencyPools: { ...base.concurrencyPools, ...(isPlainObject(layer.concurrencyPools) ? layer.concurrencyPools : {}) },
+    cacheTtl: mergeEntry(base.cacheTtl ?? {}, isPlainObject(layer.cacheTtl) ? layer.cacheTtl : {}),
     gitProxy: mergeNamed(base.gitProxy ?? {}, layer.gitProxy),
     commands: mergeNamed(base.commands, layer.commands)
   };

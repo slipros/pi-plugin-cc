@@ -13,6 +13,7 @@ import {
   normalizeSandbox,
   parseMount,
   resolveLaunch,
+  sandboxMountGaps,
   sandboxRunWarnings,
   sessionDirFor,
   DEFAULT_SANDBOX_IMAGE,
@@ -814,4 +815,19 @@ test("relaxed-isolation warnings name what a profile gave away through args", ()
 
   // A plain profile says nothing.
   assert.deepEqual(warn([]).filter((w) => /seccomp|device|privileged|docker socket/.test(w)), []);
+});
+
+// Оснастка, которой в контейнере не будет, — отдельный ответ, а не строка среди
+// предупреждений: `delegate` превращает её в отказ запуска. Пропуск такого случая
+// стоил месяцев прогонов, где агент работал без объявленных ему скиллов.
+test("equipment outside the container is reported as a gap, not just as prose", () => {
+  const sandbox = normalizeSandbox({ mounts: ["~/skills:/pi-skills:ro"] });
+  const args = { workspaceRoot: "/work", skills: ["/pi-skills/git-commit", "/srv/not-mounted"], extensions: [] };
+
+  assert.deepEqual(sandboxMountGaps(sandbox, args), [{ label: "skill", value: "/srv/not-mounted" }]);
+  // The prose list keeps saying it too — the warning path is unchanged.
+  assert.equal(sandboxRunWarnings(sandbox, args).filter((w) => /does not exist inside the sandbox/.test(w)).length, 1);
+
+  // npm:/git: sources resolve inside the container and are nobody's gap.
+  assert.deepEqual(sandboxMountGaps(sandbox, { workspaceRoot: "/work", skills: ["npm:some-skill"] }), []);
 });

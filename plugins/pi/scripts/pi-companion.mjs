@@ -75,6 +75,7 @@ import {
   removeSandboxContainer,
   listSandboxImages,
   sandboxDockerfile,
+  sandboxMountGaps,
   sandboxPreflight,
   sandboxRunWarnings,
   sandboxStatus,
@@ -639,6 +640,29 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     const preflight = sandboxPreflight(sandbox);
     if (!preflight.ok) {
       throw new Error(`Sandbox is not ready.\n- ${preflight.errors.join("\n- ")}`);
+    }
+
+    // Equipment the preset names but the container will not have is a refusal,
+    // not a note. A skill that does not arrive takes its rules with it, the run
+    // looks entirely normal, and the gap is invisible in the result — every
+    // preset here named `/pi-skills/git-commit` while the profile mounted one
+    // directory, and agents ran for months without the rules they were given.
+    // `--no-skills` / `--no-extensions` remain the way to run without them on
+    // purpose.
+    const gaps = sandboxMountGaps(sandbox, {
+      workspaceRoot: runRoot,
+      extensions: settings.extensions,
+      skills: settings.skills
+    });
+    if (gaps.length) {
+      const mounts = gaps
+        .map(({ label, value }) => `- ${label} \`${value}\` — mount it: --mount <host path>:${value}:ro`)
+        .join("\n");
+      throw new Error(
+        `Sandbox will not carry equipment this run declares, so the agent would work without it:\n${mounts}\n` +
+          "Add the mount to the profile (`sandboxProfiles.<name>.mounts`) or the preset, " +
+          "or drop the entry with --no-skills / --no-extensions."
+      );
     }
     warnings.push(
       ...preflight.warnings,

@@ -145,3 +145,26 @@ test("a preset with nothing computed keeps its line unchanged", () => {
   assert.doesNotMatch(line, /vision/);
   assert.doesNotMatch(line, /tags/);
 });
+
+// Скилл, объявленный пресетом и не смонтированный профилем, — это агент без
+// правил, которые скилл несёт: прогон выглядит обычным, а разницу видно только
+// в поведении. Ответ обязан быть там, где агента ВЫБИРАЮТ.
+test("equipment the container will not have is named in the preset line", () => {
+  const config = configWith(
+    { dev: { sandbox: { profile: "half" } } },
+    { half: { image: "img", skills: ["/pi-skills/git-commit"], mounts: ["~/x:/pi-skills/vision:ro"] } }
+  );
+  assert.deepEqual(presetCapabilities(config, "dev").mountGaps, ["/pi-skills/git-commit"]);
+  const [line] = presetLines(config.presets, allPresetCapabilities(config));
+  assert.match(line, /НЕ СМОНТИРОВАНО: \/pi-skills\/git-commit/);
+});
+
+test("a preset whose equipment is mounted reports no gaps", () => {
+  const config = configWith(
+    { dev: { sandbox: { profile: "whole" } } },
+    { whole: { image: "img", skills: ["/pi-skills/git-commit"], mounts: ["~/skills:/pi-skills:ro"] } }
+  );
+  assert.deepEqual(presetCapabilities(config, "dev").mountGaps, []);
+  const [line] = presetLines(config.presets, allPresetCapabilities(config));
+  assert.doesNotMatch(line, /НЕ СМОНТИРОВАНО/);
+});

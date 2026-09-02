@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveRunSettings } from "./config.mjs";
-import { isSandboxed, normalizeSandbox } from "./sandbox.mjs";
+import { isSandboxed, normalizeSandbox, sandboxMountGaps } from "./sandbox.mjs";
 
 /**
  * What an agent can do beyond what its model can do.
@@ -120,15 +120,25 @@ export function presetCapabilities(config, presetName, { homeDir = os.homedir() 
     // A preset that cannot be resolved cannot be described. The command that
     // runs it will report the reason; here it is simply an agent with no
     // computed capabilities.
-    return { vision: null, shell: false, tags, skills: [] };
+    return { vision: null, shell: false, tags, skills: [], mountGaps: [] };
   }
   const skills = resolvedSkills(settings, config, { homeDir });
   const shell = hasShell(settings);
+  // Equipment named by the preset that the container will not have. Listed here
+  // so the answer is visible where agents are CHOSEN, not only when one is
+  // launched: the run itself refuses, but by then a wave is already half issued.
+  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {});
+  const mountGaps = sandboxMountGaps(sandbox, {
+    workspaceRoot: process.cwd(),
+    extensions: settings.extensions ?? [],
+    skills: settings.noSkills ? [] : (skills ?? [])
+  }).map(({ value }) => value);
   return {
     vision: hasSkillNamed(skills, VISION_SKILL_NAME) && shell ? "skill" : null,
     shell,
     tags,
-    skills
+    skills,
+    mountGaps
   };
 }
 

@@ -122,7 +122,10 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
       // a skill the profile mounts is invisible in both, and a caller that
       // cannot see it will route the work by the model's limits instead.
       caps.vision ? `vision \`${caps.vision}\`` : null,
-      caps.tags?.length ? `tags \`${caps.tags.join(", ")}\`` : null
+      caps.tags?.length ? `tags \`${caps.tags.join(", ")}\`` : null,
+      // Loudest field on the line: the preset names equipment the container will
+      // not have, so a run would work without the rules that equipment carries.
+      caps.mountGaps?.length ? `⚠ НЕ СМОНТИРОВАНО: ${caps.mountGaps.join(", ")}` : null
     ]
       .filter(Boolean)
       .join(", ");

@@ -840,19 +840,21 @@ function relaxedIsolationWarnings(sandbox) {
   return warnings;
 }
 
-export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], skills = [] } = {}) {
+/**
+ * Equipment the preset declares that the container will not have.
+ *
+ * Split out of the warning list because the two answers are used differently: a
+ * warning about relaxed isolation is worth printing, while a skill that does not
+ * exist inside the sandbox means the agent runs WITHOUT the rules that skill
+ * carries — silently, and for as long as nobody re-reads the launch output. It
+ * happened for months: every preset named `/pi-skills/git-commit` and friends
+ * while the profile mounted a single directory, so the agents ran with none of
+ * them. Callers turn this list into a refusal, not a note.
+ */
+export function sandboxMountGaps(sandbox, { workspaceRoot, extensions = [], skills = [] } = {}) {
   if (!isSandboxed(sandbox)) {
     return [];
   }
-
-  const warnings = [];
-  if (String(sandbox.network) === "none") {
-    warnings.push("Sandbox network is `none`; pi cannot reach a model provider and the run will fail.");
-  }
-  if (sandbox.agentDir === "host") {
-    warnings.push("Sandbox mounts the host `~/.pi/agent`, so container code can read host sessions and credentials.");
-  }
-  warnings.push(...relaxedIsolationWarnings(sandbox));
 
   // Paths the container does have: the workspace, the agent dir, the system
   // directories the image itself provides (a globally installed extension lives
@@ -868,6 +870,7 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
   ];
 
   const root = path.resolve(workspaceRoot ?? ".");
+  const gaps = [];
   for (const [label, entries] of [["extension", extensions], ["skill", skills]]) {
     for (const entry of entries) {
       const value = String(entry ?? "");
@@ -879,11 +882,31 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
       }
       const resolved = path.resolve(root, value.replace(/^~(?=\/|$)/, os.homedir()));
       if (!resolved.startsWith(`${root}${path.sep}`) && resolved !== root) {
-        warnings.push(
-          `The ${label} \`${value}\` is a host path outside the workspace; it does not exist inside the sandbox.`
-        );
+        gaps.push({ label, value });
       }
     }
+  }
+  return gaps;
+}
+
+export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], skills = [] } = {}) {
+  if (!isSandboxed(sandbox)) {
+    return [];
+  }
+
+  const warnings = [];
+  if (String(sandbox.network) === "none") {
+    warnings.push("Sandbox network is `none`; pi cannot reach a model provider and the run will fail.");
+  }
+  if (sandbox.agentDir === "host") {
+    warnings.push("Sandbox mounts the host `~/.pi/agent`, so container code can read host sessions and credentials.");
+  }
+  warnings.push(...relaxedIsolationWarnings(sandbox));
+
+  for (const { label, value } of sandboxMountGaps(sandbox, { workspaceRoot, extensions, skills })) {
+    warnings.push(
+      `The ${label} \`${value}\` is a host path outside the workspace; it does not exist inside the sandbox.`
+    );
   }
 
   return warnings;

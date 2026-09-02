@@ -1,38 +1,38 @@
-# Конфигурация: слои, пресеты, проектные надстройки
+# Configuration: layers, presets, project overrides
 
-Правила слияния слоёв, что проекту разрешено переопределять и как подкрутить глобальный
-пресет под один репозиторий. В скилле остаётся только то, что нужно на запуске.
+How layers merge, what a project is allowed to override, and how to tune a global preset for
+one repository. The skill keeps only what is needed at launch time.
 
-Необязательна. `~/.claude/pi/config.json` — личные дефолты, `<repo>/.claude/pi/config.json` — проектные (перебивают личные, флаги перебивают оба).
+Optional. `~/.claude/pi/config.json` holds personal defaults, `<repo>/.claude/pi/config.json` project ones — the project file wins, and command-line flags win over both.
 
 ```json
 {
-  "defaults": { "model": "openrouter/deepseek/deepseek-v4-flash-0731", "thinking": "high" },
+  "defaults": { "model": "opencode-go/glm-5.2", "thinking": "medium", "timeoutMs": 1800000 },
   "presets": {
-    "fast":  { "description": "быстрые узкие вопросы без размышления", "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
-    "audit": { "description": "враждебный разбор готовой работы, ничего не правит", "model": "opencode-go/kimi-k3", "systemPrompt": "adversarial", "readOnly": true },
+    "fast":  { "description": "narrow questions, no reasoning", "model": "opencode-go/deepseek-v4-flash", "thinking": "off" },
+    "audit": { "description": "adversarial read of finished work, changes nothing", "model": "opencode-go/kimi-k3", "systemPrompt": "adversarial", "readOnly": true },
     "dba":   {
       "model": "opencode-go/kimi-k3",
       "systemPrompt": "@.claude/pi/prompts/dba.md",
-      "appendSystemPrompt": ["Отвечай по-русски."],
+      "appendSystemPrompt": ["Answer in Russian."],
       "tools": "read,grep,find,ls,bash"
     }
   },
-  "commands": { "review": { "preset": "audit" } }
+  "commands": { "delegate": { "preset": "dba" }, "review": { "preset": "audit" } }
 }
 ```
 
-**Пресет — это целый агент, а не только модель.** Дай ему `description` — одну строку о том, для чего он: её печатает `presets` в списке агентов, и по ней выбирают агента, не открывая системный промпт (чтение промпта ради выбора стоит дороже самого выбора). Кроме описания в пресете можно задать любое поле запуска: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `git`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`, `budget`. Задал один раз — дальше запускаешь `--preset dba`.
+**A preset is a whole agent, not just a model.** Give it a `description` — one line saying what it is for: `presets` prints it next to the profile, and that is how an agent is chosen without opening the system prompt behind it (reading a prompt to make the choice costs more than the choice). Beyond the description, any run field can live in a preset: `model`, `provider`, `thinking`, `systemPrompt`, `appendSystemPrompt`, `tools`, `excludeTools`, `extensions`, `skills`, `sandbox`, `mounts`, `git`, `readOnly`, `noTools`, `noBuiltinTools`, `noExtensions`, `noSkills`, `timeoutMs`, `engine`, `budget`. Define it once, then run `--preset dba`.
 
-Два поля стоит назвать отдельно, потому что в них живут решения, а не мелочи:
+Two fields deserve naming separately, because decisions live in them rather than details:
 
-- **`timeoutMs`** — жёсткий лимит прогона в миллисекундах (по умолчанию 1 800 000, полчаса). Он снимает и pi, и контейнер, и он же — потолок для авто-продолжения после обрыва: время считается на прогон целиком, а не заново на каждое продолжение.
-- **`sandbox`** — либо `"docker"`, либо `"none"`, либо имя профиля из `sandboxProfiles`, либо объект. В объектной форме `{"profile": "go", …}` профиль берётся за основу, а остальные поля правят его: оснастка (`mounts`, `env`, `args`, `extensions`, `skills`) складывается с профильной, решения (`image`, `network`, `memory`, `cpus`) заменяются. Профиль может сам ссылаться на другой профиль; кольцо ловится ошибкой, а не зависанием.
+- **`timeoutMs`** — hard limit of a run in milliseconds (1,800,000 — half an hour — by default). It stops both pi and the container, and it is also the ceiling for auto-continuation after a truncated answer: the clock covers the whole run rather than restarting per continuation.
+- **`sandbox`** — `"docker"`, `"none"`, the name of a profile from `sandboxProfiles`, or an object. In object form `{"profile": "go", …}` the profile is the base and the remaining fields amend it: equipment (`mounts`, `env`, `args`, `extensions`, `skills`) adds to the profile's, decisions (`image`, `network`, `memory`, `cpus`) replace it. A profile may name another profile; a cycle is an error, not a hang.
 
 ```json
 "presets": {
   "go-fix": {
-    "description": "правка Go-кода с гейтами внутри контейнера",
+    "description": "Go edits with the gates running inside the container",
     "sandbox": { "profile": "go", "mounts": ["~/proj/protos:/protos:ro"] },
     "timeoutMs": 3600000,
     "budget": { "maxCostUsd": 2, "maxTurns": 40 }
@@ -40,89 +40,101 @@
 }
 ```
 
-Один дефолт задан за тебя: `excludeTools: ["ask_question"]` — прогон неинтерактивный, спрашивать некого, и вопрос агента просто сожжёт ход. Вернуть инструмент: `"excludeTools": []` в любом слое.
+Values resolve layer by layer, highest first: **command-line flags → preset → per-command defaults → global defaults.** Commit identity is the one exception: your gitconfig sits between the flags and the preset (see [git-identity.md](git-identity.md)). The system prompt is chosen as a unit, so `--system-prompt` replaces a preset's prompt outright; `appendSystemPrompt`, `extensions`, `skills` and `mounts` stack across layers instead.
 
-Значения разрешаются послойно, сверху вниз: флаги → пресет → дефолты команды → общие дефолты. Исключение — commit-identity: там между флагами и пресетом вклинивается твой gitconfig (см. «От чьего лица коммитит агент»). Системный промт выбирается целиком, поэтому `--system-prompt` в командной строке полностью заменяет пресетный. Списки `appendSystemPrompt`, `extensions`, `skills` и `mounts` со всех слоёв складываются.
+## Budgets: stopping a run that costs too much
 
-### Подкрутить глобальный пресет под проект
+Time used to be the only ceiling a run had, and it is a poor proxy for the thing worth bounding — a fast model can spend a dollar in two minutes, a cheap one can idle for an hour for free.
 
-Проектный конфиг **сливается** с пользовательским по полям, поэтому в репозитории пишется только отличие:
+```json
+"presets": {
+  "explorer": { "model": "opencode-go/kimi-k3", "budget": { "maxCostUsd": 2, "maxTurns": 40 } }
+}
+```
+
+```bash
+/pi:delegate --max-cost 0.5 --max-tokens 200000 --max-turns 20   refactor the parser
+```
+
+Each ceiling applies on its own, and the flags add to what a preset already set rather than replacing it. The numbers come from the usage the run already reports, checked after every model answer: on the rpc engine the run is asked to `abort`, so it wraps up and keeps what it has produced; on `--engine json` there is no control channel and the process is stopped the way a timeout stops it.
+
+Enforcement is "stop after", never "predict before" — the size of a message is known only once it is paid for, so a budget can be crossed by the last message and no earlier. Set them as ceilings you do not want passed, not as exact allowances. A run stopped this way ends as a failure with `Stopped by the run budget: …` among its problems.
+
+## Tuning a global preset for one project
+
+The project file **merges into** your personal one field by field, so a repository names only what it changes:
 
 ```json
 {
   "presets": {
     "go-review": {
       "model": "opencode-go/kimi-k3",
-      "appendSystemPrompt": ["Сервис на sqlc: миграции генерируются, руками не править."]
+      "appendSystemPrompt": ["This service uses sqlc; migrations are generated, do not hand-edit them."]
     }
   },
   "sandboxProfiles": { "go": { "mounts": ["~/proj/protos:/protos:ro"] } }
 }
 ```
 
-Промт, `readOnly`, песочница и весь Go-тулчейн достаются из глобальных определений нетронутыми. Правила слияния:
+The system prompt, `readOnly`, the sandbox and the whole toolchain come from the global definitions untouched. Three rules cover what "merges" means:
 
-- **Оснастка складывается** — `appendSystemPrompt`, `extensions`, `skills`, `mounts`, `env`, `args`. Совпавшая запись занимает место унаследованной: mounts сопоставляются по контейнерному пути, env — по имени переменной.
-- **Решения заменяются** — `model`, `thinking`, `systemPrompt`, `sandbox`, `readOnly`, `tools`, `excludeTools`, `timeoutMs`.
-- **`null` удаляет** — `"sandbox": null` снимает песочницу, заданную глобально. Единственный выход из слияния.
+- **Equipment accumulates** — `appendSystemPrompt`, `extensions`, `skills`, `mounts`, `env`, `args`. An entry that collides with an inherited one takes its place: mounts are matched by container path, env by variable name, so `"mounts": ["~/other:/gobin:ro"]` redirects `/gobin` instead of mounting it twice.
+- **Decisions are replaced** — `model`, `thinking`, `systemPrompt`, `sandbox`, `readOnly`, `tools`, `excludeTools`, `timeoutMs`. A project that lists `excludeTools` means exactly those.
+- **`null` removes** — `"sandbox": null` drops a sandbox the global preset asked for. It is the way back out of a merge.
 
-Вложенные объекты сливаются так же: `"sandbox": {"network": "none"}` сохраняет image, mounts и остальное из нижнего слоя.
+Nested objects merge the same way, so `"sandbox": {"network": "none"}` keeps the image, mounts and everything else the layer below set.
 
-**Системный промт под проект** — три способа, от разового к постоянному: `--system-prompt @./.claude/pi/prompts/try-a.md` на один прогон; файл `<проект>/.claude/pi/prompts/<имя>.md` затеняет одноимённый глобальный для всех пресетов; `<проект>/.claude/pi/APPEND_SYSTEM.md` дописывается к любому промту всегда.
+**A project system prompt**, from one-off to permanent: `--system-prompt @./.claude/pi/prompts/try-a.md` for a single run; `<project>/.claude/pi/prompts/<name>.md` shadows the global file of that name for every preset; `<project>/.claude/pi/APPEND_SYSTEM.md` is appended to whatever prompt was chosen, always.
 
-## Кэш продолжений: `cacheTtl`
+What a workspace outside `trustedProjects` may **not** override — mounts, env, images, the agent directory — is in [sandbox.md](sandbox.md).
 
-Продолжение сессии (`continue`, `delegate --session`) переигрывает провайдеру всю её историю. Пока промпт лежит у провайдера в кэше, это почти бесплатно; после того как кэш истёк, ровно те же токены оплачиваются заново по полной входной ставке — и чем длиннее сессия, тем дороже обходится «доделать ещё чуть-чуть» через час.
+## Continuation cache: `cacheTtl`
 
-Сколько живёт кэш, провайдеры не сообщают в машинном виде и договориться между собой не могут, поэтому окно задаётся конфигом:
+Continuing a session (`continue`, `delegate --session`) replays its whole history to the provider. While the prompt is still in the provider's cache that is nearly free; once the cache has expired the very same tokens are billed again at the full input rate — and the longer the session, the more expensive "just finish it off" an hour later becomes.
+
+Providers do not report cache lifetime in any machine-readable way and do not agree with each other, so the window is configured:
 
 ```json
-"cacheTtl": {
-  "default": "40m",
-  "providers": { "anthropic": "5m" }
-}
+"cacheTtl": { "default": "40m", "providers": { "anthropic": "5m" } }
 ```
 
-Значение — `40m`, `90s`, `2h`, `500ms`; голое число читается как минуты. Провайдер берётся из записи прогона (`provider` рецепта, иначе часть `provider/model` из id модели), запись провайдера старше `default`. По умолчанию — 40 минут для всех.
+Values are `40m`, `90s`, `2h`, `500ms`; a bare number reads as minutes. The provider comes from the run record (the recipe's `provider`, else the `provider/` half of the model id), and a provider entry outranks `default`. Session age is measured from the run's last activity (`completedAt`), not from the session file: a sandboxed session lives in the sandbox volume and has no file on the host at all. Older than the TTL and the continuation is refused with a non-zero exit; `--stale-ok` pays for the replay on purpose, `--fresh` keeps the agent and drops the history. What can be continued, and how warm its cache still is, is `sessions`.
 
-Возраст сессии считается от последней активности прогона (`completedAt`), а не от файла сессии: сэндбоксная сессия живёт в volume песочницы, и на хосте её файла нет вовсе. Старше TTL — продолжение отклоняется с ненулевым кодом; `--stale-ok` продолжает осознанно, `--fresh` оставляет агента и сбрасывает историю. Что тут можно продолжить и насколько кэш ещё тёплый — `sessions`.
+The session file itself never expires: the TTL here is about money, not about keeping work.
 
-Сам файл сессии не протухает никогда: TTL здесь — про деньги, а не про сохранность работы.
+## Model output ceiling: `~/.pi/agent/models.json`
 
-## Потолок вывода модели: `~/.pi/agent/models.json`
-
-Это таблица провайдеров самого pi, а не конфиг плагина, — но потолок ответа задаётся только там, и в песочнице плагин единственный, кто доносит его до запроса.
+That file is pi's own provider table rather than plugin config — but the answer ceiling can only be set there, and inside the sandbox the plugin is the only thing that carries it into the request.
 
 ```json
 {
   "providers": {
     "opencode-go": {
       "compat": { "maxTokensField": "max_tokens" },
-      "models": [
-        { "id": "kimi-k3", "samplingParams": { "max_tokens": 32000 } }
-      ]
+      "models": [ { "id": "kimi-k3", "samplingParams": { "max_tokens": 32000 } } ]
     }
   }
 }
 ```
 
-**`samplingParams` модели.** pi проверяет это поле и складывает его в объект модели, но в провайдера уходит не модель, а конфиг агента, — и `samplingParams` туда никто не переносит, поэтому запрос улетает без потолка. За маской провайдера это чинит прокси учётных данных: перед отправкой он дописывает в тело запроса те ключи `samplingParams`, которых там нет (заданное самим pi не трогается никогда). Две записи одного поля учтены: `max_tokens` не добавляется, если pi уже прислал `max_completion_tokens`, и наоборот — API, ждущее новое имя, старое отвергает.
+**`samplingParams` on a model.** pi validates the field and folds it into the model object, but what reaches the provider is the agent config, not the model — and nobody carries `samplingParams` across, so the request leaves without a ceiling. Behind the provider mask the credential proxy fixes this: before forwarding it adds the `samplingParams` keys that are missing from the body (anything pi set itself is never touched). Both spellings of the field are handled: `max_tokens` is not added when pi already sent `max_completion_tokens`, and the other way round — an API expecting the new name rejects the old one.
 
-Цена отсутствия потолка не теоретическая: сервер применяет свой максимум, и модель, ушедшая в повтор, генерирует до него. На журнале одного эпика — 19 таких ответов, меньше процента запросов, 46% всех выходных токенов. Хуже токенов форма отказа: обрезанный ответ кончается посреди вызова инструмента, вызов отбрасывается, и текстовая половина становится финальным ответом (см. авто-продолжение в скилле).
+The cost of no ceiling is not theoretical: the server applies its own maximum, and a model that has gone into a loop generates up to it. In one epic's journal that was 19 such answers — under one percent of requests, 46% of all output tokens. Worse than the tokens is the shape of the failure: a truncated answer ends mid tool call, the call is dropped, and the text half becomes the final answer (see auto-continuation in the skill).
 
-**`compat.maxTokensField`.** В каком поле провайдер принимает потолок. pi выводит это из имени провайдера и адреса, а маска подменяет и то, и другое: за ней каждый провайдер выглядит стоковым OpenAI и получает `max_completion_tokens`. Совместимый эндпоинт, знающий только `max_tokens`, такое поле молча игнорирует — потолка нет вовсе (замерено: запрос с лимитом 64 вернул 15518 токенов, тот же лимит в `max_tokens` остановился ровно на 64). Прокси восстанавливает решение, принятое на хосте: список имён и фрагментов адреса скопирован из собственного `detectCompat` в pi, к нему добавлены `ollama.com` и локальная Ollama по адресу и порту.
+**`compat.maxTokensField`.** Which field the provider takes the ceiling in. pi derives it from the provider name and the address, and the mask replaces both: behind it every provider looks like stock OpenAI and gets `max_completion_tokens`. A compatible endpoint that only knows `max_tokens` silently ignores that field — no ceiling at all (measured: a request with a limit of 64 returned 15,518 tokens; the same limit in `max_tokens` stopped exactly at 64). The proxy restores the decision made on the host, using the name and URL list copied from pi's own `detectCompat` plus `ollama.com` and a local Ollama by address and port.
 
-Явный `compat` пользователя всегда старше автоопределения — прокси заполняет пробел, а не спорит с заданным. Поле читается и с провайдера, и с модели: `compat` на провайдере действует на все его модели, включая не перечисленные в `models[]`.
+An explicit user `compat` always outranks the detection — the proxy fills a gap, it does not argue with a setting. The field is read from both provider and model: `compat` on a provider covers all of its models, including ones not listed in `models[]`.
 
-**Границы.** `compat` pi читает и сам — прокси лишь восстанавливает его за маской. А `samplingParams` без прокси до запроса не доезжает вовсе, поэтому объявленный потолок действует только у **песочного** прогона: прокси поднимается там и только там (и не поднимается, если профиль отключил его через `"proxyCredentials": false`).
+**Boundaries.** pi reads `compat` itself; the proxy only restores it behind the mask. `samplingParams`, on the other hand, never reaches the request without the proxy — so a declared ceiling applies to **sandboxed** runs only: the proxy is raised there and nowhere else (and not at all when a profile turned it off with `"proxyCredentials": false`).
 
-## Переменные окружения
+## Environment variables
 
-Читаются у companion-процесса на хосте — в контейнер не передаются, полей пресета под них нет.
+Read from the companion process on the host — they are not passed into the container, and there are no preset fields for them.
 
-- **`PI_TRUNCATION_RETRIES`** — сколько раз подряд прогон продолжает себя после обрыва на потолке вывода. По умолчанию 10, `0` выключает продолжение совсем; нечисловое и отрицательное значение даёт дефолт. Лимит на **подряд идущие** обрывы: доведённый до конца ответ обнуляет счётчик.
-- **`PI_LOOP_NUDGE`** — вмешательство в прогон, который ходит по кругу в собственном рассуждении. По умолчанию включено; ровно значение `0` выключает его совсем (любое другое значение оставляет включённым). Детектор считает кругом ход, ушедший ЦЕЛИКОМ в размышление — без текста и без вызова инструмента; за прогон отправляется не больше двух сообщений. Пороги (6000 знаков рассуждения, 3 таких хода из последних 10) зашиты в коде и из замеров не выведены — это осознанно консервативная догадка. Счётчик в журнале (`отправлено вмешательств`) считает именно отправку: сообщение записано в сессию, но подхватил ли его агент — изменил ли поведение, а не проигнорировал или получил его слишком поздно, — не отслеживается никак; надёжного признака подхвата в потоке событий RPC нет.
-- **`PI_PLUGIN_BINARY`** — чем запускать pi (по умолчанию `pi` из `PATH`).
-- **`PI_PLUGIN_DB`** — файл журнала прогонов вместо `$XDG_DATA_HOME/pi-plugin/jobs.db` (без `XDG_DATA_HOME` — `~/.local/share/pi-plugin/jobs.db`).
+- **`PI_TRUNCATION_RETRIES`** — how many times in a row a run continues itself after being truncated at the output ceiling. Default 10; `0` disables continuation entirely; a non-numeric or negative value falls back to the default. The limit is on **consecutive** truncations: an answer that finishes resets the counter.
+- **`PI_LOOP_NUDGE`** — intervention in a run going round in its own reasoning. On by default; exactly `0` turns it off (any other value leaves it on). The detector counts a turn as looping when it goes **entirely** into reasoning — no text, no tool call — and at most two messages are sent per run. The thresholds (6,000 characters of reasoning, 3 such turns out of the last 10) are hard-coded and not derived from measurement: a deliberately conservative guess. The journal counter (`nudges sent`) counts the sending: the message is written into the session, but whether the agent picked it up — changed behaviour rather than ignoring it or receiving it too late — is not tracked at all, because the RPC event stream carries no reliable sign of it.
+- **`PI_PLUGIN_BINARY`** — what to run pi with (default: `pi` from `PATH`).
+- **`PI_PLUGIN_DB`** — the run journal file instead of `$XDG_DATA_HOME/pi-plugin/jobs.db` (without `XDG_DATA_HOME`: `~/.local/share/pi-plugin/jobs.db`).
+- **`PI_PROXY_BIND`**, **`PI_PROXY_SETTLE_MS`** — bind address and settle delay of the host-side proxies, see [git-proxy.md](git-proxy.md).
 
-Если что-то не работает — начни с `setup`: он покажет, найден ли бинарь pi, есть ли доступные модели, какие конфиги подхвачены и где лежит состояние задач.
+When something does not work, start with `setup`: it shows whether the pi binary was found, whether any models are reachable, which configs were picked up and where job state lives.

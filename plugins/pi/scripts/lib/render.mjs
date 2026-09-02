@@ -125,7 +125,7 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
       caps.tags?.length ? `tags \`${caps.tags.join(", ")}\`` : null,
       // Loudest field on the line: the preset names equipment the container will
       // not have, so a run would work without the rules that equipment carries.
-      caps.mountGaps?.length ? `⚠ НЕ СМОНТИРОВАНО: ${caps.mountGaps.join(", ")}` : null
+      caps.mountGaps?.length ? `⚠ NOT MOUNTED: ${caps.mountGaps.join(", ")}` : null
     ]
       .filter(Boolean)
       .join(", ");

@@ -1,40 +1,40 @@
-# dind: контейнеры внутри песочницы
+# dind: containers inside the sandbox
 
-Профиль `agent` (`PI_DIND=1`) даёт агенту собственный docker внутри песочницы — для тестов на
-`testcontainers` и E2E против compose-стека репозитория. Здесь то, как он устроен и что
-нужно один раз настроить на хосте; рабочая команда — в скилле (`skills/pi/SKILL.md`).
+The `agent` profile (`PI_DIND=1`) gives a run its own docker inside the sandbox — for
+`testcontainers` tests and for E2E against the repository's compose stack. This is how it is put
+together and what has to be set up once on the host; the working command is in the skill.
 
-Тесты на `testcontainers` поднимают БД контейнером — в облегчённом профиле (`agent-lite`) такого нет и быть не должно. Профиль `agent` даёт прогону **свой** rootless-демон: его контейнеры живут внутри песочницы, умирают вместе с ней и в `docker ps` на хосте не видны.
+Tests on `testcontainers` start a database in a container — the light profile (`agent-lite`) has no daemon and should not have one. The `agent` profile gives the run **its own** rootless daemon: its containers live inside the sandbox, die with it, and never show up in `docker ps` on the host.
 
 ```bash
-delegate --preset go-developer "почини интеграционные тесты"   # профиль agent уже в пресете
-sandbox build agent                                            # образ один на все стеки
+/pi:delegate --preset go-developer "fix the integration tests"   # the profile is already in the preset
+/pi:sandbox build agent                                          # one image for every stack
 ```
 
-Ни хостового сокета, ни `--privileged`. Всё, что понадобилось (замерено, не взято из инструкции):
+No host socket, no `--privileged`. Everything that turned out to be needed — measured, not taken from a tutorial:
 
-| Что | Зачем |
+| What | Why |
 |---|---|
-| `--security-opt seccomp=@sandbox/dind-seccomp.json` | дефолтный профиль docker блокирует `unshare`/`mount`/`clone` с `CLONE_NEW*` — без них rootless не стартует. `@sandbox/` резолвится по тем же каталогам, что и Dockerfile (проект → `~/.claude/pi/sandbox` → плагин), чтобы не хардкодить абсолютный путь |
-| `--device /dev/net/tun` | RootlessKit создаёт tap-интерфейс; без него падает на `ip tuntap add` |
-| `DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS=--pidns` | со своим PID namespace демон получает собственный `/proc` и может писать sysctl в свои сетевые namespace |
-| volume `pi-dind-images` под `~/.local/share/docker` | иначе образы качаются заново каждый прогон |
-| `TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1` | иначе testcontainers адресует контейнеры через `172.17.0.1` и виснет на проверке готовности |
-| `TESTCONTAINERS_RYUK_DISABLED=true` | уборщик не нужен: всё внутри умирает вместе с песочницей |
+| `--security-opt seccomp=@sandbox/dind-seccomp.json` | docker's default profile blocks `unshare`/`mount`/`clone` with `CLONE_NEW*`, without which rootless does not start. `@sandbox/` resolves through the same directories as a Dockerfile (project → `~/.claude/pi/sandbox` → the plugin), so no absolute path is hard-coded |
+| `--device /dev/net/tun` | RootlessKit creates a tap interface; without it `ip tuntap add` fails |
+| `DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS=--pidns` | with its own PID namespace the daemon gets its own `/proc` and can write sysctls in its network namespaces |
+| volume `pi-dind-images` under `~/.local/share/docker` | otherwise images are pulled again on every run |
+| `TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1` | otherwise testcontainers addresses containers through `172.17.0.1` and hangs on the readiness check |
+| `TESTCONTAINERS_RYUK_DISABLED=true` | the reaper is pointless: everything inside dies with the sandbox |
 
-`docker compose` в образе есть (plugin) — для E2E против compose-стека репозитория, не только testcontainers. `DOCKER_HOST`/`XDG_RUNTIME_DIR` не задаются в env профиля: entrypoint выводит их из `id -u`, чтобы образ работал под любым uid.
+`docker compose` is in the image (as a plugin), for E2E against a repository's compose stack rather than only testcontainers. `DOCKER_HOST`/`XDG_RUNTIME_DIR` are not set in the profile's env: the entrypoint derives them from `id -u`, so the image works under any uid.
 
-**Не понадобились:** `apparmor=unconfined` (на Docker Desktop AppArmor не активен; на нативном Linux с активным AppArmor профиль `docker-default` доложит часть mount-операций поверх seccomp — там, скорее всего, понадобится), `systempaths=unconfined` (`/proc/kcore` и `/proc/sysrq-trigger` остаются замаскированными), `--device /dev/fuse` (overlay2 работает поверх volume нативно), `--privileged`.
+**Not needed:** `apparmor=unconfined` (AppArmor is not active on Docker Desktop; on native Linux with AppArmor enabled the `docker-default` profile will likely report some mount operations on top of seccomp — there it probably would be), `systempaths=unconfined` (`/proc/kcore` and `/proc/sysrq-trigger` stay masked), `--device /dev/fuse` (overlay2 works natively on top of a volume), `--privileged`.
 
-**Профиль seccomp** генерируется из профиля rootless podman (`containers/common`) скриптом `make-dind-seccomp.py` рядом с Dockerfile — там же зафиксированы URL upstream, дата, sha256 исходника и результата, и команда воспроизведения (`--fetch` скачивает и сверяет хэш). Он разрешает четыре сисколла, которые upstream держит за `CAP_SYS_ADMIN`: `sethostname`, `setdomainname`, `setns`, `chroot`. Их выполняет вложенный runc, а docker сверяет capability-гейт с правами **внешнего** контейнера, где этой capability нет. Разрешение сисколла не даёт привилегии: ядро по-прежнему требует `CAP_SYS_ADMIN` в том namespace, которым владеет вызывающий — он есть у вложенного рантайма и отсутствует у процесса, который полез бы к хосту. (Cap-гейтованный ALLOW вместо безусловного здесь **не** работает — проверено, ломает вложенный демон по той же причине: гейт резолвится по caps внешнего контейнера.)
+**The seccomp profile** is generated from rootless podman's profile (`containers/common`) by `make-dind-seccomp.py` next to the Dockerfile — which also records the upstream URL, the date, the sha256 of source and result, and the command to reproduce it (`--fetch` downloads and verifies the hash). It allows four syscalls upstream keeps behind `CAP_SYS_ADMIN`: `sethostname`, `setdomainname`, `setns`, `chroot`. The nested runc performs them, while docker checks the capability gate against the **outer** container, which does not have that capability. Allowing a syscall grants no privilege: the kernel still requires `CAP_SYS_ADMIN` in the namespace the caller owns — the nested runtime has it, a process reaching for the host does not. (A cap-gated ALLOW instead of an unconditional one does **not** work here — tested, and it breaks the nested daemon for the same reason.)
 
-**Версия docker в образе закреплена на 28.x** (проверка в Dockerfile валит сборку, если пришло другое). В 29.x скрипт запуска пишет `net.ipv4.ip_forward` через sysctl и падает на read-only `/proc/sys`; лечится это только `systempaths=unconfined`, то есть возвратом доступа к `/proc/kcore` ради одного sysctl.
+**The docker version in the image is pinned to 28.x** (a check in the Dockerfile fails the build otherwise). In 29.x the startup script writes `net.ipv4.ip_forward` through sysctl and fails on a read-only `/proc/sys`; the only cure is `systempaths=unconfined`, which means handing back `/proc/kcore` for the sake of one sysctl.
 
-**Переносимость.** Образ собирается под uid хоста (`RUNTIME_UID`/`RUNTIME_GID` companion передаёт из `process.getuid()`): для uid ≠ 1000 заводится пользователь и subuid-диапазон, иначе RootlessKit не стартует. При смене пользователя образ нужно пересобрать (`sandbox build agent`).
+**Portability.** The image is built for the host's uid (`RUNTIME_UID`/`RUNTIME_GID` are passed from `process.getuid()`): for uid ≠ 1000 a user and a subuid range are created, otherwise RootlessKit does not start. Changing user means rebuilding the image (`sandbox build agent`).
 
-**Параллельные dind-прогоны.** Хранилище образов у каждого прогона своё — монтирование помечено `:isolate`, и docker выдаёт контейнеру анонимный volume, умирающий вместе с ним. Иначе два демона дерутся за эксклюзивный lock containerd на общем volume и портят `meta.db`; общего RW-хранилища образов для нескольких dind в docker нет ([moby#40196](https://github.com/moby/moby/issues/40196)), поэтому изоляция — единственный способ поднять пул `dind` выше единицы. Кеши модулей и сборки при этом остаются общими: `:isolate` действует на одно монтирование, в отличие от `isolateCaches`, который анонимизирует все.
+**Parallel dind runs.** Image storage is per run — the mount is marked `:isolate`, so docker hands the container an anonymous volume that dies with it. Otherwise two daemons fight over containerd's exclusive lock on a shared volume and corrupt `meta.db`; docker has no shared RW image storage for several dind instances ([moby#40196](https://github.com/moby/moby/issues/40196)), so isolation is the only way to raise the `dind` pool above one. Module and build caches stay shared: `:isolate` applies to a single mount, unlike `isolateCaches`, which anonymises all of them.
 
-Цена изоляции — холодное хранилище образов на каждом старте, и её снимает **зеркало-кеш на хосте**:
+The price of isolation is cold image storage on every start, and a **host-side registry mirror** removes it:
 
 ```bash
 docker run -d --restart=always --name pi-registry-mirror -p 5000:5000 \
@@ -42,6 +42,6 @@ docker run -d --restart=always --name pi-registry-mirror -p 5000:5000 \
   -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io registry:2
 ```
 
-Профиль передаёт демону внутри песочницы `PI_REGISTRY_MIRROR` (по умолчанию `http://host.docker.internal:5000`), entrypoint пишет из него `registry-mirrors` + `insecure-registries` + `max-concurrent-downloads: 10` в `daemon.json` до старта dockerd. Первый прогон греет зеркало, остальные тянут слои по локальной сети. Зеркало недоступно — docker сам идёт в апстрим, прогон не ломается. Проксируется только Docker Hub: приватные реестры ходят напрямую.
+The profile passes `PI_REGISTRY_MIRROR` (default `http://host.docker.internal:5000`) to the daemon inside the sandbox, and the entrypoint writes `registry-mirrors` + `insecure-registries` + `max-concurrent-downloads: 10` into `daemon.json` before dockerd starts. The first run warms the mirror, the rest pull layers over the local network. If the mirror is unreachable docker goes upstream on its own and the run is fine. Only Docker Hub is proxied: private registries are contacted directly.
 
-**Остаточный риск.** Проверено pen-test-агентом изнутри: побег на хост **не достигнут**. seccomp реально отдаёт EPERM на `fsopen`/`open_by_handle_at`/`bpf`/`userfaultfd`/`kexec` даже с полными caps в user namespace — это и есть примитивы userns-escape. Агент может создавать user namespace и монтировать внутри него, но `mount_setattr` на host-маунтах даёт EPERM (их владелец — init userns), а побег остаётся только через уязвимость ядра, не через штатный механизм. Хостового демона, устройств хоста, немаскированного `/proc` и `CAP_SYS_ADMIN` снаружи у него нет. Прогон, ослабляющий изоляцию, сам об этом сообщает: `Sandbox replaces the default seccomp profile…`, `Sandbox passes the host device /dev/net/tun…`.
+**Residual risk.** Checked by a pen-test agent from the inside: escape to the host was **not achieved**. seccomp really does return EPERM for `fsopen`/`open_by_handle_at`/`bpf`/`userfaultfd`/`kexec` even with full caps in a user namespace — those are the userns-escape primitives. The agent can create user namespaces and mount inside them, but `mount_setattr` on host mounts returns EPERM (they are owned by the init userns), and escape is left to a kernel vulnerability rather than a supported mechanism. It has no host daemon, no host devices, no unmasked `/proc` and no `CAP_SYS_ADMIN` outside. A run that relaxes isolation says so itself: `Sandbox replaces the default seccomp profile…`, `Sandbox passes the host device /dev/net/tun…`.

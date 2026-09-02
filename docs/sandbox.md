@@ -1,57 +1,66 @@
-# Песочница: устройство, профили, образы
+# Sandbox: what the container gets, profiles, images
 
-Как объявляются профили песочниц, из чего собираются образы и почему ключи провайдера и
-токены форджей не попадают внутрь контейнера. Рабочие команды и то, что важно знать на
-каждом прогоне, — в скилле (`skills/pi/SKILL.md`, раздел «Песочница»).
+How sandbox profiles are declared, what images are built from, and why provider keys and forge
+tokens never enter the container. The working commands are in the skill (`skills/pi/SKILL.md`).
 
-`--sandbox docker` запускает весь процесс pi в контейнере: инструменты, `!`-команды и расширения исполняются там, с хоста примонтирован только рабочий каталог.
+`--sandbox docker` runs the whole pi process inside a container: built-in tools, `!` commands and extensions all execute there, and the only thing mounted from the host is the workspace.
 
 ```bash
-sandbox build                       # собрать образ (один раз; версия pi = хостовой)
-delegate --sandbox docker "перепиши модуль и прогони тесты"
-sandbox                             # состояние образа и оставшиеся контейнеры
-sandbox clean                       # убрать контейнеры, оставшиеся после падения
+/pi:sandbox build                     # build the image (pinned to your pi version)
+/pi:delegate --sandbox docker         rewrite this module and run the tests
+/pi:sandbox                           # image state and leftover containers
+/pi:sandbox clean                     # remove containers a crash left behind
 ```
 
-- Рабочий каталог примонтирован read-write в `/workspace/<имя каталога>` — имя сохраняется, чтобы рецепты сборки вида `$(notdir $(CURDIR))` считали внутри то же, что снаружи; правки видны на хосте, всё остальное — домашний каталог, ключи, соседние репозитории — контейнеру недоступно.
-- Каждый прогон в песочнице идёт с `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1` и `PI_TELEMETRY=0` — это дефолт песочницы, а не свойство профиля, поэтому дублировать в профилях не нужно. Контейнеру незачем ходить за обновлениями и слать телеметрию: его единственная законная исходящая связь — модель. Побочно это убирает сетевые проверки со старта каждого прогона.
-- Сессии разложены по рабочим каталогам (`PI_CODING_AGENT_SESSION_DIR`): pi бакетит их по cwd, а cwd в контейнере раньше всегда был плоским `/workspace`, поэтому в одном бакете лежали транскрипты всех репозиториев сразу и `--session last` мог подцепить чужую сессию.
-- **Воркспейс вне `trustedProjects` не делит кэши ни с кем.** Named volume'ы, которые профиль монтирует на запись (кэш модулей, кэш сборки, индекс gopls), заменяются анонимными — они умирают вместе с контейнером, — а каталог агента становится отдельным томом на воркспейс. Причина одна: тома переживают прогон и общие для всех, поэтому отравленный модуль или объект сборки из чужого репозитория подхватил бы следующий прогон в другом репозитории. Цена — холодный кэш сборки; модули всё равно резолвятся мгновенно из хостового download-кэша (`GOPROXY=file://`, read-only). Список доверенных матчится по префиксу: `"trustedProjects": ["~/github"]` покрывает всё внутри. Грубый вариант — `"trustProjectConfig": true`: доверять любому воркспейсу где угодно, то есть вернуть поведение, которое было до появления этой границы.
-- Каталог агента — отдельный docker-volume, поэтому хостовые настройки, сессии и установленные пакеты pi внутрь не попадают. Read-only подкладываются два файла: `auth.json` и `models.json` (описания кастомных провайдеров — без него пресет с моделью своего шлюза упал бы с `Unknown provider`).
-- **Реальные ключи в контейнер не попадают.** На время прогона поднимается локальный прокси, агенту выдаётся одноразовый токен, а настоящий ключ подставляется уже на хосте. В логе прогона это видно строкой «Credentials stay on the host». Песочница защищает хост от агента, но не защищала бы ключи: у агента внутри есть bash и сеть, и `auth.json` он прочитал бы целиком. Токен живёт ровно столько, сколько прогон: прокси умирает вместе с ним, и утёкший токен уже ничего не открывает.
+## What the container gets
 
-  **Агент не знает, какая модель ему отвечает.** В контейнере провайдер называется `sandbox`, модель — `agent-model`, настоящее имя подставляет прокси в теле запроса. Отсюда практическая польза: агент не может пересесть на модель подороже у того же провайдера — счёт приходит хозяину аккаунта, а не в песочницу. Поведенческие поля (`api`, `compat`, размер окна) переносятся из настоящей записи: соврать в них значило бы изменить работу pi, а не спрятать имя. В журнал и отчёты пишется реальная модель — статистика остаётся про то, что действительно отвечало.
+| | |
+| --- | --- |
+| Workspace | bind mounted at `/workspace/<dirname>`, read-write — the directory keeps its name, so build recipes reading `$(notdir $(CURDIR))` compute the same value inside and out |
+| Agent directory | a named docker volume, so host settings, sessions and installed pi packages stay out. Two files are laid in read-only: `auth.json` and `models.json` (custom provider definitions — without it a preset naming a local gateway model would fail with `Unknown provider`) |
+| Credentials | never enter the container: a run-scoped proxy on the host holds the real key and the agent gets a token that dies with the run |
+| Identity | your uid/gid, so files written through the mount are not owned by root |
+| Network | on by default, because the model call needs it |
+| Environment | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` — a sandbox default rather than a profile field, so no profile needs to repeat it. The container has no business fetching updates or sending telemetry; its only legitimate outbound connection is the model |
 
-  Работает и для своих провайдеров из `~/.pi/agent/models.json`, и для встроенных в pi: их адреса берутся из каталога моделей рядом с бинарём `pi` (`MODELS[провайдер][модель].baseUrl`), а описание провайдера подкладывается в контейнерный `models.json`. Если адрес не нашёлся — монтируется запись одного провайдера вместо файла со всеми ключами. Отключается на профиль: `"proxyCredentials": false`.
-- **Токены форджей в контейнер тоже не попадают — и push оттуда невозможен.** Тем же приёмом поднимается git-прокси: контейнер получает run-токен и адрес прокси, настоящий токен подставляется на хосте. В шапке прогона строка «Git stays on the host: fetch from … goes through a run-scoped proxy, push is refused». Подробности — «Git из песочницы» ниже.
-- Расширения с хостовыми путями внутри контейнера не существуют — companion предупредит. `npm:`/`git:`-источники ставятся внутри и работают.
-- Сессии живут в volume: `--session last` между песочными прогонами работает, но хостовую сессию в песочнице продолжить нельзя (и наоборот).
+The rest of your home directory, your SSH keys and everything outside the workspace are simply not there. Sessions live in the volume, so `--session last` keeps working across sandboxed runs — but a session started on the host cannot be continued in the sandbox, and vice versa. Sessions are also split per workspace through `PI_CODING_AGENT_SESSION_DIR`: pi buckets them by working directory, and containers used to share one flat `/workspace`, so one bucket held the transcripts of every repository this machine had ever touched.
 
-Профиль песочницы целиком настраивается в пресете (`sandbox: { mode, image, network, agentDir, env, mounts, args, memory, cpus, pidsLimit, maxConcurrent, gitProxy }`); `--sandbox none` разово отключает песочницу пресета.
+If the image is missing or the daemon is unreachable, the run fails **before** a job exists, with the command that fixes it.
 
-`maxConcurrent` — сколько контейнеров этого профиля разрешено одновременно. Прогон сверх лимита **ждёт свободный слот**, а не падает: провайдер, ограничивший число параллельных сессий, иначе обрывает лишние прогоны на середине. В логе такого прогона видно `Waiting for a free slot: profile <имя> is at its limit of N`; ожидание ограничено таймаутом прогона. Считается по живым контейнерам docker, а не по записям журнала.
+### Real keys stay on the host
 
-**Общий пул на несколько профилей** — когда лимит принадлежит не профилю, а провайдеру за ним. Профиль объявляет `concurrencyGroup`, лимит задаётся один раз в корне конфига:
+For the duration of a run a local proxy is raised, the agent gets a one-time token, and the real key is substituted on the host. The run log says `Credentials stay on the host`. A sandbox protects the host from the agent, but would not protect the keys: the agent has bash and network inside, and would simply read `auth.json`. The token lives exactly as long as the run.
+
+**The agent does not know which model answers it.** Inside the container the provider is called `sandbox` and the model `agent-model`; the proxy substitutes the real name in the request body. The practical benefit: an agent cannot move itself to a pricier model at the same provider — the bill goes to the account owner, not to the sandbox. Behavioural fields (`api`, `compat`, window size) are carried over from the real entry, since lying in those would change how pi works rather than hide a name. The journal and reports record the real model, so statistics stay about what actually answered.
+
+This works both for your own providers from `~/.pi/agent/models.json` and for the ones built into pi: their addresses come from the model catalogue next to the `pi` binary, and a provider definition is laid into the container's `models.json`. Turned off per profile with `"proxyCredentials": false`.
+
+**Forge tokens do not enter either — and push from inside is impossible.** The same trick raises a git proxy; details in [git-proxy.md](git-proxy.md).
+
+## Equipment that will not arrive stops the run
+
+A preset can name skills and extensions by container path. A path nothing mounts — or a mount whose host side does not exist, which docker turns into an empty directory — means the agent runs without the rules that equipment carries, while the run looks entirely normal. `delegate` therefore refuses to start and names the mount that would fix it; `presets` marks the same preset with `⚠ NOT MOUNTED`. See [agents.md](agents.md).
+
+## Trusted workspaces: what a repository may decide
+
+Two things hang off one list:
 
 ```json
-"concurrencyPools": { "ollama-pro": 3 },
-"sandboxProfiles": {
-  "agent-base": { "image": "pi-sandbox-agent:latest", "concurrencyGroup": "ollama-pro" },
-  "agent":      { "profile": "agent-base" }
-}
+{ "trustedProjects": ["~/github"], "presets": { } }
 ```
 
-Теперь `agent-base` и `agent` делят одни три слота, а не по три на каждый. Лимит живёт у пула, поэтому профили не могут разойтись во мнении, сколько сессий разрешает провайдер; ссылка на несуществующий пул — ошибка до старта, а не молчаливое «без лимита». Всё это **опционально**: нет `concurrencyGroup` — работает `maxConcurrent` самого профиля, нет и его — лимитов нет вовсе.
+Entries match by prefix, so one line covers everything under it. `"trustProjectConfig": true` is the blunt version: trust every workspace, wherever it is.
 
-При запуске в шапке видно занятость: `Slots: 2/3 in use · pool ollama-pro`, а если слотов не осталось — `— this run waits for a free slot`.
+For a workspace **not** covered by either:
 
-Контейнеры называются `pi-<профиль>-<job-id>` (`pi-go-delegate-msonq…`), поэтому в `docker ps` сразу видно, какой профиль занимает слот.
+- its `.claude/pi/config.json` is sanitized — it may still choose a model, prompts and a toolchain, but not `mounts`, `env`, `agentDir`, `volume`, `user`, `image`, `network`, `args`, `mode`, `isolateCaches` or `onFinish`. What was stripped is printed with the run.
+- its **caches are not shared**. Named volumes the profile mounts writable — the module cache, the build cache, the gopls index — are replaced with anonymous volumes that die with the container, and the agent directory becomes one volume per workspace.
 
-`memory`, `cpus`, `pidsLimit` — необязательные потолки ресурсов: не заданы — docker ничего не ограничивает, как и было раньше. Смысл появляется на параллельных прогонах: один gopls на большом репозитории держит несколько сотен мегабайт, поэтому три worktree-агента разом — это гигабайты на хосте. Профиль передаёт лимиты наследникам; всё, что этими тремя полями не покрыто, по-прежнему задаётся через `args`.
+The reason is one vector: those volumes outlive the run and are shared by every other one, so a module or build object written by a repository you cloned from the internet would be picked up by the next run, in a different repository. An untrusted run pays with a cold build cache — modules still resolve instantly from the host download cache, mounted read-only through `GOPROXY=file://`.
 
-### Оснастка агента: sandboxProfiles
+## Sandbox profiles: giving an agent its toolchain
 
-Образ намеренно голый — node, git, ripgrep. Если агенту нужен тулчейн (собрать Go, прогнать линтер, соблюсти твои гейты на коммит), эта оснастка описывается один раз в `sandboxProfiles` и подключается по имени:
+The image is deliberately bare — node, git, ripgrep. An agent that has to build Go, run a linter or honour your commit gates needs those tools inside, and that equipment is the same for every Go preset you own. So it is named once, under `sandboxProfiles`, and referenced by name:
 
 ```json
 {
@@ -61,49 +70,106 @@ sandbox clean                       # убрать контейнеры, ост�
         "/home/linuxbrew/.linuxbrew/opt/go/libexec:/usr/local/go:ro",
         "~/go/bin:/gobin:ro",
         "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
+        "~/.pi/agent/skills:/pi-skills:ro",
         "pi-plugin-gomod:/home/pi/go/pkg/mod",
         "pi-plugin-gocache:/home/pi/.cache"
       ],
       "env": ["PATH=/usr/local/go/bin:/gobin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-      "extensions": ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]
+      "extensions": ["/pi-agent/host-extensions/custom-gcl-precommit.ts"],
+      "skills": ["/pi-skills/git-commit"]
     }
   },
   "presets": {
-    "go-fix": { "model": "opencode-go/kimi-k3", "systemPrompt": "fixer", "sandbox": "go" }
+    "go-fix":    { "model": "opencode-go/kimi-k3", "systemPrompt": "fixer",       "sandbox": "go" },
+    "go-review": { "model": "opencode-go/glm-5.2", "systemPrompt": "adversarial", "sandbox": "go", "readOnly": true }
   }
 }
 ```
 
-- `extensions`/`skills` профиля подключаются **только** когда песочница активна, поэтому могут ссылаться на контейнерные пути. Гейты живут здесь: гейт, которого нет внутри контейнера, не падает с ошибкой — он просто перестаёт гейтить.
-- **LSP.** Расширение `pi-lsp-adapter` вшито в образ (`/usr/local/lib/node_modules/pi-lsp-adapter/src/index.ts`) — ничего не качается на старте. Сам сервер монтируется с хоста (`gopls` статический, работает как есть). Адаптер берёт пути от **домашнего каталога**, а не от `PI_CODING_AGENT_DIR`: конфиг — `$HOME/.pi/agent/lsp.json`, lock — `$HOME/.pi/agent/lsp/lsp.lock.json`. Без записи в lock сервер считается неустановленным даже при `installMode: off` и абсолютном `bin`, а `/lsp install` интерактивен и в headless не отрабатывает — поэтому lock монтируется готовым, с контейнерным путём (`"resolvedCommand": ["/gobin/gopls"]`). Volume под это не нужен: рабочие каталоги адаптера (`pids`, `logs`, `cache`, `workspaces`) создаёт образ, за прогон они остаются пустыми, а дорогой индекс держит сам сервер в `$HOME/.cache` — том, что уже смонтирован.
-- Бинари не копируются, а монтируются: `~/go/bin:/gobin:ro` показывает контейнеру тот же файл на диске. Статические бинари (всё, что собрано Go) работают как есть.
-- `env` принимает обе формы: `"NAME"` пробрасывает значение с хоста, `"NAME=значение"` задаёт своё. Смонтированный бинарь бесполезен, пока его каталог не в `PATH`.
-- Volume-ы (`pi-plugin-gomod:/home/pi/go/pkg/mod`) держат кэши между прогонами — без них каждый прогон пересобирает всё заново.
-- `"sandbox": {"profile": "go", "network": "none"}` — взять профиль за основу и переопределить отдельные поля. `--sandbox go` подключает профиль разово. Оснастка (`mounts`, `env`, `extensions`, `skills`, `args`) при этом **добавляется** к профилю, а не заменяет его: `{"profile": "go", "env": ["PI_HOOKS=…"]}` сохраняет профильный `PATH`, без которого ни один смонтированный бинарь не найдётся.
-- Профиль сам может ссылаться на `profile` — `agent` это `agent-base` плюс свой docker, а не его копия. Цикл ссылок сообщается ошибкой, а не подвисает.
+- `extensions` / `skills` of a profile load **only** when the sandbox is active, so they can point at container paths that do not exist on your host. Gates belong here: a pre-commit linter gate missing inside the container does not fail loudly, it just stops gating — which is why an unmounted one now stops the run instead.
+- Host binaries are not copied in, they are bind mounted: `~/go/bin:/gobin:ro` makes the same file on disk visible at `/gobin`, read-only. Statically linked binaries (anything built by Go) run as-is; something linked against host libraries has to be installed in the image instead.
+- `env` takes both forms: `"NAME"` forwards the host value, `"NAME=value"` sets one. A mounted binary is useless until `PATH` names its directory.
+- Named volumes (`pi-plugin-gomod:/home/pi/go/pkg/mod`) keep module and build caches between runs; without them every run recompiles the world.
+- `"sandbox": {"profile": "go", "network": "none"}` starts from a profile and overrides single fields; `--sandbox go` applies a profile for one run. Equipment adds to the profile rather than replacing it, so `{"profile": "go", "env": ["PI_HOOKS=…"]}` keeps the profile's `PATH` — without which every mounted binary is unreachable.
+- A profile may itself name a `profile`, so `agent` is `agent-base` plus the docker daemon instead of a copy of it. A cycle is reported, not hung.
 
-Если образ не собран или демон недоступен, прогон падает **до** создания задачи — с текстом, что именно делать.
+### Language servers
 
-### Несколько образов
+The image ships the `pi-lsp-adapter` extension (`/usr/local/lib/node_modules/pi-lsp-adapter/src/index.ts`), so a run gets `lsp_definition`, `lsp_references`, `lsp_workspace_symbols` and `lsp_diagnostics` without downloading anything. The server itself is bind mounted from the host — `gopls` is a static Go binary and runs as it is.
 
-Профиль может назвать свой образ и свой Dockerfile — под каждый стек свой:
+```json
+"mounts": [
+  "~/go/bin:/gobin:ro",
+  "~/.pi/agent/lsp.sandbox.json:/home/pi/.pi/agent/lsp.json:ro",
+  "~/.pi/agent/lsp.sandbox.lock.json:/home/pi/.pi/agent/lsp/lsp.lock.json:ro"
+]
+```
+
+The adapter resolves every path from the **home directory**, not from `PI_CODING_AGENT_DIR`, so its config is `$HOME/.pi/agent/lsp.json` and never `/pi-agent/lsp.json`. A server counts as missing until it appears in `lsp.lock.json` — even with `"installMode": "off"` and an absolute `bin` — and `/lsp install` is interactive, so a headless run cannot fix it: mount a lockfile naming the container path (`{"servers": {"gopls": {"installer": "system", "resolvedCommand": ["/gobin/gopls"]}}}`).
+
+No volume is needed for this. The adapter's writable directories (`pids`, `logs`, `cache`, `workspaces`) are created by the image, stay empty across a run, and the index that actually costs time belongs to the language server, which keeps it under `$HOME/.cache` — a volume you already have.
+
+## Running somewhere else: `--cwd`
+
+`--cwd <path>` moves the agent's working directory without moving you:
+
+```bash
+/pi:delegate --preset go-developer --cwd ~/proj/bookmarks   implement SPEC.md
+/pi:review --cwd ../other-repo
+```
+
+Only the agent moves. The directory is what gets bind mounted at `/workspace/<dirname>`, what pi runs in, and the tree `review` diffs — while the job records stay in the workspace you typed the command in, so `status`, `watch`, `steer` and `result` keep finding the job. A missing path is an error before the job exists, because the usual cause is a typo and an agent started in the wrong tree is worse than one not started.
+
+Configuration does **not** follow: presets, prompts and `.claude/pi/config.json` come from your workspace, never from the target. To pick up the target's own instructions, say so: `--append-system-prompt @../other-repo/.claude/pi/SYSTEM.md`.
+
+`--mount host:container[:ro]` adds one more directory to whatever profile the run ended up with:
+
+```bash
+/pi:delegate --preset go-fix --mount ~/proj/shared-lib:/shared:ro   port this module to the new API
+```
+
+It is repeatable, and a relative host path (`./fixtures:/fixtures:ro`) resolves against the workspace rather than being read by docker as a named volume. Mounting onto a container path the profile already uses replaces that mount instead of adding a second one. Without a sandbox there is nowhere to mount into and the flag is an error, not a no-op.
+
+**A git worktree works as the working directory, with nothing to mount by hand.** A worktree owns no repository: its `.git` is a file naming the absolute path of the shared one, which the container would otherwise not have. The companion detects this from `--cwd` and mounts that repository at exactly the path the file names, adding a `Worktree: shared … mounted` line to the run header. This is what makes several agents work in one repository at once — one worktree and one background job per branch. The mount must be writable, since git keeps each worktree's index and HEAD inside it.
+
+## Concurrency: slots and pools
+
+`maxConcurrent` caps how many containers of one profile run at once. A run over the cap **waits for a slot** instead of failing: when the provider behind the profile limits parallel sessions, the extra runs would otherwise be cut off mid-flight. Its log shows `Waiting for a free slot: profile <name> is at its limit of N`, and the wait is bounded by the run's own timeout. Slots are counted from live docker containers, not from job records.
+
+**Several profiles can share one allowance** when the limit belongs to the provider rather than to a profile:
+
+```json
+"concurrencyPools": { "ollama-pro": 3 },
+"sandboxProfiles": {
+  "agent-base": { "image": "pi-sandbox-agent:latest", "concurrencyGroup": "ollama-pro" },
+  "agent":      { "profile": "agent-base" }
+}
+```
+
+`agent-base` and `agent` now draw from the same three slots instead of three each. Keeping the number with the pool means profiles cannot disagree about how many sessions the provider allows, and a reference to an undefined pool is an error before the run starts rather than a silent "no limit". The run header shows occupancy at launch — `Slots: 2/3 in use · pool ollama-pro`. Containers are named `pi-<profile>-<job-id>`, so `docker ps` shows which profile holds a slot.
+
+`memory`, `cpus` and `pidsLimit` are optional ceilings — leave them out and docker imposes none. They earn their place once runs go parallel: a language server indexing a large repository holds several hundred megabytes on its own. A profile passes them down to any profile built on it, and `args` still takes any docker flag these three do not cover.
+
+## One image per stack
+
+A profile may name its own image and the Dockerfile that builds it:
 
 ```json
 "sandboxProfiles": {
-  "go":   { "image": "pi-plugin-sandbox:latest" },
+  "agent-base": { "image": "pi-sandbox-agent:latest", "dockerfile": "agent" },
   "node": { "image": "pi-sandbox-node:latest", "dockerfile": "node" }
 }
 ```
 
 ```bash
-sandbox                 # таблица образов: собран/нет, из какого файла, какие профили используют
-sandbox build node      # собрать один (можно назвать и профиль, и имя образа)
-sandbox build --all     # собрать все, что знает конфиг
+/pi:sandbox                  # every image: built or missing, from which file, used by which profiles
+/pi:sandbox build go         # build one, by image name or by profile name
+/pi:sandbox build --all      # build everything the config knows about
 ```
 
-Dockerfile ищется как `<имя>.Dockerfile` в `<проект>/.claude/pi/sandbox/`, затем `~/.claude/pi/sandbox/`, затем в самом плагине — как и промты. **Держи свои образы в `~/.claude/pi/sandbox/`**: плагин обновляется из git, и правка его файла потеряется при следующем обновлении, а одноимённый пользовательский файл перекрывает плагинный и переживает апдейт.
+Dockerfiles are looked up as `<name>.Dockerfile` in `<workspace>/.claude/pi/sandbox`, then `~/.claude/pi/sandbox`, then the plugin's own directory — the same layering as stored prompts. **Keep yours in `~/.claude/pi/sandbox/`**: the plugin is updated from git, so an image edited inside it is lost on the next pull, while a user file of the same name shadows the plugin's and survives.
 
-Базовый образ (`base.Dockerfile`) — фундамент: в нём pi, git, ripgrep, make, LSP-адаптер. Стековые образы наследуются от него:
+The base image is the foundation — pi, git, ripgrep, make, the LSP adapter — and stack images build on it:
 
 ```dockerfile
 FROM pi-plugin-sandbox:latest
@@ -111,8 +177,42 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
 ```
 
-Что куда класть:
+That example is not hypothetical: `go test -race` links the race runtime through cgo, so without a C compiler the race detector fails outright, and `CGO_ENABLED=1` is pinned in the image so a stray `CGO_ENABLED=0` cannot switch it back off.
 
-- **в образ** — то, у чего есть версия и что должно быть воспроизводимым: SDK языка, `gopls`, компилятор C. Без `gcc` не работает `go test -race` (детектор гонок линкуется через cgo), а это часть тестового гейта, поэтому `CGO_ENABLED=1` там же прописан явно — чтобы случайный `CGO_ENABLED=0` в окружении не выключил его молча;
-- **монтировать с хоста** — локально собранные инструменты, которых нет ни в одном реестре: `custom-gcl` (golangci-lint с правилами gid.team), `mockery`, `protoc-gen-*`, `tea`. Они живут в `~/go/bin` и монтируются профилем;
-- **кеш модулей — file-прокси, не копия.** Хостовый `~/go/pkg/mod/cache/download` монтируется read-only, `GOPROXY=file:///host-gomod,https://proxy.golang.org,direct`. Всё уже скачанное (включая приватные `gitlab.gid.team`) доступно мгновенно, контейнер в хостовый кеш не пишет, распаковка идёт в свой volume. Проверено прогоном с `--network none`: `go mod download` и `go test -race -count=1` проходят без сети.
+Three kinds of tooling, three homes:
+
+- **In the image** — anything versioned and reproducible: the language SDK, `gopls`, the C toolchain.
+- **Mounted from the host** — locally built binaries no registry has: a linter carrying house rules, `mockery`, protoc plugins. They live in `~/go/bin`, which the profile mounts read-only.
+- **Proxied, not copied** — the module cache. Bind mount the host download cache read-only and point Go at it: `GOPROXY=file:///host-gomod,https://proxy.golang.org,direct`. Gigabytes of already-fetched modules, private ones included, resolve instantly; the container never writes to the host cache and unpacks into its own volume. Verified with `--network none`: `go mod download` and `go test -race -count=1` both pass offline.
+
+## The full inline form
+
+The profile is configurable per preset, in full:
+
+```json
+"presets": {
+  "caged": {
+    "model": "opencode-go/kimi-k3",
+    "sandbox": {
+      "mode": "docker",
+      "image": "pi-plugin-sandbox:latest",
+      "network": "bridge",
+      "agentDir": "volume",
+      "env": ["ANTHROPIC_API_KEY"],
+      "mounts": ["/opt/toolchain:/opt/toolchain:ro"],
+      "memory": "4g",
+      "cpus": 2,
+      "pidsLimit": 512
+    }
+  }
+}
+```
+
+`"sandbox": "docker"` is shorthand for the defaults, and `--sandbox none` switches a preset's sandbox back off for one run.
+
+Two limits worth knowing: the workspace bind mount is read-write, so a sandboxed agent can still rewrite your checkout (that is the point — the isolation is about the rest of the machine), and the container-local agent directory means the extensions and skills you installed on the host are absent unless the preset asks for them explicitly.
+
+## Related
+
+- [dind.md](dind.md) — a docker daemon inside the sandbox, for testcontainers and compose stacks
+- [git-proxy.md](git-proxy.md) — forge access from a sandbox: fetch through a per-run proxy, push refused

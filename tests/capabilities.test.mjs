@@ -156,7 +156,7 @@ test("equipment the container will not have is named in the preset line", () => 
   );
   assert.deepEqual(presetCapabilities(config, "dev").mountGaps, ["/pi-skills/git-commit"]);
   const [line] = presetLines(config.presets, allPresetCapabilities(config));
-  assert.match(line, /НЕ СМОНТИРОВАНО: \/pi-skills\/git-commit/);
+  assert.match(line, /NOT MOUNTED: \/pi-skills\/git-commit/);
 });
 
 test("a preset whose equipment is mounted reports no gaps", () => {
@@ -172,7 +172,7 @@ test("a preset whose equipment is mounted reports no gaps", () => {
     );
     assert.deepEqual(presetCapabilities(config, "dev").mountGaps, []);
     const [line] = presetLines(config.presets, allPresetCapabilities(config));
-    assert.doesNotMatch(line, /НЕ СМОНТИРОВАНО/);
+    assert.doesNotMatch(line, /NOT MOUNTED/);
   } finally {
     fs.rmSync(hostDir, { recursive: true, force: true });
   }

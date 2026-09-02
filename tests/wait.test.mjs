@@ -111,6 +111,8 @@ test("a failed job makes the wait fail, so a caller can branch on it", () => {
 });
 
 test("an unknown job id is refused rather than waited on", () => {
+  // `--for` bounds the appearance grace as well: without it this would sit out
+  // the full grace period before refusing.
   withWorkspace((workspaceRoot, dataDir) => {
     record(workspaceRoot, {
       id: "delegate-known",
@@ -120,8 +122,78 @@ test("an unknown job id is refused rather than waited on", () => {
       createdAt: new Date().toISOString()
     });
 
-    const result = runWait(workspaceRoot, ["delegate-missing"], dataDir);
+    const result = runWait(workspaceRoot, ["delegate-missing", "--for", "2"], dataDir);
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /No pi job matches/);
+  });
+});
+
+/** Async twin of `withWorkspace`: the sync one tears down before a promise settles. */
+async function withWorkspaceAsync(run) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-wait-"));
+  const workspaceRoot = path.join(dataDir, "repo");
+  fs.mkdirSync(workspaceRoot);
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = dataDir;
+  try {
+    return await run(workspaceRoot, dataDir);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+test("a job id that has not reached the journal yet is waited for, not refused", async () => {
+  // The bucket already holds history, which is the case the appearance grace
+  // used to miss: keyed on an empty journal, a wait fired straight after
+  // `delegate --background` in a lived-in workspace exited non-zero within a
+  // second — a supervisor reading only the notification takes that for a
+  // finished wave.
+  await withWorkspaceAsync(async (workspaceRoot, dataDir) => {
+    const { spawn } = await import("node:child_process");
+    record(workspaceRoot, {
+      id: "delegate-older",
+      kind: "delegate",
+      title: "yesterday",
+      workspaceRoot,
+      status: "completed",
+      createdAt: new Date(Date.now() - 60_000).toISOString(),
+      completedAt: new Date(Date.now() - 60_000).toISOString()
+    });
+
+    const child = spawn(process.execPath, [COMPANION, "wait", "delegate-newborn", "--for", "20"], {
+      cwd: workspaceRoot,
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, PI_PLUGIN_DB: process.env.PI_PLUGIN_DB }
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+
+    setTimeout(() => {
+      record(workspaceRoot, {
+        id: "delegate-newborn",
+        kind: "delegate",
+        title: "just started",
+        workspaceRoot,
+        status: "completed",
+        summary: "done",
+        createdAt: new Date().toISOString(),
+        completedAt: new Date().toISOString()
+      });
+    }, 800);
+
+    const code = await new Promise((resolve) => child.on("close", resolve));
+    assert.equal(code, 0, `stderr: ${stderr}`);
+    assert.match(stdout, /delegate-newborn/);
+    assert.ok(!stderr.includes("No pi job matches"), `refused instead of waiting: ${stderr}`);
   });
 });

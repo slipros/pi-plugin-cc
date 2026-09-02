@@ -46,6 +46,7 @@ import {
 } from "./lib/jobs.mjs";
 import { listModels, normalizeThinking, resolveModelSelection } from "./lib/models.mjs";
 import { runFinishHook } from "./lib/notify.mjs";
+import { formatFleetEvent, eventKey, orphanEvents, readFleetEvents, recordFleetEvent } from "./lib/fleet-events.mjs";
 import { getPiAvailability, PI_BINARY, runPiTurn } from "./lib/pi.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { buildSystemPrompt, interpolate, listNamedPrompts, loadTaskTemplate } from "./lib/prompts.mjs";
@@ -244,6 +245,20 @@ const DEFAULT_WAIT_SECONDS = 3600;
 /** Job records change at the pace of the filesystem, not of the model. */
 const WAIT_POLL_MS = 500;
 
+/** Runs shown by `events` without `--tail`. */
+const DEFAULT_EVENT_TAIL = 20;
+
+/**
+ * How often `events --follow` sweeps for runs whose process died.
+ * Nothing is polled for the announced endings — those arrive as log lines the
+ * moment they are written; this interval only bounds how late a killed run is
+ * noticed.
+ */
+const DEFAULT_EVENT_POLL_SECONDS = 20;
+
+/** How often `events --follow` re-reads the log itself. Cheap: one small file. */
+const EVENT_LOG_POLL_MS = 1000;
+
 const RUN_FLAGS = {
   booleans: [
     "background",
@@ -328,7 +343,9 @@ const KNOWN_FLAGS = new Set([
   "diff",
   "prune",
   "full",
-  "kind"
+  "kind",
+  "poll",
+  "workspace"
 ]);
 
 /**
@@ -367,6 +384,7 @@ function usage() {
     "                          [--status <s,s>] [--preset <name>] [--model <id>] [--json]",
     `  ${self} result [job-id] [--diff] [--json]`,
     `  ${self} wait [job-id...] [--all] [--for <seconds>] [--json]`,
+    `  ${self} events [--follow [--for <s>]] [--tail <n>] [--poll <s>] [--workspace] [--json]`,
     `  ${self} runs [run-id] [--all] [--limit N] [--days N] [--model <id>]`,
     "                        [--preset <name>] [--kind delegate|review] [--prune] [--json]",
     `  ${self} rerun <run-id> [--append <text>] [--prompt <text>|--stdin] [run flags]`,
@@ -851,22 +869,35 @@ async function executeRun({
 
   const startedAt = Date.now();
   /**
-   * The hook fires for every terminal outcome, including a failed run: "it
-   * finished" is exactly the moment worth announcing, and a notification that
-   * only arrives on success is the one you cannot rely on.
+   * Announce the end of the run, for every terminal outcome including failure:
+   * "it finished" is exactly the moment worth announcing, and a notification
+   * that only arrives on success is the one you cannot rely on.
+   *
+   * Two channels, and the order is deliberate. The fleet event goes first and
+   * always — it is the one a supervisor watches, so it cannot be something the
+   * user had to switch on. `onFinish` follows as the optional channel out to
+   * the host (desktop notification, message queue), and its failure is a log
+   * line, never the thing that swallows the announcement.
    */
-  const fireFinishHook = (status, execution = null) => {
+  const announceTerminal = (status, execution = null) => {
+    // The record `runTrackedJob` just wrote is the authority on how the run
+    // ended: it is where a degraded-but-usable run becomes `completed` and
+    // where a run cut off at the output ceiling becomes `truncated`. Announcing
+    // a status recomputed here would contradict what `status` reports.
+    const stored = readStoredJob(job.workspaceRoot, job.id);
+    const finished = {
+      ...job,
+      ...(stored ? enrichJob(stored) : {}),
+      status: stored?.status ?? status,
+      logFile,
+      model: execution?.model ?? stored?.model ?? settings.model,
+      summary: execution?.summary ?? stored?.summary ?? null
+    };
+    recordFleetEvent(finished);
     if (!settings.onFinish) {
       return;
     }
-    const outcome = runFinishHook(settings.onFinish, {
-      ...job,
-      status,
-      logFile,
-      model: execution?.model ?? settings.model,
-      summary: execution?.summary ?? null,
-      elapsed: execution?.elapsed ?? null
-    });
+    const outcome = runFinishHook(settings.onFinish, finished);
     if (outcome.error) {
       appendLogLine(logFile, `onFinish hook failed: ${outcome.error}`);
     }
@@ -926,13 +957,13 @@ async function executeRun({
       };
     });
   } catch (error) {
-    // `runTrackedJob` has already recorded the failure; the hook only announces
+    // `runTrackedJob` has already recorded the failure; this only announces
     // it. Rethrown untouched afterwards so the command still reports it.
-    fireFinishHook("failed");
+    announceTerminal("failed");
     throw error;
   }
 
-  fireFinishHook(execution.aborted ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed", execution);
+  announceTerminal(execution.aborted ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed", execution);
 
   return { job, execution };
 }
@@ -1917,6 +1948,121 @@ async function commandCancel(argv, workspaceRoot) {
 }
 
 /**
+ * The fleet channel as a stream.
+ *
+ * `wait` answers one question once — "are these jobs done yet" — and then it is
+ * gone, which makes it a waiter that has to be re-armed for every wave and can
+ * die between them without saying so. `events --follow` is the other shape: one
+ * long-lived reader of the machine-wide log, arming once and covering every run
+ * from every workspace until it is stopped. That is what a supervisor watching
+ * for "an agent finished" actually needs, and what a Claude Code Monitor turns
+ * into one chat notification per line.
+ *
+ * The poll exists for the one ending nobody can announce from inside: a run
+ * whose process was killed writes nothing, and only a sweep notices its pid is
+ * gone. Those are folded into the same stream as `orphaned`, so silence in this
+ * channel means "still working" and never "died quietly".
+ */
+async function commandEvents(argv, workspaceRoot) {
+  const { flags } = parseArgs(argv, {
+    booleans: ["json", "follow", "workspace"],
+    strings: ["for", "tail", "poll"]
+  });
+
+  // Following starts at the end of the log by default: replaying an epic's
+  // worth of finished runs into the chat is noise, and what a follower is armed
+  // for is the ending that has not happened yet. `--tail N` asks for catch-up.
+  const tailCount =
+    flags.tail === undefined ? (flags.follow ? 0 : DEFAULT_EVENT_TAIL) : Number(flags.tail);
+  if (!Number.isFinite(tailCount) || tailCount < 0) {
+    throw new Error(`--tail expects a count, got "${flags.tail}".`);
+  }
+  const pollSeconds =
+    flags.poll === undefined ? DEFAULT_EVENT_POLL_SECONDS : positiveNumber(flags.poll, "--poll");
+  const followSeconds = flags.for === undefined ? null : positiveNumber(flags.for, "--for");
+
+  const belongsHere = (event) => !flags.workspace || event.workspaceRoot === workspaceRoot;
+  const write = (event) => {
+    process.stdout.write(flags.json ? `${JSON.stringify(event)}\n` : `${formatFleetEvent(event)}\n`);
+  };
+
+  const history = readFleetEvents();
+
+  if (!flags.follow) {
+    const rows = history.events.filter(belongsHere).slice(-tailCount);
+    if (!rows.length && !flags.json) {
+      process.stdout.write(
+        "No finished pi runs recorded yet. The log fills as runs end; `--follow` waits for the next one.\n"
+      );
+      return 0;
+    }
+    for (const event of rows) {
+      write(event);
+    }
+    return 0;
+  }
+
+  const seen = new Set(history.events.map(eventKey));
+  const caughtUp = tailCount > 0 ? history.events.slice(-tailCount) : [];
+  for (const event of caughtUp) {
+    if (belongsHere(event)) {
+      write(event);
+    }
+  }
+  let cursor = history.nextLine;
+
+  if (!flags.json) {
+    process.stdout.write(
+      `pi fleet channel armed · watching ${flags.workspace ? "this workspace" : "every workspace"} · ` +
+        `${history.events.length} run(s) already in the log · orphan sweep every ${pollSeconds}s\n`
+    );
+  }
+
+  const deadline = followSeconds === null ? null : Date.now() + followSeconds * 1000;
+  // Two clocks, because the two kinds of ending arrive differently. Announced
+  // endings are already written when the run ends, so the log is read often and
+  // the notification is nearly immediate; a killed run is only visible as a
+  // dead pid, and that sweep is the expensive one — it reads every bucket on
+  // the machine — so it runs on the slower interval.
+  let nextSweep = Date.now() + pollSeconds * 1000;
+  for (;;) {
+    const next = readFleetEvents({ from: cursor });
+    cursor = next.nextLine;
+    for (const event of next.events) {
+      const key = eventKey(event);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      if (belongsHere(event)) {
+        write(event);
+      }
+    }
+
+    if (Date.now() >= nextSweep) {
+      nextSweep = Date.now() + pollSeconds * 1000;
+      // A killed run leaves no line of its own, so the sweep writes one for it
+      // — into the log, not just to this stream, so a second follower does not
+      // report the same death twice.
+      const jobs = (flags.workspace ? listJobs(workspaceRoot) : listJobsEverywhere()).map(enrichJob);
+      for (const event of orphanEvents(jobs, seen)) {
+        seen.add(eventKey(event));
+        recordFleetEvent(event);
+        cursor = readFleetEvents({ from: cursor }).nextLine;
+        if (belongsHere(event)) {
+          write(event);
+        }
+      }
+    }
+
+    if (deadline !== null && Date.now() >= deadline) {
+      return 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, EVENT_LOG_POLL_MS));
+  }
+}
+
+/**
  * Block until background jobs finish.
  *
  * `delegate --background` hands the run to a detached process and returns
@@ -1955,10 +2101,25 @@ async function commandWait(argv, workspaceRoot) {
 
   // A job id printed by `delegate --background` can reach this command before
   // the detached child has written its record, exactly as with `watch --follow`.
+  //
+  // The wait is on the named jobs appearing, not on the bucket being empty:
+  // keyed on emptiness it only ever helped in a fresh workspace, and in a
+  // lived-in one — where every id but the newest is already on disk — the
+  // just-started job fell straight through to "No pi job matches" and a
+  // non-zero exit within a second of being launched. A supervisor reading only
+  // the notification sees that as the wave having finished.
+  const missingReferences = (known) =>
+    positional.filter(
+      (reference) => !known.some((job) => job.id === reference || job.id.endsWith(reference))
+    );
+
   let jobs = snapshot();
-  if (positional.length && !jobs.length) {
-    const appearBy = Date.now() + JOB_APPEARANCE_GRACE_MS;
-    while (!jobs.length && Date.now() < appearBy) {
+  if (positional.length) {
+    // Never wait for an id past the caller's own deadline: `wait --for 5` that
+    // spends 30 seconds looking for the job has stopped answering the question
+    // it was asked.
+    const appearBy = Math.min(Date.now() + JOB_APPEARANCE_GRACE_MS, deadline);
+    while (missingReferences(jobs).length && Date.now() < appearBy) {
       await new Promise((resolve) => setTimeout(resolve, 200));
       jobs = snapshot();
     }
@@ -2200,6 +2361,7 @@ const COMMANDS = {
   rerun: commandRerun,
   continue: commandContinue,
   sessions: commandSessions,
+  events: commandEvents,
   wait: commandWait,
   cancel: commandCancel,
   steer: commandSteer,

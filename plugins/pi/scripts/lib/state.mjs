@@ -7,6 +7,9 @@ import process from "node:process";
 const STATE_VERSION = 1;
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
+
+/** Name of the machine-wide terminal-event log inside the state root. */
+const FLEET_EVENTS_FILE_NAME = "fleet-events.jsonl";
 const MAX_JOBS = 50;
 /** Bounds on the state lock: long enough for a slow disk, short enough to not stall a run. */
 const LOCK_TIMEOUT_MS = 2000;
@@ -61,6 +64,19 @@ function stateRoot() {
   }
   const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
   return path.join(dataHome, "pi-plugin", "state");
+}
+
+/**
+ * The fleet event log: one line per run that reached a terminal state.
+ *
+ * Deliberately outside the per-workspace buckets. A supervisor watching for
+ * "an agent finished" has to hear about every run on the machine, and the
+ * bucket is exactly what it cannot be sure of — a `cd` between two Bash calls
+ * files the job under a directory the watcher never looks at. One log, one
+ * watcher, no bucket to guess.
+ */
+export function fleetEventsPath() {
+  return path.join(stateRoot(), FLEET_EVENTS_FILE_NAME);
 }
 
 /**

@@ -179,6 +179,24 @@ export function readStoredJob(workspaceRoot, jobId) {
   }
 }
 
+/**
+ * Job records live in the bucket of the directory the run was started from, so a
+ * `cd` between two calls turns "no such job" into the answer for a job that
+ * plainly exists — the reference is fine, the shell moved. `status --global`
+ * could always see those records, so the miss was a lookup scope, not missing
+ * data: fall back to the global list and tell the caller which workspace the
+ * record came from.
+ */
+function matchJobAnywhere(jobs, reference) {
+  const local = matchJob(jobs, reference);
+  if (local || !reference) {
+    return { job: local, elsewhere: null };
+  }
+  const everywhere = sortJobsNewestFirst(listJobsEverywhere()).map(enrichJob);
+  const job = matchJob(everywhere, reference);
+  return { job, elsewhere: job ? (job.workspaceRoot ?? null) : null };
+}
+
 function matchJob(jobs, reference) {
   if (!reference) {
     return null;
@@ -225,11 +243,13 @@ export function buildStatusSnapshot(
   const jobs = sortJobsNewestFirst(source).map(enrichJob);
 
   if (jobId) {
-    const job = matchJob(jobs, jobId);
+    const { job, elsewhere } = everywhere
+      ? { job: matchJob(jobs, jobId), elsewhere: null }
+      : matchJobAnywhere(jobs, jobId);
     if (!job) {
       throw new Error(`No pi job matches "${jobId}".`);
     }
-    return { jobs: [job], filtered: false, total: jobs.length, global: everywhere };
+    return { jobs: [job], filtered: false, total: jobs.length, global: everywhere, elsewhere };
   }
 
   const matching = filterJobs(jobs, { status, preset, model });
@@ -244,16 +264,19 @@ export function buildStatusSnapshot(
 
 export function resolveResultJob(workspaceRoot, jobId = null) {
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map(enrichJob);
-  if (!jobs.length) {
-    throw new Error("No pi jobs have been recorded for this workspace yet.");
-  }
 
   if (jobId) {
-    const job = matchJob(jobs, jobId);
+    const { job, elsewhere } = matchJobAnywhere(jobs, jobId);
     if (!job) {
       throw new Error(`No pi job matches "${jobId}".`);
     }
-    return { job, stored: readStoredJob(workspaceRoot, job.id) };
+    // The stored record sits in ITS OWN bucket: reading it from the caller's
+    // workspace would silently return null for a job found elsewhere.
+    return { job, stored: readStoredJob(elsewhere ?? workspaceRoot, job.id), elsewhere };
+  }
+
+  if (!jobs.length) {
+    throw new Error("No pi jobs have been recorded for this workspace yet.");
   }
 
   const finished = jobs.find((job) => ["completed", "failed", "cancelled"].includes(job.status));

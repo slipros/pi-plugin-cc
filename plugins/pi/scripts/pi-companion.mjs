@@ -1451,13 +1451,28 @@ async function commandStatus(argv, workspaceRoot) {
     preset: flags.preset ?? null,
     model: flags.model ?? null
   });
+  noteForeignBucket(snapshot.elsewhere);
   output(renderStatusReport(snapshot), snapshot, Boolean(flags.json));
   return 0;
 }
 
+// Records live in the bucket of the directory a run was started from, so the
+// same id resolves from one shell and not from another. The lookup now falls
+// back to the global list; saying where the record actually is keeps that from
+// looking like magic — and points at the `--cwd` the next call should use.
+function noteForeignBucket(workspace) {
+  if (!workspace) {
+    return;
+  }
+  process.stderr.write(
+    `note: job record lives in ${workspace}, not in this workspace — found it via the global list.\n`
+  );
+}
+
 async function commandResult(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, { booleans: ["json", "diff"] });
-  const { job, stored } = resolveResultJob(workspaceRoot, positional[0] ?? null);
+  const { job, stored, elsewhere } = resolveResultJob(workspaceRoot, positional[0] ?? null);
+  noteForeignBucket(elsewhere);
 
   // The patch is read from the tree on demand rather than stored with the job:
   // it can be megabytes, and the answer to "show me what it wrote" is only

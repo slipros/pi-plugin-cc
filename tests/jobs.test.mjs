@@ -124,6 +124,35 @@ test("status shows newest first and can be filtered to one job", () => {
   });
 });
 
+test("a job started from another directory is found by id, not reported missing", () => {
+  withWorkspace((workspaceRoot) => {
+    // Records live in the bucket of the directory a run was started from. A `cd`
+    // between two calls used to turn "no such job" into the answer for a job that
+    // plainly exists — the reference was fine, the shell had moved.
+    const elsewhere = path.join(path.dirname(workspaceRoot), "other-repo");
+    fs.mkdirSync(elsewhere, { recursive: true });
+    upsertJob(elsewhere, {
+      id: "pi-far",
+      kind: "delegate",
+      status: "completed",
+      workspaceRoot: elsewhere,
+      createdAt: new Date().toISOString()
+    });
+
+    const snapshot = buildStatusSnapshot(workspaceRoot, { jobId: "pi-far" });
+    assert.equal(snapshot.jobs[0].id, "pi-far");
+    assert.equal(snapshot.elsewhere, elsewhere);
+
+    const result = resolveResultJob(workspaceRoot, "pi-far");
+    assert.equal(result.job.id, "pi-far");
+    // The stored record is read from ITS OWN bucket: passing the caller's
+    // workspace here would look up a path that never held the job.
+    assert.equal(result.elsewhere, elsewhere);
+
+    assert.throws(() => buildStatusSnapshot(workspaceRoot, { jobId: "pi-nowhere" }), /No pi job matches/);
+  });
+});
+
 test("result refuses to guess while only unfinished jobs exist", () => {
   withWorkspace((workspaceRoot) => {
     assert.throws(() => resolveResultJob(workspaceRoot), /No pi jobs have been recorded/);

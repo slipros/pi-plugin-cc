@@ -186,7 +186,7 @@ test("file work survives the second write of the same run", () => {
       kind: "delegate",
       status: "completed",
       createdAt: new Date().toISOString(),
-      fileWork: {
+      agentWork: {
         linesRead: 412,
         linesWritten: 87,
         linesReplaced: 31,

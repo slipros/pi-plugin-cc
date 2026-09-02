@@ -33,7 +33,7 @@ import { openGitProxy, withGitProxy } from "./git-proxy.mjs";
 import { settleProxyPorts } from "./proxy-bind.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
-import { summarizeFileWork } from "./file-work.mjs";
+import { summarizeAgentWork } from "./agent-work.mjs";
 const SETTLE_GRACE_MS = 1500;
 const SHUTDOWN_GRACE_MS = 5000;
 /**
@@ -731,7 +731,7 @@ export async function runPiRpcTurn({
       peakContext: state.peakContext ?? 0,
       thinkingChars: state.thinkingChars ?? 0,
       // How much code the run moved through its own tools.
-      fileWork: summarizeFileWork(state.fileWork),
+      agentWork: summarizeAgentWork(state.agentWork),
       // Already measured by the slot queue and thrown away until now: the time
       // this run spent waiting for a container of its own pool, which is time no
       // model spent working.

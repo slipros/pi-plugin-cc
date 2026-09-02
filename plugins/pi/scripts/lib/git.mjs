@@ -134,6 +134,36 @@ function parseStatusPaths(text) {
  * the run was going shows up as the agent's work. In a worktree or a sandbox
  * that does not happen; in a shared checkout it can.
  */
+/**
+ * Lines added and removed, as numbers rather than a sentence.
+ *
+ * `--shortstat` already says this in English, and every reader that wants to
+ * compare runs has to parse it back out. Binary files report `-` for both
+ * counts and are skipped: they have no lines to add up.
+ *
+ * What this cannot see: files the run created and never staged. `git diff`
+ * knows nothing about untracked paths, so a run that leaves new files
+ * uncommitted under-reports here — hence `untracked` beside it, which is the
+ * honest size of that gap.
+ */
+function parseNumstat(text) {
+  let added = 0;
+  let deleted = 0;
+  for (const line of String(text ?? "").split("\n")) {
+    const [plus, minus] = line.split("\t");
+    if (plus === undefined || minus === undefined || plus === "-" || minus === "-") {
+      continue;
+    }
+    const a = Number(plus);
+    const d = Number(minus);
+    if (Number.isFinite(a) && Number.isFinite(d)) {
+      added += a;
+      deleted += d;
+    }
+  }
+  return { added, deleted };
+}
+
 export function summarizeTreeChanges(cwd, before) {
   if (!before) {
     return null;
@@ -154,6 +184,13 @@ export function summarizeTreeChanges(cwd, before) {
 
   const files = [...new Set([...committed, ...now.filter((file) => !wasDirty.has(file))])].sort();
   const stat = before.head ? gitOutput(cwd, ["diff", "--shortstat", before.head]).trim() : "";
+  // The same diff as numbers: what the run actually delivered, against what its
+  // tools reported writing. The two disagree when a run rewrites the same lines
+  // over and over — work that costs tokens and leaves nothing behind.
+  const { added, deleted } = before.head
+    ? parseNumstat(gitOutput(cwd, ["diff", "--numstat", before.head]))
+    : { added: 0, deleted: 0 };
+  const untracked = listUntrackedFiles(cwd).filter((file) => !wasDirty.has(file));
 
   return {
     base: before.head,
@@ -165,6 +202,11 @@ export function summarizeTreeChanges(cwd, before) {
     // separately so a reader is never told the agent wrote them.
     preexisting: [...wasDirty].filter((file) => now.includes(file)).sort(),
     stat,
+    added,
+    deleted,
+    // New files that never reached the index: they are real work, and `added`
+    // above does not count a line of them.
+    untracked: untracked.length,
     // Everything since the run started, commits and working tree together.
     diffCommand: before.head ? `git diff ${before.head.slice(0, 12)}` : null
   };

@@ -14,12 +14,12 @@ import { settleProxyPorts } from "./proxy-bind.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
 import {
-  createFileWorkState,
-  mergeFileWork,
+  createAgentWorkState,
+  mergeAgentWork,
   noteToolEnd,
   noteToolStart,
-  summarizeFileWork
-} from "./file-work.mjs";
+  summarizeAgentWork
+} from "./agent-work.mjs";
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
 
 /**
@@ -370,7 +370,10 @@ export function applyPiEvent(state, event, now = Date.now()) {
       const summary = summarizeToolCall(event.toolName, event.args);
       state.toolCalls.push(summary);
       timing.toolStartedAt.set(toolKey(event), now);
-      noteToolStart((state.fileWork ??= createFileWorkState()), event.toolName, event.args);
+      noteToolStart((state.agentWork ??= createAgentWorkState()), event.toolName, event.args, {
+        now,
+        runStartedAt: timing.firstEventAt
+      });
       (state.openToolCalls ??= new Map()).set(toolKey(event), {
         name: event.toolName,
         args: event.args
@@ -386,7 +389,7 @@ export function applyPiEvent(state, event, now = Date.now()) {
       const opened = (state.openToolCalls ??= new Map()).get(toolKey(event));
       state.openToolCalls.delete(toolKey(event));
       noteToolEnd(
-        (state.fileWork ??= createFileWorkState()),
+        (state.agentWork ??= createAgentWorkState()),
         event.toolName ?? opened?.name,
         opened?.args,
         event.result,
@@ -496,7 +499,7 @@ export function createTurnState() {
     timing: createTimingState(),
     peakContext: 0,
     thinkingChars: 0,
-    fileWork: createFileWorkState(),
+    agentWork: createAgentWorkState(),
     // Arguments of tools still running, so the result event can be attributed
     // to the file its call named: `tool_execution_end` carries the answer but
     // not always the request.
@@ -808,7 +811,7 @@ export function mergeRecoveredRun(first, next) {
     timing: mergeTiming(first.timing, next.timing),
     peakContext: Math.max(Number(first.peakContext) || 0, Number(next.peakContext) || 0),
     thinkingChars: sum(first.thinkingChars, next.thinkingChars),
-    fileWork: mergeFileWork(first.fileWork, next.fileWork),
+    agentWork: mergeAgentWork(first.agentWork, next.agentWork),
     slotWaitMs: sum(first.slotWaitMs, next.slotWaitMs),
     recoveredTruncations: (Number(first.recoveredTruncations) || 0) + 1,
     proxyStats: next.proxyStats ?? first.proxyStats
@@ -1078,7 +1081,7 @@ export async function runPiTurn({
       peakContext: state.peakContext ?? 0,
       thinkingChars: state.thinkingChars ?? 0,
       // How much code the run moved through its own tools.
-      fileWork: summarizeFileWork(state.fileWork),
+      agentWork: summarizeAgentWork(state.agentWork),
       // Already measured by the slot queue and thrown away until now: the time
       // this run spent waiting for a container of its own pool, which is time no
       // model spent working.

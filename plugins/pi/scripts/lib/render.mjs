@@ -232,7 +232,7 @@ function formatSessionLine(sessionId, settings) {
  * it read changed code it never looked at, and that is worth seeing next to the
  * answer rather than in a query somebody has to think to run.
  */
-export function formatFileWork(work) {
+export function formatAgentWork(work) {
   if (!work) {
     return null;
   }
@@ -251,6 +251,39 @@ export function formatFileWork(work) {
     parts.push(`${rereads} re-read(s)`);
   }
   return parts.join(" · ");
+}
+
+/**
+ * How the run went about it, in one line.
+ *
+ * Separate from the line counts because it answers a different question: not
+ * how much was done, but whether the doing was healthy. Each part is printed
+ * only when it has something to say — a clean run should not be padded with
+ * four zeroes.
+ */
+export function formatToolProfile(work) {
+  if (!work) {
+    return null;
+  }
+  const calls = Number(work.toolCalls) || 0;
+  const shell = Number(work.shellCalls) || 0;
+  const parts = [];
+  if (calls) {
+    parts.push(`${calls} tool call(s)${shell ? `, ${Math.round((100 * shell) / calls)}% shell` : ""}`);
+  }
+  const failed = [
+    Number(work.editErrors) ? `${work.editErrors} edit(s) matched nothing` : null,
+    Number(work.readErrors) ? `${work.readErrors} read(s) missed` : null,
+    Number(work.shellErrors) ? `${work.shellErrors} command(s) failed` : null
+  ].filter(Boolean);
+  parts.push(...failed);
+  if (typeof work.firstEditMs === "number") {
+    parts.push(`first edit after ${Math.round(work.firstEditMs / 1000)}s`);
+  }
+  if (Number(work.repeatCallRun) >= 3) {
+    parts.push(`${work.repeatCallRun} identical calls in a row`);
+  }
+  return parts.length ? parts.join(" · ") : null;
 }
 
 function renderRunHeader(title, { job, settings, execution }) {
@@ -277,7 +310,8 @@ function renderRunHeader(title, { job, settings, execution }) {
       : null,
     execution?.sessionId ? formatSessionLine(execution.sessionId, settings) : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,
-    formatFileWork(execution?.fileWork) ? `- File work: ${formatFileWork(execution.fileWork)}` : null,
+    formatAgentWork(execution?.agentWork) ? `- File work: ${formatAgentWork(execution.agentWork)}` : null,
+    formatToolProfile(execution?.agentWork) ? `- Tool profile: ${formatToolProfile(execution.agentWork)}` : null,
     // Printed whether or not it was reached: a run that stopped early is easier
     // to read when the ceiling it was given is on the same page.
     describeBudget(settings.budget) ? `- Budget: ${describeBudget(settings.budget)}` : null,
@@ -697,7 +731,7 @@ export function renderRunDetail(run) {
     }${run.duration_seconds ? ` · ${formatSeconds(run.duration_seconds)}` : ""}`,
     // `null` here means the run predates the measurement, which is not the same
     // as a run that touched no files — so the line is absent rather than zero.
-    formatFileWork({
+    formatAgentWork({
       linesRead: run.lines_read,
       linesWritten: run.lines_written,
       linesReplaced: run.lines_replaced,
@@ -705,7 +739,7 @@ export function renderRunDetail(run) {
       filesWritten: run.files_written,
       rereads: run.rereads
     })
-      ? `- File work: ${formatFileWork({
+      ? `- File work: ${formatAgentWork({
           linesRead: run.lines_read,
           linesWritten: run.lines_written,
           linesReplaced: run.lines_replaced,
@@ -713,6 +747,31 @@ export function renderRunDetail(run) {
           filesWritten: run.files_written,
           rereads: run.rereads
         })}`
+      : null,
+    formatToolProfile({
+      toolCalls: run.tool_calls,
+      shellCalls: run.shell_calls,
+      editErrors: run.edit_errors,
+      readErrors: run.read_errors,
+      shellErrors: run.shell_errors,
+      firstEditMs: run.first_edit_ms,
+      repeatCallRun: run.repeat_call_run
+    })
+      ? `- Tool profile: ${formatToolProfile({
+          toolCalls: run.tool_calls,
+          shellCalls: run.shell_calls,
+          editErrors: run.edit_errors,
+          readErrors: run.read_errors,
+          shellErrors: run.shell_errors,
+          firstEditMs: run.first_edit_ms,
+          repeatCallRun: run.repeat_call_run
+        })}`
+      : null,
+    // What reached the tree, next to what the tools reported writing: the gap
+    // between them is work that was done twice.
+    run.diff_added !== null && run.diff_added !== undefined
+      ? `- Delivered: +${run.diff_added} / −${run.diff_deleted ?? 0} line(s)` +
+        `${run.diff_untracked ? ` · ${run.diff_untracked} new file(s) never staged, not counted above` : ""}`
       : null
   ].filter(Boolean);
   lines.push(...meta, "");
@@ -931,13 +990,13 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
   if (rows.some((row) => Number(row.file_work_runs ?? 0) > 0)) {
     lines.push(
       "",
-      `| ${by} | замерено | прочитано/прогон | записано/прогон | заменено | читал:писал | перечитываний |`,
-      "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+      `| ${by} | замерено | прочитано/прогон | записано/прогон | заменено | читал:писал | перечитываний | сдано в дерево | цена строки |`,
+      "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     );
     for (const row of rows) {
       const measured = Number(row.file_work_runs ?? 0);
       if (!measured) {
-        lines.push(`| ${row.bucket} | 0 | н/д | н/д | н/д | н/д | н/д |`);
+        lines.push(`| ${row.bucket} | 0 | н/д | н/д | н/д | н/д | н/д | н/д | н/д |`);
         continue;
       }
       const read = Number(row.lines_read ?? 0);
@@ -947,10 +1006,22 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
       // нечем — прогон, не написавший ни строки, это законный исход (ревью,
       // исследование), и у него отношения нет, а не «бесконечность».
       const ratio = written > 0 ? `${(read / written).toFixed(1)}:1` : "—";
+      // Что дошло до дерева, против того, что инструменты отчитались написать.
+      const diffRuns = Number(row.diff_runs ?? 0);
+      const added = Number(row.diff_added ?? 0);
+      const untracked = Number(row.diff_untracked ?? 0);
+      const delivered = diffRuns
+        ? `+${formatCompact(added)}/−${formatCompact(Number(row.diff_deleted) || 0)}${untracked ? ` (+${untracked} вне индекса)` : ""}`
+        : "н/д";
+      // Цена строки — единственная величина здесь, сравнимая между моделями
+      // напрямую: дешёвая модель, переписывающая одно место шесть раз, дороже
+      // дорогой, сделавшей это с первого захода.
+      const diffCost = Number(row.diff_cost ?? 0);
+      const perLine = diffRuns && added > 0 && diffCost > 0 ? `$${(diffCost / added).toFixed(4)}` : "—";
       lines.push(
         `| ${row.bucket} | ${measured} из ${row.runs ?? 0} | ${formatCompact(Math.round(read / measured))} | ` +
           `${formatCompact(Math.round(written / measured))} | ${formatCompact(Number(row.lines_replaced) || 0)} | ` +
-          `${ratio} | ${row.rereads ?? 0} |`
+          `${ratio} | ${row.rereads ?? 0} | ${delivered} | ${perLine} |`
       );
     }
     lines.push(
@@ -960,9 +1031,60 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
         "бы отношение нечитаемым. «Читал:писал» — сколько строк кода прогон прочитал на каждую написанную; прогон, " +
         "который пишет больше, чем читает, меняет код, которого не видел. «Заменено» — строки, снесённые правками " +
         "(много при том же «записано» значит переписывание, а не дописывание). «Перечитывания» — повторные чтения " +
-        "уже прочитанного файла: агент либо потерял контекст, либо проверяет собственную правку. Колонка «замерено» " +
-        "говорит, на скольких прогонах корзины это вообще посчитано: у прогонов старше замера колонки пусты, и в " +
-        "средние они не входят."
+        "уже прочитанного файла: агент либо потерял контекст, либо проверяет собственную правку. «Сдано в дерево» — " +
+        "строки из `git diff` от точки старта прогона: расхождение с «записано» значит переписывание одного и того же " +
+        "места, то есть потраченные токены, от которых в дереве ничего не осталось; файлы, созданные и не добавленные " +
+        "в индекс, git не видит, и их число стоит рядом отдельно. «Цена строки» — стоимость прогонов с замеренным " +
+        "диффом, делённая на сданные строки: дешёвая модель, переписывающая одно место шесть раз, выходит дороже " +
+        "дорогой, сделавшей это с первого захода. Колонка «замерено» говорит, на скольких прогонах корзины это вообще " +
+        "посчитано: у прогонов старше замера колонки пусты, и в средние они не входят."
+    );
+  }
+
+  // Четвёртая таблица — чем агент работал. Третья говорит, сколько он наработал;
+  // эта — как он к этому шёл, и её колонки читаются вместе: много правок с
+  // ошибкой при высокой доле шелла значит, что модель обходит инструменты и
+  // промахивается мимо кода, которого не читала.
+  if (rows.some((row) => Number(row.shell_calls) || Number(row.edit_errors) || Number(row.first_edit_runs))) {
+    lines.push(
+      "",
+      `| ${by} | через шелл | правок мимо | чтений мимо | команд с ошибкой | до первой правки | повтор вызова |`,
+      "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
+    for (const row of rows) {
+      // Ноль ошибок у прогона, где их никто не считал, читается как «проверили
+      // и не нашли». Пусто — «н/д», как в остальных столбцах замера.
+      if (!Number(row.tool_profile_runs ?? 0)) {
+        lines.push(`| ${row.bucket} | н/д | н/д | н/д | н/д | н/д | н/д |`);
+        continue;
+      }
+      const shellDenominator = Number(row.shell_calls_denom ?? 0);
+      const shell = shellDenominator
+        ? `${Math.round((100 * (Number(row.shell_calls) || 0)) / shellDenominator)}%`
+        : "н/д";
+      const firstEditRuns = Number(row.first_edit_runs ?? 0);
+      // Прогоны, которые не правили ничего (ревью, исследование), в среднее не
+      // входят вовсе: у них нет первой правки, а не «ноль до неё».
+      const firstEdit = firstEditRuns
+        ? `${formatSeconds(Math.round(Number(row.first_edit_ms) / 1000))}${
+            firstEditRuns < Number(row.runs ?? 0) ? ` (по ${firstEditRuns})` : ""
+          }`
+        : "н/д";
+      lines.push(
+        `| ${row.bucket} | ${shell} | ${row.edit_errors ?? 0} | ${row.read_errors ?? 0} | ` +
+          `${row.shell_errors ?? 0} | ${firstEdit} | ${row.repeat_call_worst ?? 0} |`
+      );
+    }
+    lines.push(
+      "",
+      "Четвёртая таблица — чем агент работал. «Через шелл» — доля вызовов, ушедших в `bash`: она же размер слепого " +
+        "пятна третьей таблицы, потому что `cat` и `sed -i` в строчные счётчики не попадают. «Правок мимо» — правки, " +
+        "не нашедшие того, что собирались заменить: сильнейший из здешних признаков того, что модель пишет по памяти, " +
+        "а не по прочитанному (общий столбец `err` первой таблицы складывает это с упавшими командами, где виновата " +
+        "сама работа, а не модель). «До первой правки» — сколько прогон осматривался, прежде чем тронуть первый файл; " +
+        "снаружи «долго читал» и «долго думал» выглядят одинаково медленно, а лечатся по-разному. «Повтор вызова» — " +
+        "самая длинная серия одинаковых вызовов подряд: круг в действиях, тогда как «серия повторов» второй таблицы — " +
+        "круг в ответах."
     );
   }
 

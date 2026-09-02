@@ -395,7 +395,7 @@ export async function runTrackedJob(job, runner) {
       thinkingChars: execution.thinkingChars ?? 0,
       // Lines and files the run moved through its own tools: what it read
       // before changing anything, and how much it changed.
-      fileWork: execution.fileWork ?? null,
+      agentWork: execution.agentWork ?? null,
       // How many times the run continued itself past the output ceiling. A run
       // rescued repeatedly finished, but it says something about the model that
       // a clean run does not.

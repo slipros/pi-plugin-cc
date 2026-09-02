@@ -55,6 +55,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   files_read       INTEGER,
   files_written    INTEGER,
   rereads          INTEGER,
+  edit_errors      INTEGER,
+  read_errors      INTEGER,
+  shell_errors     INTEGER,
+  shell_calls      INTEGER,
+  first_edit_ms    INTEGER,
+  repeat_call_run  INTEGER,
+  diff_added       INTEGER,
+  diff_deleted     INTEGER,
+  diff_untracked   INTEGER,
   degraded         INTEGER DEFAULT 0,
   session_id       TEXT,
   background       INTEGER DEFAULT 0,
@@ -251,6 +260,31 @@ function addMissingColumns(db) {
     ["files_read", "INTEGER"],
     ["files_written", "INTEGER"],
     ["rereads", "INTEGER"],
+    // Профиль того, ЧЕМ агент работал, рядом с тем, сколько он наработал.
+    // Общий tool_errors складывает в одну кучу три разных диагноза: правка, не
+    // нашедшая строку, — это «пишет по памяти, а не по прочитанному»; чтение,
+    // не нашедшее файл, — «угадывает путь»; упавшая команда — «сломалась сама
+    // работа». Первое лечится брифом, последнее — не лечится вовсе.
+    ["edit_errors", "INTEGER"],
+    ["read_errors", "INTEGER"],
+    ["shell_errors", "INTEGER"],
+    // Доля работы, ушедшей в шелл, — она же размер слепого пятна строчных
+    // счётчиков: `bash: cat` и `sed -i` в них не попадают.
+    ["shell_calls", "INTEGER"],
+    // Сколько прогон осматривался до первой правки: отделяет «долго читал» от
+    // «долго думал», а снаружи оба выглядят одинаково медленно.
+    ["first_edit_ms", "INTEGER"],
+    // Самая длинная серия одинаковых вызовов подряд: круг в ДЕЙСТВИЯХ, тогда
+    // как repeat_run с прокси ловит круг в ОТВЕТАХ.
+    ["repeat_call_run", "INTEGER"],
+    // Что прогон сдал по git — против того, что его инструменты отчитались
+    // написать. Расхождение значит переписывание одного и того же места:
+    // токены потрачены, в дереве не осталось ничего.
+    ["diff_added", "INTEGER"],
+    ["diff_deleted", "INTEGER"],
+    // Файлы, созданные и не попавшие в индекс: `git diff` их не видит, и без
+    // этого числа diff_added у такого прогона выглядел бы честным нулём.
+    ["diff_untracked", "INTEGER"],
     // Профиль того, КАК модель ломается. Счётчики выше говорят, сколько работа
     // стоила; эти — по какой причине она буксовала, и это разные вопросы. Их
     // приходилось выкапывать из журналов событий вручную, по одному прогону за
@@ -345,6 +379,15 @@ const COLUMNS = [
   "files_read",
   "files_written",
   "rereads",
+  "edit_errors",
+  "read_errors",
+  "shell_errors",
+  "shell_calls",
+  "first_edit_ms",
+  "repeat_call_run",
+  "diff_added",
+  "diff_deleted",
+  "diff_untracked",
   "degraded",
   "session_id",
   "background",
@@ -422,12 +465,22 @@ export function jobToRow(job) {
     thinking_chars: job.thinkingChars ?? 0,
     // Файловая работа прогона. Без DEFAULT 0 в схеме: на прогонах старше замера
     // ноль был бы неотличим от честного «ничего не читал и не писал».
-    lines_read: job.fileWork?.linesRead ?? null,
-    lines_written: job.fileWork?.linesWritten ?? null,
-    lines_replaced: job.fileWork?.linesReplaced ?? null,
-    files_read: job.fileWork?.filesRead ?? null,
-    files_written: job.fileWork?.filesWritten ?? null,
-    rereads: job.fileWork?.rereads ?? null,
+    lines_read: job.agentWork?.linesRead ?? null,
+    lines_written: job.agentWork?.linesWritten ?? null,
+    lines_replaced: job.agentWork?.linesReplaced ?? null,
+    files_read: job.agentWork?.filesRead ?? null,
+    files_written: job.agentWork?.filesWritten ?? null,
+    rereads: job.agentWork?.rereads ?? null,
+    edit_errors: job.agentWork?.editErrors ?? null,
+    read_errors: job.agentWork?.readErrors ?? null,
+    shell_errors: job.agentWork?.shellErrors ?? null,
+    shell_calls: job.agentWork?.shellCalls ?? null,
+    first_edit_ms: job.agentWork?.firstEditMs ?? null,
+    repeat_call_run: job.agentWork?.repeatCallRun ?? null,
+    // Из git, а не из инструментов агента: сколько работы дошло до дерева.
+    diff_added: job.changes?.added ?? null,
+    diff_deleted: job.changes?.deleted ?? null,
+    diff_untracked: job.changes?.untracked ?? null,
     degraded: job.degraded ? 1 : 0,
     session_id: job.sessionId ?? null,
     background: job.background ? 1 : 0,
@@ -630,7 +683,28 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               SUM(lines_written)   AS lines_written,
               SUM(lines_replaced)  AS lines_replaced,
               SUM(rereads)         AS rereads,
-              SUM(lines_read IS NOT NULL) AS file_work_runs
+              SUM(lines_read IS NOT NULL) AS file_work_runs,
+              SUM(edit_errors IS NOT NULL) AS tool_profile_runs,
+              SUM(edit_errors)     AS edit_errors,
+              SUM(read_errors)     AS read_errors,
+              SUM(shell_errors)    AS shell_errors,
+              SUM(shell_calls)     AS shell_calls,
+              -- Знаменатель доли шелла — вызовы ТОЛЬКО тех прогонов, где шелл
+              -- вообще посчитан: делить на все вызовы корзины значило бы
+              -- занижать долю прогонами, про которые сказать нечего.
+              SUM(CASE WHEN shell_calls IS NOT NULL THEN tool_calls ELSE 0 END) AS shell_calls_denom,
+              AVG(first_edit_ms)   AS first_edit_ms,
+              SUM(first_edit_ms IS NOT NULL) AS first_edit_runs,
+              MAX(repeat_call_run) AS repeat_call_worst,
+              SUM(diff_added)      AS diff_added,
+              SUM(diff_deleted)    AS diff_deleted,
+              SUM(diff_untracked)  AS diff_untracked,
+              SUM(diff_added IS NOT NULL) AS diff_runs,
+              -- Стоимость считается только по прогонам с замеренным диффом:
+              -- полная стоимость корзины, делённая на строки её измеренной
+              -- части, дала бы цену строки выше настоящей во столько раз,
+              -- сколько прогонов замера не имеют.
+              SUM(CASE WHEN diff_added IS NOT NULL THEN cost ELSE 0 END) AS diff_cost
        FROM jobs ${where}
        GROUP BY bucket
        ORDER BY (SUM(input) + SUM(output)) DESC, bucket DESC

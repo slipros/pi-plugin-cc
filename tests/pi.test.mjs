@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { summarizeFileWork } from "../plugins/pi/scripts/lib/file-work.mjs";
+import { summarizeAgentWork } from "../plugins/pi/scripts/lib/agent-work.mjs";
 import {
   READ_ONLY_TOOLS,
   applyPiEvent,
@@ -348,7 +348,7 @@ test("the event stream counts the lines the run read and wrote", () => {
     { type: "tool_execution_end", toolCallId: "t2", toolName: "edit", result: "ok" }
   ]);
 
-  const work = summarizeFileWork(state.fileWork);
+  const work = summarizeAgentWork(state.agentWork);
   assert.equal(work.linesRead, 3);
   assert.equal(work.linesWritten, 2);
   assert.equal(work.linesReplaced, 1);
@@ -364,7 +364,7 @@ test("a result event without its tool name is still attributed to the call that 
     { type: "tool_execution_end", toolCallId: "t1", result: "a\nb\n" }
   ]);
 
-  const work = summarizeFileWork(state.fileWork);
+  const work = summarizeAgentWork(state.agentWork);
   assert.equal(work.linesRead, 2);
   assert.equal(work.filesRead, 1);
 });

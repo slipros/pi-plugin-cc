@@ -97,7 +97,7 @@ export function renderSetupReport(report) {
  * and the caller should not have to open a system prompt to answer it —
  * reading prompts to choose costs more than the choice.
  */
-export function presetLines(presets, capabilities = {}) {
+export function presetLines(presets, capabilities = {}, limits = {}) {
   const names = Object.keys(presets ?? {});
   if (!names.length) {
     return ["- none configured (add a `presets` block to `.claude/pi/config.json`)"];
@@ -105,8 +105,14 @@ export function presetLines(presets, capabilities = {}) {
   return names.map((name) => {
     const preset = presets[name] ?? {};
     const caps = capabilities[name] ?? {};
+    // The output ceiling belongs next to the model: a run that hits it ends
+    // mid-sentence with a "completed" status, and the choice between two presets
+    // is often exactly this number. Absent when the catalogue was unreachable.
+    const limit = limits[preset.model ?? ""] ?? null;
     const details = [
-      preset.model ? `model \`${preset.model}\`` : null,
+      preset.model
+        ? `model \`${preset.model}\`${limit ? ` (ctx ${limit.context ?? "?"} · out ${limit.maxOutput ?? "?"})` : ""}`
+        : null,
       preset.provider ? `provider \`${preset.provider}\`` : null,
       preset.thinking ? `thinking \`${preset.thinking}\`` : null,
       preset.systemPrompt ? `prompt \`${preset.systemPrompt}\`` : null,
@@ -133,8 +139,8 @@ export function presetLines(presets, capabilities = {}) {
  * call takes over a second, which is too slow for anything that asks on every
  * invocation, such as a hook.
  */
-export function renderPresetsReport({ presets = {}, prompts = [], capabilities = {} } = {}) {
-  const lines = ["# pi presets", "", ...presetLines(presets, capabilities)];
+export function renderPresetsReport({ presets = {}, prompts = [], capabilities = {}, limits = {} } = {}) {
+  const lines = ["# pi presets", "", ...presetLines(presets, capabilities, limits)];
   if (prompts.length) {
     lines.push("", "## System prompts", "", prompts.map((name) => `- \`${name}\``).join("\n"));
   }

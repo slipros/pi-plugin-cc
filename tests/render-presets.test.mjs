@@ -61,3 +61,20 @@ test("the presets report stands on its own, without the catalogue", () => {
 test("no presets configured says so, instead of printing an empty list", () => {
   assert.match(renderPresetsReport({ presets: {} }), /none configured/);
 });
+
+// Потолок вывода — не украшение: прогон, упёршийся в него, обрывается на
+// полуслове и закрывается статусом «completed», а разница между двумя пресетами
+// часто ровно в этом числе. Каталог недоступен — отчёт печатается как прежде.
+test("the output ceiling shows up next to the model when limits are known", () => {
+  const presets = { dev: { description: "пишет код", model: "prov/m1" } };
+  const limits = { "prov/m1": { context: "1M", maxOutput: "65.5K" } };
+  const out = renderPresetsReport({ presets, limits });
+  assert.match(out, /model `prov\/m1` \(ctx 1M · out 65\.5K\)/);
+});
+
+test("without limits the presets report is unchanged", () => {
+  const presets = { dev: { description: "пишет код", model: "prov/m1" } };
+  const out = renderPresetsReport({ presets });
+  assert.match(out, /model `prov\/m1`,?/);
+  assert.doesNotMatch(out, /ctx /);
+});

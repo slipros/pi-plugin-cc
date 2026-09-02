@@ -1014,6 +1014,21 @@ async function commandPresets(argv, workspaceRoot) {
     // wrote will eventually write one back into the config.
     capabilities: allPresetCapabilities(config)
   };
+  // Model limits cost a pass over the catalogue (~1s), so they are fetched only
+  // for the human report: `presets --json` is what hooks call on every rejected
+  // Agent call, and it must stay instant. Catalogue unreachable — the report
+  // prints exactly as before rather than failing over a decoration.
+  if (!flags.json) {
+    try {
+      const limits = {};
+      for (const entry of listModels(PI_BINARY, { cwd: workspaceRoot })) {
+        limits[entry.id] = { context: entry.context, maxOutput: entry.maxOutput };
+      }
+      payload.limits = limits;
+    } catch {
+      // no limits in the report
+    }
+  }
   output(renderPresetsReport(payload), payload, Boolean(flags.json));
   return 0;
 }

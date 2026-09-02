@@ -13,6 +13,13 @@ import { openGitProxy, withGitProxy } from "./git-proxy.mjs";
 import { settleProxyPorts } from "./proxy-bind.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
 
+import {
+  createFileWorkState,
+  mergeFileWork,
+  noteToolEnd,
+  noteToolStart,
+  summarizeFileWork
+} from "./file-work.mjs";
 export const PI_BINARY = process.env.PI_PLUGIN_BINARY?.trim() || "pi";
 
 /**
@@ -363,6 +370,11 @@ export function applyPiEvent(state, event, now = Date.now()) {
       const summary = summarizeToolCall(event.toolName, event.args);
       state.toolCalls.push(summary);
       timing.toolStartedAt.set(toolKey(event), now);
+      noteToolStart((state.fileWork ??= createFileWorkState()), event.toolName, event.args);
+      (state.openToolCalls ??= new Map()).set(toolKey(event), {
+        name: event.toolName,
+        args: event.args
+      });
       return { phase: "working", message: summary };
     }
     case "tool_execution_end": {
@@ -371,6 +383,15 @@ export function applyPiEvent(state, event, now = Date.now()) {
         timing.toolIntervals.push([startedAt, now]);
         timing.toolStartedAt.delete(toolKey(event));
       }
+      const opened = (state.openToolCalls ??= new Map()).get(toolKey(event));
+      state.openToolCalls.delete(toolKey(event));
+      noteToolEnd(
+        (state.fileWork ??= createFileWorkState()),
+        event.toolName ?? opened?.name,
+        opened?.args,
+        event.result,
+        Boolean(event.isError)
+      );
       if (event.isError) {
         state.toolErrors += 1;
         return { phase: "working", message: `${event.toolName ?? "tool"} reported an error.` };
@@ -475,6 +496,11 @@ export function createTurnState() {
     timing: createTimingState(),
     peakContext: 0,
     thinkingChars: 0,
+    fileWork: createFileWorkState(),
+    // Arguments of tools still running, so the result event can be attributed
+    // to the file its call named: `tool_execution_end` carries the answer but
+    // not always the request.
+    openToolCalls: new Map(),
     model: null,
     thinkingLevel: null,
     stopReason: null,
@@ -782,6 +808,7 @@ export function mergeRecoveredRun(first, next) {
     timing: mergeTiming(first.timing, next.timing),
     peakContext: Math.max(Number(first.peakContext) || 0, Number(next.peakContext) || 0),
     thinkingChars: sum(first.thinkingChars, next.thinkingChars),
+    fileWork: mergeFileWork(first.fileWork, next.fileWork),
     slotWaitMs: sum(first.slotWaitMs, next.slotWaitMs),
     recoveredTruncations: (Number(first.recoveredTruncations) || 0) + 1,
     proxyStats: next.proxyStats ?? first.proxyStats
@@ -1050,6 +1077,8 @@ export async function runPiTurn({
       timing: summarizeTiming(state.timing),
       peakContext: state.peakContext ?? 0,
       thinkingChars: state.thinkingChars ?? 0,
+      // How much code the run moved through its own tools.
+      fileWork: summarizeFileWork(state.fileWork),
       // Already measured by the slot queue and thrown away until now: the time
       // this run spent waiting for a container of its own pool, which is time no
       // model spent working.

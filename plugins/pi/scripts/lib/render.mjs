@@ -224,6 +224,35 @@ function formatSessionLine(sessionId, settings) {
   return `- pi session: \`${sessionId}\` (continue with \`continue ${sessionId}\`; ${how})`;
 }
 
+/**
+ * How much code the run moved, in one line.
+ *
+ * Read and written are shown together on purpose: either number alone says
+ * little, while the pair is the shape of the work — a run that wrote more than
+ * it read changed code it never looked at, and that is worth seeing next to the
+ * answer rather than in a query somebody has to think to run.
+ */
+export function formatFileWork(work) {
+  if (!work) {
+    return null;
+  }
+  const read = Number(work.linesRead) || 0;
+  const written = Number(work.linesWritten) || 0;
+  const replaced = Number(work.linesReplaced) || 0;
+  const rereads = Number(work.rereads) || 0;
+  if (!read && !written && !replaced) {
+    return null;
+  }
+  const parts = [
+    `read ${read} line(s) in ${Number(work.filesRead) || 0} file(s)`,
+    `wrote ${written}${replaced ? ` (replacing ${replaced})` : ""} in ${Number(work.filesWritten) || 0} file(s)`
+  ];
+  if (rereads) {
+    parts.push(`${rereads} re-read(s)`);
+  }
+  return parts.join(" · ");
+}
+
 function renderRunHeader(title, { job, settings, execution }) {
   // The effective thinking level comes back from pi's own state; the requested
   // one is only a fallback for engines that never report it.
@@ -248,6 +277,7 @@ function renderRunHeader(title, { job, settings, execution }) {
       : null,
     execution?.sessionId ? formatSessionLine(execution.sessionId, settings) : null,
     formatUsage(execution?.usage) ? `- Usage: ${formatUsage(execution.usage)}` : null,
+    formatFileWork(execution?.fileWork) ? `- File work: ${formatFileWork(execution.fileWork)}` : null,
     // Printed whether or not it was reached: a run that stopped early is easier
     // to read when the ceiling it was given is on the same page.
     describeBudget(settings.budget) ? `- Budget: ${describeBudget(settings.budget)}` : null,
@@ -664,7 +694,26 @@ export function renderRunDetail(run) {
     run.sandbox ? `- Sandbox: ${run.sandbox}` : null,
     `- Usage: ${formatTokens(Number(run.input ?? 0) + Number(run.output ?? 0) + Number(run.cache_read ?? 0))} tokens${
       formatCost(run.cost) ? ` · ${formatCost(run.cost)}` : ""
-    }${run.duration_seconds ? ` · ${formatSeconds(run.duration_seconds)}` : ""}`
+    }${run.duration_seconds ? ` · ${formatSeconds(run.duration_seconds)}` : ""}`,
+    // `null` here means the run predates the measurement, which is not the same
+    // as a run that touched no files — so the line is absent rather than zero.
+    formatFileWork({
+      linesRead: run.lines_read,
+      linesWritten: run.lines_written,
+      linesReplaced: run.lines_replaced,
+      filesRead: run.files_read,
+      filesWritten: run.files_written,
+      rereads: run.rereads
+    })
+      ? `- File work: ${formatFileWork({
+          linesRead: run.lines_read,
+          linesWritten: run.lines_written,
+          linesReplaced: run.lines_replaced,
+          filesRead: run.files_read,
+          filesWritten: run.files_written,
+          rereads: run.rereads
+        })}`
+      : null
   ].filter(Boolean);
   lines.push(...meta, "");
 
@@ -874,6 +923,46 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
         "в потолок и потому не меняет никаких других полей. «Отправлено вмешательств» — сколько раз плагин отправил " +
         "сообщение в сессию, пытаясь прервать круг в рассуждении; подхватил ли его агент, неизвестно — RPC подтверждает " +
         "доставку команды, а не то, что модель на неё среагировала."
+    );
+  }
+
+  // Третья таблица — про работу с кодом, а не про стоимость и не про поломку.
+  // Вопрос у неё свой: сколько кода прогон прочитал, прежде чем его менять.
+  if (rows.some((row) => Number(row.file_work_runs ?? 0) > 0)) {
+    lines.push(
+      "",
+      `| ${by} | замерено | прочитано/прогон | записано/прогон | заменено | читал:писал | перечитываний |`,
+      "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
+    for (const row of rows) {
+      const measured = Number(row.file_work_runs ?? 0);
+      if (!measured) {
+        lines.push(`| ${row.bucket} | 0 | н/д | н/д | н/д | н/д | н/д |`);
+        continue;
+      }
+      const read = Number(row.lines_read ?? 0);
+      const written = Number(row.lines_written ?? 0);
+      // Отношение — то, ради чего таблица и заведена: одно из чисел само по
+      // себе не говорит ничего, а пара говорит форму работы. Делить на ноль
+      // нечем — прогон, не написавший ни строки, это законный исход (ревью,
+      // исследование), и у него отношения нет, а не «бесконечность».
+      const ratio = written > 0 ? `${(read / written).toFixed(1)}:1` : "—";
+      lines.push(
+        `| ${row.bucket} | ${measured} из ${row.runs ?? 0} | ${formatCompact(Math.round(read / measured))} | ` +
+          `${formatCompact(Math.round(written / measured))} | ${formatCompact(Number(row.lines_replaced) || 0)} | ` +
+          `${ratio} | ${row.rereads ?? 0} |`
+      );
+    }
+    lines.push(
+      "",
+      "Третья таблица — про работу с кодом. Считается по вызовам собственных инструментов агента (`read`, `write`, " +
+        "`edit`): чтение через `bash: cat` сюда не попадает и намеренно не угадывается — примесь вывода шелла сделала " +
+        "бы отношение нечитаемым. «Читал:писал» — сколько строк кода прогон прочитал на каждую написанную; прогон, " +
+        "который пишет больше, чем читает, меняет код, которого не видел. «Заменено» — строки, снесённые правками " +
+        "(много при том же «записано» значит переписывание, а не дописывание). «Перечитывания» — повторные чтения " +
+        "уже прочитанного файла: агент либо потерял контекст, либо проверяет собственную правку. Колонка «замерено» " +
+        "говорит, на скольких прогонах корзины это вообще посчитано: у прогонов старше замера колонки пусты, и в " +
+        "средние они не входят."
     );
   }
 

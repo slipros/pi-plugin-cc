@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   span_ms          INTEGER DEFAULT 0,
   peak_context     INTEGER DEFAULT 0,
   thinking_chars   INTEGER DEFAULT 0,
+  lines_read       INTEGER,
+  lines_written    INTEGER,
+  lines_replaced   INTEGER,
+  files_read       INTEGER,
+  files_written    INTEGER,
+  rereads          INTEGER,
   degraded         INTEGER DEFAULT 0,
   session_id       TEXT,
   background       INTEGER DEFAULT 0,
@@ -229,6 +235,22 @@ function addMissingColumns(db) {
     // Time this run spent queued for a slot of its own pool — already measured
     // by `awaitSandboxSlot` and thrown away until now.
     ["slot_wait_ms", "INTEGER DEFAULT 0"],
+    // Сколько кода прогон реально сдвинул: строки, прочитанные им перед
+    // правкой, и строки, которые он написал. Счётчики токенов отвечают, во
+    // сколько обошлась работа, тайминги — куда ушло время; ни те, ни другие не
+    // отвечают, читал ли агент код, прежде чем его менять. Прогон, написавший
+    // 300 строк при 40 прочитанных, и прогон, написавший 30 при 900
+    // прочитанных, в журнале до сих пор выглядели одинаково.
+    //
+    // Без DEFAULT 0 — по той же причине, что think_p50_chars ниже: ноль от
+    // ALTER TABLE здесь неотличим от измеренного нуля (прогон, который ничего
+    // не читал, — законный исход и сам по себе находка).
+    ["lines_read", "INTEGER"],
+    ["lines_written", "INTEGER"],
+    ["lines_replaced", "INTEGER"],
+    ["files_read", "INTEGER"],
+    ["files_written", "INTEGER"],
+    ["rereads", "INTEGER"],
     // Профиль того, КАК модель ломается. Счётчики выше говорят, сколько работа
     // стоила; эти — по какой причине она буксовала, и это разные вопросы. Их
     // приходилось выкапывать из журналов событий вручную, по одному прогону за
@@ -317,6 +339,12 @@ const COLUMNS = [
   "span_ms",
   "peak_context",
   "thinking_chars",
+  "lines_read",
+  "lines_written",
+  "lines_replaced",
+  "files_read",
+  "files_written",
+  "rereads",
   "degraded",
   "session_id",
   "background",
@@ -392,6 +420,14 @@ export function jobToRow(job) {
     span_ms: job.timing?.spanMs ?? 0,
     peak_context: job.peakContext ?? 0,
     thinking_chars: job.thinkingChars ?? 0,
+    // Файловая работа прогона. Без DEFAULT 0 в схеме: на прогонах старше замера
+    // ноль был бы неотличим от честного «ничего не читал и не писал».
+    lines_read: job.fileWork?.linesRead ?? null,
+    lines_written: job.fileWork?.linesWritten ?? null,
+    lines_replaced: job.fileWork?.linesReplaced ?? null,
+    files_read: job.fileWork?.filesRead ?? null,
+    files_written: job.fileWork?.filesWritten ?? null,
+    rereads: job.fileWork?.rereads ?? null,
     degraded: job.degraded ? 1 : 0,
     session_id: job.sessionId ?? null,
     background: job.background ? 1 : 0,
@@ -431,6 +467,11 @@ export function recordJob(handle, job) {
   }
   const row = jobToRow(job);
   const placeholders = COLUMNS.map((column) => `$${column}`).join(", ");
+  // Счётчики, которые не должны откатываться назад, обновляются через MAX —
+  // но только те, у которых есть DEFAULT 0. У колонок без него (файловая
+  // работа, профиль поломки) пустое значение это SQL NULL, а `MAX(NULL, 5)` в
+  // SQLite равен NULL: первая запись прогона, сделанная при старте, обнуляла бы
+  // всё, что измерено к концу. Им нужен COALESCE, как всем остальным.
   const updates = COLUMNS.filter((column) => column !== "id")
     .map((column) =>
       ["input", "output", "cache_read", "cache_write", "reasoning", "cost", "turns", "tool_calls", "tool_errors", "model_ms", "tool_ms", "span_ms", "peak_context", "thinking_chars", "req_count", "req_failed", "ttft_p50_ms", "gen_ms", "gen_out_tokens", "slot_wait_ms"].includes(
@@ -580,7 +621,16 @@ export function queryStats(handle, { by = "day", days = 30, limit = 50 } = {}) {
               SUM(turns_idle IS NOT NULL) AS turns_idle_runs,
               SUM(answers_cut)     AS answers_cut,
               MAX(repeat_run)      AS repeat_worst,
-              SUM(loop_nudges)     AS loop_nudges
+              SUM(loop_nudges)     AS loop_nudges,
+              -- Сколько кода прогоны этой корзины реально сдвинули. Знаменатель
+              -- отдельный: колонки без DEFAULT, и прогоны старше замера дают
+              -- NULL, а не ноль — делить их на COUNT(*) значило бы занижать
+              -- всё, что измерено, ровно на долю истории.
+              SUM(lines_read)      AS lines_read,
+              SUM(lines_written)   AS lines_written,
+              SUM(lines_replaced)  AS lines_replaced,
+              SUM(rereads)         AS rereads,
+              SUM(lines_read IS NOT NULL) AS file_work_runs
        FROM jobs ${where}
        GROUP BY bucket
        ORDER BY (SUM(input) + SUM(output)) DESC, bucket DESC

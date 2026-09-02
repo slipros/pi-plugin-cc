@@ -167,3 +167,56 @@ test("a job with no text still maps onto the row", () => {
   assert.equal(row.result_text, null);
   assert.equal(row.settings, null);
 });
+
+test("file work survives the second write of the same run", () => {
+  // A run is recorded twice: once when it starts, once when it ends. The
+  // upsert keeps counters from going backwards with MAX(), and MAX(NULL, 5) in
+  // SQLite is NULL — so a column without DEFAULT 0 (file work, and the failure
+  // profile beside it) has to be merged with COALESCE instead. It was not, and
+  // every measured run landed in the journal empty.
+  withJournal((handle) => {
+    recordJob(handle, {
+      id: "delegate-two-writes",
+      kind: "delegate",
+      status: "running",
+      createdAt: new Date().toISOString()
+    });
+    recordJob(handle, {
+      id: "delegate-two-writes",
+      kind: "delegate",
+      status: "completed",
+      createdAt: new Date().toISOString(),
+      fileWork: {
+        linesRead: 412,
+        linesWritten: 87,
+        linesReplaced: 31,
+        filesRead: 9,
+        filesWritten: 4,
+        rereads: 2
+      }
+    });
+
+    const run = queryRun(handle, "delegate-two-writes");
+    assert.equal(run.lines_read, 412);
+    assert.equal(run.lines_written, 87);
+    assert.equal(run.lines_replaced, 31);
+    assert.equal(run.files_read, 9);
+    assert.equal(run.files_written, 4);
+    assert.equal(run.rereads, 2);
+  });
+});
+
+test("a run that predates the measurement stores null, not a measured zero", () => {
+  withJournal((handle) => {
+    recordJob(handle, {
+      id: "delegate-old",
+      kind: "delegate",
+      status: "completed",
+      createdAt: new Date().toISOString()
+    });
+
+    const run = queryRun(handle, "delegate-old");
+    assert.equal(run.lines_read, null);
+    assert.equal(run.files_written, null);
+  });
+});

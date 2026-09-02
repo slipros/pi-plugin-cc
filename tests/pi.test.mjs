@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { summarizeFileWork } from "../plugins/pi/scripts/lib/file-work.mjs";
 import {
   READ_ONLY_TOOLS,
   applyPiEvent,
@@ -330,4 +331,40 @@ test("a run already ending is never continued", () => {
 
 test("turning recovery off leaves nothing to continue", () => {
   assert.equal(recoveryDecision({ stopReason: "length", consecutive: 0, consecutiveLimit: 0 }), "stop");
+});
+
+test("the event stream counts the lines the run read and wrote", () => {
+  const { state } = drain([
+    { type: "session", id: "session-1", cwd: "/repo" },
+    { type: "turn_start" },
+    { type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "src/a.ts" } },
+    { type: "tool_execution_end", toolCallId: "t1", toolName: "read", result: "one\ntwo\nthree\n" },
+    {
+      type: "tool_execution_start",
+      toolCallId: "t2",
+      toolName: "edit",
+      args: { path: "src/a.ts", old_string: "one", new_string: "ONE\nplus" }
+    },
+    { type: "tool_execution_end", toolCallId: "t2", toolName: "edit", result: "ok" }
+  ]);
+
+  const work = summarizeFileWork(state.fileWork);
+  assert.equal(work.linesRead, 3);
+  assert.equal(work.linesWritten, 2);
+  assert.equal(work.linesReplaced, 1);
+  assert.equal(work.filesRead, 1);
+  assert.equal(work.filesWritten, 1);
+});
+
+test("a result event without its tool name is still attributed to the call that opened it", () => {
+  // pi versions differ in what they echo back on the end event; the file the
+  // read was about is only certain from the start event.
+  const { state } = drain([
+    { type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "src/a.ts" } },
+    { type: "tool_execution_end", toolCallId: "t1", result: "a\nb\n" }
+  ]);
+
+  const work = summarizeFileWork(state.fileWork);
+  assert.equal(work.linesRead, 2);
+  assert.equal(work.filesRead, 1);
 });

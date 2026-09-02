@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveRunSettings } from "./config.mjs";
-import { isSandboxed, normalizeSandbox, sandboxMountGaps } from "./sandbox.mjs";
+import { attachMounts, isSandboxed, normalizeSandbox, sandboxMountGaps } from "./sandbox.mjs";
 
 /**
  * What an agent can do beyond what its model can do.
@@ -127,7 +127,16 @@ export function presetCapabilities(config, presetName, { homeDir = os.homedir() 
   // Equipment named by the preset that the container will not have. Listed here
   // so the answer is visible where agents are CHOSEN, not only when one is
   // launched: the run itself refuses, but by then a wave is already half issued.
-  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {});
+  // Mounts named outside the sandbox descriptor — by the preset or a flag — are
+  // attached to it before the run checks for gaps (`buildRunSettings`), so the
+  // same attachment has to happen here. Reading the descriptor alone reported
+  // every preset that carries its skills in `mounts` as unequipped, while the
+  // run it describes started fine: a warning that fires on working presets is
+  // what teaches a reader to ignore the one that is real.
+  const sandbox = attachMounts(
+    normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {}),
+    settings.mounts ?? []
+  );
   const mountGaps = sandboxMountGaps(sandbox, {
     workspaceRoot: process.cwd(),
     extensions: settings.extensions ?? [],

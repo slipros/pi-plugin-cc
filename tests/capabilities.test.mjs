@@ -159,6 +159,30 @@ test("equipment the container will not have is named in the preset line", () => 
   assert.match(line, /NOT MOUNTED: \/pi-skills\/git-commit/);
 });
 
+// Пресет носит оснастку в собственных `mounts`, рядом с `skills`, а не внутри
+// дескриптора песочницы. Прогон склеивает одно с другим перед проверкой, и
+// витрина обязана склеивать так же: иначе рабочий пресет объявляется
+// неоснащённым, и предупреждение перестают читать до того, как оно станет
+// правдой.
+test("mounts named by the preset itself close the gap the same way", () => {
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+  fs.mkdirSync(path.join(hostDir, "git-commit"));
+  try {
+    const config = configWith({
+      dev: {
+        sandbox: { profile: "bare" },
+        skills: ["/pi-skills/git-commit"],
+        mounts: [`${hostDir}/git-commit:/pi-skills/git-commit:ro`]
+      }
+    });
+    assert.deepEqual(presetCapabilities(config, "dev").mountGaps, []);
+    const [line] = presetLines(config.presets, allPresetCapabilities(config));
+    assert.doesNotMatch(line, /NOT MOUNTED/);
+  } finally {
+    fs.rmSync(hostDir, { recursive: true, force: true });
+  }
+});
+
 test("a preset whose equipment is mounted reports no gaps", () => {
   // Real directory on the host side: a mount pointing at nothing is itself a gap
   // (docker would give the container an empty directory), and that rule has its

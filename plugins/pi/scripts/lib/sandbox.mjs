@@ -869,6 +869,17 @@ export function sandboxMountGaps(sandbox, { workspaceRoot, extensions = [], skil
     ...(sandbox.mounts ?? []).map((mount) => mount.split(":")[1]).filter(Boolean)
   ];
 
+  // The mount that would carry a container path, if any. Named mounts (docker
+  // volumes) have no host side to check — only a path does.
+  const coveringMount = (value) =>
+    (sandbox.mounts ?? [])
+      .map((mount) => {
+        const [host, target] = String(mount).split(":");
+        return { host, target };
+      })
+      .filter(({ host, target }) => host && target && /^[~./]/.test(host))
+      .find(({ target }) => value === target || value.startsWith(`${target}/`)) ?? null;
+
   const root = path.resolve(workspaceRoot ?? ".");
   const gaps = [];
   for (const [label, entries] of [["extension", extensions], ["skill", skills]]) {
@@ -878,11 +889,22 @@ export function sandboxMountGaps(sandbox, { workspaceRoot, extensions = [], skil
         continue; // npm: / git: sources are resolved inside the container.
       }
       if (containerPaths.some((target) => value === target || value.startsWith(`${target}/`))) {
-        continue; // Already a path inside the container.
+        // Inside the container — but a mount whose HOST side does not exist is
+        // docker creating an empty directory, and the equipment is just as
+        // absent as with no mount at all. Same failure, quieter cause.
+        const mount = coveringMount(value);
+        if (mount) {
+          const hostPath = path.resolve(root, mount.host.replace(/^~(?=\/|$)/, os.homedir()));
+          const suffix = value.slice(mount.target.length);
+          if (!fs.existsSync(path.join(hostPath, suffix))) {
+            gaps.push({ label, value, reason: "missing-host-path", hostPath: path.join(hostPath, suffix) });
+          }
+        }
+        continue;
       }
       const resolved = path.resolve(root, value.replace(/^~(?=\/|$)/, os.homedir()));
       if (!resolved.startsWith(`${root}${path.sep}`) && resolved !== root) {
-        gaps.push({ label, value });
+        gaps.push({ label, value, reason: "unmounted" });
       }
     }
   }
@@ -903,9 +925,11 @@ export function sandboxRunWarnings(sandbox, { workspaceRoot, extensions = [], sk
   }
   warnings.push(...relaxedIsolationWarnings(sandbox));
 
-  for (const { label, value } of sandboxMountGaps(sandbox, { workspaceRoot, extensions, skills })) {
+  for (const gap of sandboxMountGaps(sandbox, { workspaceRoot, extensions, skills })) {
     warnings.push(
-      `The ${label} \`${value}\` is a host path outside the workspace; it does not exist inside the sandbox.`
+      gap.reason === "missing-host-path"
+        ? `The ${gap.label} \`${gap.value}\` is mounted from \`${gap.hostPath}\`, which does not exist — the container would see an empty directory.`
+        : `The ${gap.label} \`${gap.value}\` is a host path outside the workspace; it does not exist inside the sandbox.`
     );
   }
 

@@ -152,7 +152,7 @@ test("a preset with nothing computed keeps its line unchanged", () => {
 test("equipment the container will not have is named in the preset line", () => {
   const config = configWith(
     { dev: { sandbox: { profile: "half" } } },
-    { half: { image: "img", skills: ["/pi-skills/git-commit"], mounts: ["~/x:/pi-skills/vision:ro"] } }
+    { half: { image: "img", skills: ["/pi-skills/git-commit"], mounts: ["~/x:/pi-skills-other:ro"] } }
   );
   assert.deepEqual(presetCapabilities(config, "dev").mountGaps, ["/pi-skills/git-commit"]);
   const [line] = presetLines(config.presets, allPresetCapabilities(config));
@@ -160,11 +160,20 @@ test("equipment the container will not have is named in the preset line", () => 
 });
 
 test("a preset whose equipment is mounted reports no gaps", () => {
-  const config = configWith(
-    { dev: { sandbox: { profile: "whole" } } },
-    { whole: { image: "img", skills: ["/pi-skills/git-commit"], mounts: ["~/skills:/pi-skills:ro"] } }
-  );
-  assert.deepEqual(presetCapabilities(config, "dev").mountGaps, []);
-  const [line] = presetLines(config.presets, allPresetCapabilities(config));
-  assert.doesNotMatch(line, /НЕ СМОНТИРОВАНО/);
+  // Real directory on the host side: a mount pointing at nothing is itself a gap
+  // (docker would give the container an empty directory), and that rule has its
+  // own test in sandbox.test.mjs.
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-skills-"));
+  fs.mkdirSync(path.join(hostDir, "git-commit"));
+  try {
+    const config = configWith(
+      { dev: { sandbox: { profile: "whole" } } },
+      { whole: { image: "img", skills: ["/pi-skills/git-commit"], mounts: [`${hostDir}:/pi-skills:ro`] } }
+    );
+    assert.deepEqual(presetCapabilities(config, "dev").mountGaps, []);
+    const [line] = presetLines(config.presets, allPresetCapabilities(config));
+    assert.doesNotMatch(line, /НЕ СМОНТИРОВАНО/);
+  } finally {
+    fs.rmSync(hostDir, { recursive: true, force: true });
+  }
 });

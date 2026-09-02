@@ -291,13 +291,33 @@ test("a mount can name the host side with ~", () => {
 });
 
 test("a path that the profile mounts into the container is not warned about", () => {
-  const sandbox = normalizeSandbox({ mounts: ["~/.pi/agent/extensions:/pi-agent/host-extensions:ro"] });
-  const warnings = sandboxRunWarnings(sandbox, {
-    workspaceRoot: "/work",
-    extensions: ["/pi-agent/host-extensions/custom-gcl-precommit.ts", "/home/me/elsewhere/ext.ts"]
-  });
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /elsewhere/);
+  // The host side is a real directory here: a mount whose source does not exist
+  // is its own gap (docker would hand the container an empty directory), and a
+  // fixture on an invented path would be testing that rule instead of this one.
+  const hostDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-mounts-"));
+  fs.writeFileSync(path.join(hostDir, "custom-gcl-precommit.ts"), "");
+  try {
+    const sandbox = normalizeSandbox({ mounts: [`${hostDir}:/pi-agent/host-extensions:ro`] });
+    const warnings = sandboxRunWarnings(sandbox, {
+      workspaceRoot: "/work",
+      extensions: ["/pi-agent/host-extensions/custom-gcl-precommit.ts", "/home/me/elsewhere/ext.ts"]
+    });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /elsewhere/);
+  } finally {
+    fs.rmSync(hostDir, { recursive: true, force: true });
+  }
+});
+
+test("a mount whose host side is missing is a gap of its own", () => {
+  // The quieter half of the same failure: the profile mounts the directory, so
+  // the path exists inside the container — empty. The skill is just as absent as
+  // with no mount at all, and the run looks entirely normal.
+  const sandbox = normalizeSandbox({ mounts: [`${path.join(os.tmpdir(), "pi-plugin-no-such-dir")}:/pi-skills:ro`] });
+  const gaps = sandboxMountGaps(sandbox, { workspaceRoot: "/work", skills: ["/pi-skills/git-commit"] });
+  assert.equal(gaps.length, 1);
+  assert.equal(gaps[0].reason, "missing-host-path");
+  assert.match(sandboxRunWarnings(sandbox, { workspaceRoot: "/work", skills: ["/pi-skills/git-commit"] })[0], /does not exist/);
 });
 
 const PROFILES = {
@@ -821,10 +841,13 @@ test("relaxed-isolation warnings name what a profile gave away through args", ()
 // предупреждений: `delegate` превращает её в отказ запуска. Пропуск такого случая
 // стоил месяцев прогонов, где агент работал без объявленных ему скиллов.
 test("equipment outside the container is reported as a gap, not just as prose", () => {
-  const sandbox = normalizeSandbox({ mounts: ["~/skills:/pi-skills:ro"] });
-  const args = { workspaceRoot: "/work", skills: ["/pi-skills/git-commit", "/srv/not-mounted"], extensions: [] };
+  // `~/skills` need not exist: the entry under test is the one no mount covers.
+  const sandbox = normalizeSandbox({ mounts: ["~/skills:/pi-skills-unused:ro"] });
+  const args = { workspaceRoot: "/work", skills: ["/srv/not-mounted"], extensions: [] };
 
-  assert.deepEqual(sandboxMountGaps(sandbox, args), [{ label: "skill", value: "/srv/not-mounted" }]);
+  assert.deepEqual(sandboxMountGaps(sandbox, args), [
+    { label: "skill", value: "/srv/not-mounted", reason: "unmounted" }
+  ]);
   // The prose list keeps saying it too — the warning path is unchanged.
   assert.equal(sandboxRunWarnings(sandbox, args).filter((w) => /does not exist inside the sandbox/.test(w)).length, 1);
 

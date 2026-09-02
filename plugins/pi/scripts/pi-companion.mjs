@@ -656,7 +656,11 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     });
     if (gaps.length) {
       const mounts = gaps
-        .map(({ label, value }) => `- ${label} \`${value}\` — mount it: --mount <host path>:${value}:ro`)
+        .map((gap) =>
+          gap.reason === "missing-host-path"
+            ? `- ${gap.label} \`${gap.value}\` — mounted from \`${gap.hostPath}\`, which does not exist on this machine`
+            : `- ${gap.label} \`${gap.value}\` — mount it: --mount <host path>:${gap.value}:ro`
+        )
         .join("\n");
       throw new Error(
         `Sandbox will not carry equipment this run declares, so the agent would work without it:\n${mounts}\n` +

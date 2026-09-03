@@ -746,11 +746,38 @@ function resolveCredentialsMount(hostAgentDir, provider) {
 }
 
 /**
+ * Whether the process that owns a per-run file is still running.
+ *
+ * `kill(pid, 0)` sends nothing; it asks the kernel whether the process exists.
+ * EPERM means it does and belongs to someone else — for a sweep that is "alive",
+ * because deleting a live run's credentials is the expensive mistake here.
+ */
+function ownerIsAlive(name) {
+  const pid = Number(/\.(\d+)\./.exec(name)?.[1]);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+/**
  * Remove the credential slices this process created.
  *
  * They live under the same short-lived state tree as everything else, so a
  * missed cleanup is bounded — but a file holding a provider key should not
  * outlive the run that needed it.
+ *
+ * Age alone used to decide what belonged to nobody, and an hour of age is not
+ * abandonment: a run that lasts longer than that is still holding its
+ * `auth.json`, mounted read-only into its container. Any later command sweeping
+ * the directory deleted it, and the run died on the next read with
+ * `Credential store read failed … ENOENT`. So the owner is asked first, and age
+ * only decides for files whose owner cannot be identified.
  */
 export function cleanupCredentialSlices() {
   const dir = path.join(os.tmpdir(), "pi-companion", "auth");
@@ -773,8 +800,14 @@ export function cleanupCredentialSlices() {
       }
       continue;
     }
+    const alive = ownerIsAlive(entry);
+    if (alive === true) {
+      continue;
+    }
     try {
-      if (now - fs.statSync(file).mtimeMs > ABANDONED_SLICE_MS) {
+      // A dead owner's file is nobody's immediately; one with no readable pid
+      // falls back to age, which is all there is to go on.
+      if (alive === false || now - fs.statSync(file).mtimeMs > ABANDONED_SLICE_MS) {
         fs.unlinkSync(file);
       }
     } catch {

@@ -518,11 +518,46 @@ export function buildDockerRunArgs({
     }
     args.push("-v", resolveMountSource(mount, homeDir, cwd));
   }
-  args.push(...(sandbox.args ?? []).map((arg) => resolveSandboxFileRefs(String(arg), cwd)));
+  const profileArgs = (sandbox.args ?? []).map((arg) => resolveSandboxFileRefs(String(arg), cwd));
+  assertProfileArgsShape(profileArgs);
+  args.push(...profileArgs);
 
   args.push(sandbox.image || DEFAULT_SANDBOX_IMAGE);
   args.push(...piArgs);
   return args;
+}
+
+/**
+ * Refuse a profile `args` list that has lost the flag in front of a value.
+ *
+ * Everything up to the image is flags and their values; the image is the first
+ * bare word docker meets. A value left without its flag therefore takes the
+ * image's place, and docker answers `invalid reference format` — naming neither
+ * the argument nor the run. The failure even looks like it belongs to the
+ * workspace, since the working directory decides which mounts are added around
+ * it, so it appears to come and go with the directory name.
+ *
+ * The shape is checked instead of the cause, because the causes differ: a
+ * repeated docker flag that merging deduplicated away, a hand-edited config, a
+ * value pasted without its flag.
+ */
+function assertProfileArgsShape(args) {
+  for (const [index, value] of args.entries()) {
+    if (value.startsWith("-")) {
+      continue;
+    }
+    const previous = index > 0 ? args[index - 1] : null;
+    // `--flag value` is the only shape a bare word may appear in; `--flag=value`
+    // already carries its own, so a word after it belongs to nothing.
+    if (previous?.startsWith("-") && !previous.includes("=")) {
+      continue;
+    }
+    throw new Error(
+      `Sandbox profile argument "${value}" has no flag in front of it. Docker reads the first bare word as ` +
+        "the image name and fails with `invalid reference format`. Check the profile's `args`: a repeated " +
+        "docker flag, or a value pasted without its flag."
+    );
+  }
 }
 
 /**

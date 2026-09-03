@@ -479,6 +479,40 @@ test("a profile keeps every occurrence of a repeated docker flag", () => {
   ]);
 });
 
+test("a value that lost its flag is named instead of being handed to docker", () => {
+  // The shape a deduplicated `--security-opt` leaves behind: a value with no
+  // flag in front of it, which docker reads as the image name and rejects as
+  // `invalid reference format` — naming neither the run nor the argument.
+  assert.throws(
+    () =>
+      buildDockerRunArgs({
+        sandbox: {
+          mode: "docker",
+          image: "pi-sandbox:latest",
+          args: ["--security-opt", "seccomp=/p.json", "systempaths=unconfined"]
+        },
+        piArgs: ["--mode", "rpc"],
+        cwd: "/home/me/project",
+        identity: IDENTITY
+      }),
+    /"systempaths=unconfined" has no flag in front of it/
+  );
+});
+
+test("the shapes docker itself accepts stay accepted", () => {
+  const args = buildDockerRunArgs({
+    sandbox: {
+      mode: "docker",
+      image: "pi-sandbox:latest",
+      args: ["--security-opt", "seccomp=/p.json", "--security-opt", "systempaths=unconfined", "--rm=true", "--init"]
+    },
+    piArgs: ["--mode", "rpc"],
+    cwd: "/home/me/project",
+    identity: IDENTITY
+  });
+  assert.deepEqual(args.slice(-3), ["pi-sandbox:latest", "--mode", "rpc"]);
+});
+
 test("a profile cycle is reported instead of hanging", () => {
   const profiles = { a: { profile: "b" }, b: { profile: "a" } };
   assert.throws(() => normalizeSandbox("a", profiles), /extends itself/);

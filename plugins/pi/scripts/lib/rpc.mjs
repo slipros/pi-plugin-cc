@@ -701,7 +701,15 @@ export async function runPiRpcTurn({
       errors.push(`Could not start ${launch.command}: ${spawnError.message}`);
     }
     if (timedOut) {
-      errors.push(`pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated.`);
+      // The number alone leaves the caller guessing where it came from: a run
+      // without a preset takes the built-in 30 minutes, while every preset here
+      // may carry its own. The session survives the kill, so the way forward is
+      // a continuation rather than starting the task again.
+      errors.push(
+        `pi exceeded the ${Math.round(timeoutMs / 1000)}s timeout and was terminated. ` +
+          "That limit comes from --timeout, the preset's `timeoutMs`, or `defaults.timeoutMs` " +
+          "in the config, in that order. The session is intact: continue it instead of re-running the task."
+      );
     }
     if (aborted) {
       errors.push("The run was aborted before pi finished.");

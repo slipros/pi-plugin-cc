@@ -463,6 +463,22 @@ test("a profile can start from another profile", () => {
   assert.equal(sandbox.profile, undefined);
 });
 
+test("a profile keeps every occurrence of a repeated docker flag", () => {
+  const profiles = {
+    dind: { args: ["--security-opt", "seccomp=/profile.json", "--security-opt", "systempaths=unconfined"] },
+    "dind-run": { profile: "dind", args: ["--device", "/dev/net/tun"] }
+  };
+  const sandbox = normalizeSandbox("dind-run", profiles);
+  assert.deepEqual(sandbox.args, [
+    "--security-opt",
+    "seccomp=/profile.json",
+    "--security-opt",
+    "systempaths=unconfined",
+    "--device",
+    "/dev/net/tun"
+  ]);
+});
+
 test("a profile cycle is reported instead of hanging", () => {
   const profiles = { a: { profile: "b" }, b: { profile: "a" } };
   assert.throws(() => normalizeSandbox("a", profiles), /extends itself/);

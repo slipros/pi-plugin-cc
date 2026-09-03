@@ -1054,7 +1054,11 @@ export async function runPiTurn({
     const text = state.assistantTexts.at(-1) ?? "";
     const errors = [...state.errors];
     if (timedOut) {
-      errors.push(`pi exceeded the ${Math.round(turnTimeoutMs / 1000)}s timeout and was terminated.`);
+      errors.push(
+        `pi exceeded the ${Math.round(turnTimeoutMs / 1000)}s timeout and was terminated. ` +
+          "That limit comes from --timeout, the preset's `timeoutMs`, or `defaults.timeoutMs` " +
+          "in the config, in that order. The session is intact: continue it instead of re-running the task."
+      );
     }
     if (budgetStop) {
       errors.push(`Stopped by the run budget: ${budgetStop}.`);

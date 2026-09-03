@@ -27,6 +27,8 @@ Built in the shape of the official [Codex plugin](https://github.com/openai/code
 
 Plus the `pi:pi-delegate` subagent (so Claude can delegate without a slash command) and the `pi-cli-runtime` skill (so Claude knows how pi's flags, sessions and event stream behave).
 
+The gates those runs work under ship with it: a pi extension bundling fourteen hooks (`git commit` past the repository's own hooks, secrets in a command, `git stash`, a wiped module cache — refused, not asked about) and `pi-accept.sh`, which checks that a finished run left a commit and a clean tree. See [docs/hooks.md](docs/hooks.md).
+
 The same functionality is packaged as a **standalone skill** in [`skills/pi`](skills/pi) — handy for iterating without reinstalling a plugin:
 
 ```bash
@@ -98,6 +100,7 @@ The skill file ([`skills/pi/SKILL.md`](skills/pi/SKILL.md), in Russian) is what 
 | [docs/git-identity.md](docs/git-identity.md) | Who the agent commits as, and how `includeIf` keeps working inside a container |
 | [docs/git-proxy.md](docs/git-proxy.md) | Forge access from a sandbox: fetch through a per-run proxy, push refused |
 | [docs/dind.md](docs/dind.md) | A docker daemon inside the sandbox, parallel runs, the host-side registry mirror |
+| [docs/hooks.md](docs/hooks.md) | The gates a run works under: the bundled hooks extension, what enables which hook, and accepting a delegated run with `pi-accept.sh` |
 
 Research notes behind some of the decisions — decoding collapse, provider throughput, truncation — are in `docs/RESEARCH-*.md` and `docs/DESIGN-*.md` (in Russian).
 

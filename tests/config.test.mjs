@@ -308,3 +308,19 @@ test("every route that could disable the sandbox from a repository is closed", a
   const kept = sandboxOf({ presets: { p: { model: "x/y", thinking: "high" } } }).clean;
   assert.deepEqual(kept.presets.p, { model: "x/y", thinking: "high" });
 });
+
+test("a repeated docker flag survives the merge instead of being deduplicated", () => {
+  const merged = mergeConfigLayer(
+    {
+      ...BUILT_IN_CONFIG,
+      sandboxProfiles: { dind: { args: ["--security-opt", "seccomp=/profile.json"] } }
+    },
+    { sandboxProfiles: { dind: { args: ["--security-opt", "systempaths=unconfined"] } } }
+  );
+  assert.deepEqual(merged.sandboxProfiles.dind.args, [
+    "--security-opt",
+    "seccomp=/profile.json",
+    "--security-opt",
+    "systempaths=unconfined"
+  ]);
+});

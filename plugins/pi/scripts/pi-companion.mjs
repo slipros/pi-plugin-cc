@@ -69,6 +69,7 @@ import {
   containerNameForJob,
   describeSandbox,
   describeSlotUsage,
+  hostPathForContainerPath,
   isSandboxed,
   listSandboxContainers,
   normalizeSandbox,
@@ -598,11 +599,29 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
   let sandbox = applyConcurrencyPool(normalizeSandbox(settings.sandbox, config.sandboxProfiles), config);
   let worktreeMount = null;
   if (settings.mounts.length && !isSandboxed(sandbox)) {
-    // Without a container there is nothing to mount into: pi already sees the
-    // whole filesystem, so silently dropping them would hide a real mistake.
-    throw new Error(
-      `--mount needs a sandbox: ${settings.mounts.join(", ")} has nowhere to go. ` +
-        "Add `--sandbox docker` or a preset with one."
+    const asked = (flags.mount ?? []).map(String);
+    if (asked.length) {
+      // A --mount on the command line is the caller expecting isolation that a
+      // host run cannot give: pi already sees the whole filesystem.
+      throw new Error(
+        `--mount needs a sandbox: ${asked.join(", ")} has nowhere to go. ` +
+          "Add `--sandbox docker` or a preset with one."
+      );
+    }
+    // A preset's mounts are a different statement: they describe equipment in
+    // container coordinates because that is where the agent normally finds it.
+    // Refusing the run over them made every preset unusable with `--sandbox
+    // none` — the way out was hand-assembling a run from --system-prompt and
+    // --model, which loses the preset's skills and gates entirely. The equipment
+    // is on the host, so the mounts are read backwards and dropped.
+    const mounts = settings.mounts;
+    const toHost = (entry) => hostPathForContainerPath(entry, mounts) ?? entry;
+    settings.skills = settings.skills.map(toHost);
+    settings.extensions = settings.extensions.map(toHost);
+    settings.mounts = [];
+    warnings.push(
+      "No sandbox: the preset's mounts have nowhere to go, so its skills and extensions are read from the " +
+        "host paths they would have been mounted from. Equipment the host does not have is simply absent."
     );
   }
   if (isSandboxed(sandbox)) {
@@ -815,8 +834,20 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
  * and pinning them would repeat a stale copy of the machine's setup rather than
  * the run. What is kept is what the caller chose — the preset, the model, the
  * ceilings — so a rerun resolves everything else fresh.
+ *
+ * The equipment flags are kept for the same reason the preset is: they are the
+ * caller's choice, not the machine's state. A continuation that loses `--mount`
+ * gets an agent writing its report into a path nothing mounts, which dies with
+ * the container; one that loses `--system-prompt` gets a different agent reading
+ * the same history. Flag values are stored as written (a prompt name, a mount
+ * spec) and resolved again at run time, so the config still has the last word on
+ * what they mean.
  */
-function rerunRecipe(settings) {
+export function rerunRecipe(settings, flags = {}) {
+  const list = (value) => {
+    const entries = (Array.isArray(value) ? value : value == null ? [] : [value]).map(String).filter(Boolean);
+    return entries.length ? entries : null;
+  };
   const recipe = {
     preset: settings.presetName ?? null,
     model: settings.model ?? null,
@@ -826,9 +857,52 @@ function rerunRecipe(settings) {
     sandbox: settings.sandbox?.profileName ?? (isSandboxed(settings.sandbox) ? "docker" : null),
     readOnly: settings.readOnly ? true : null,
     timeoutMs: settings.timeoutMs ?? null,
-    budget: settings.budget ?? null
+    budget: settings.budget ?? null,
+    mounts: list(flags.mount),
+    systemPrompt: flags["system-prompt"] ?? null,
+    appendSystemPrompt: list(flags["append-system-prompt"]),
+    tools: flags.tools ?? null,
+    excludeTools: flags["exclude-tools"] ?? null,
+    skills: list(flags.skill),
+    extensions: list(flags.extension),
+    gitName: flags["git-name"] ?? null,
+    gitEmail: flags["git-email"] ?? null
   };
   return Object.fromEntries(Object.entries(recipe).filter(([, value]) => value !== null));
+}
+
+/**
+ * The flags a continuation runs with: the contour of the run that owns the
+ * session, with the caller's own flags on top.
+ *
+ * Separate and exported because this is where a continuation silently becomes a
+ * different run — a lost mount, a dropped system prompt — and that class of
+ * defect is invisible in a passing run: the agent works, writes its report into
+ * a path nothing mounts, and the report dies with the container.
+ */
+export function continuationFlags(flags, recipe = {}) {
+  return {
+    ...flags,
+    preset: flags.preset ?? recipe.preset,
+    model: flags.model ?? recipe.model,
+    provider: flags.provider ?? recipe.provider,
+    thinking: flags.thinking ?? recipe.thinking,
+    engine: flags.engine ?? recipe.engine,
+    sandbox: flags.sandbox ?? recipe.sandbox,
+    // Equipment travels with the contour rather than being re-typed; a flag
+    // passed here still wins, so a continuation can add or replace any of it.
+    mount: flags.mount ?? recipe.mounts,
+    "system-prompt": flags["system-prompt"] ?? recipe.systemPrompt,
+    "append-system-prompt": flags["append-system-prompt"] ?? recipe.appendSystemPrompt,
+    tools: flags.tools ?? recipe.tools,
+    "exclude-tools": flags["exclude-tools"] ?? recipe.excludeTools,
+    skill: flags.skill ?? recipe.skills,
+    extension: flags.extension ?? recipe.extensions,
+    "git-name": flags["git-name"] ?? recipe.gitName,
+    "git-email": flags["git-email"] ?? recipe.gitEmail,
+    ...(recipe.readOnly && !flags.write ? { "read-only": true } : {}),
+    timeout: flags.timeout ?? (recipe.timeoutMs ? String(Math.round(recipe.timeoutMs / 1000)) : undefined)
+  };
 }
 
 /**
@@ -873,7 +947,7 @@ async function executeRun({
     // the journal (redacted and capped there); the record on disk holds them so
     // a `rerun` works even for a job whose journal row has aged out.
     prompt,
-    rerunSettings: rerunRecipe(settings),
+    rerunSettings: rerunRecipe(settings, flags),
     status: "pending",
     createdAt: nowIso()
   });
@@ -1242,17 +1316,7 @@ async function commandContinue(argv, workspaceRoot) {
   // the way they do on `rerun`.
   const recipe = session.recipe ?? {};
   const runRoot = resolveRunRoot(flags.cwd ?? session.runRoot ?? null);
-  const merged = {
-    ...flags,
-    preset: flags.preset ?? recipe.preset,
-    model: flags.model ?? recipe.model,
-    provider: flags.provider ?? recipe.provider,
-    thinking: flags.thinking ?? recipe.thinking,
-    engine: flags.engine ?? recipe.engine,
-    sandbox: flags.sandbox ?? recipe.sandbox,
-    ...(recipe.readOnly && !flags.write ? { "read-only": true } : {}),
-    timeout: flags.timeout ?? (recipe.timeoutMs ? String(Math.round(recipe.timeoutMs / 1000)) : undefined)
-  };
+  const merged = continuationFlags(flags, recipe);
 
   const settings = buildRunSettings({
     command: "delegate",

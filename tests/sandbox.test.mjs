@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   attachMounts,
+  hostPathForContainerPath,
   buildDockerRunArgs,
   containerNameForJob,
   describeSandbox,
@@ -461,6 +462,76 @@ test("a profile can start from another profile", () => {
   ]);
   assert.deepEqual(sandbox.extensions, ["/pi-agent/host-extensions/custom-gcl-precommit.ts"]);
   assert.equal(sandbox.profile, undefined);
+});
+
+test("a profile keeps every occurrence of a repeated docker flag", () => {
+  const profiles = {
+    dind: { args: ["--security-opt", "seccomp=/profile.json", "--security-opt", "systempaths=unconfined"] },
+    "dind-run": { profile: "dind", args: ["--device", "/dev/net/tun"] }
+  };
+  const sandbox = normalizeSandbox("dind-run", profiles);
+  assert.deepEqual(sandbox.args, [
+    "--security-opt",
+    "seccomp=/profile.json",
+    "--security-opt",
+    "systempaths=unconfined",
+    "--device",
+    "/dev/net/tun"
+  ]);
+});
+
+test("a value that lost its flag is named instead of being handed to docker", () => {
+  // The shape a deduplicated `--security-opt` leaves behind: a value with no
+  // flag in front of it, which docker reads as the image name and rejects as
+  // `invalid reference format` — naming neither the run nor the argument.
+  assert.throws(
+    () =>
+      buildDockerRunArgs({
+        sandbox: {
+          mode: "docker",
+          image: "pi-sandbox:latest",
+          args: ["--security-opt", "seccomp=/p.json", "systempaths=unconfined"]
+        },
+        piArgs: ["--mode", "rpc"],
+        cwd: "/home/me/project",
+        identity: IDENTITY
+      }),
+    /"systempaths=unconfined" has no flag in front of it/
+  );
+});
+
+test("the shapes docker itself accepts stay accepted", () => {
+  const args = buildDockerRunArgs({
+    sandbox: {
+      mode: "docker",
+      image: "pi-sandbox:latest",
+      args: ["--security-opt", "seccomp=/p.json", "--security-opt", "systempaths=unconfined", "--rm=true", "--init"]
+    },
+    piArgs: ["--mode", "rpc"],
+    cwd: "/home/me/project",
+    identity: IDENTITY
+  });
+  assert.deepEqual(args.slice(-3), ["pi-sandbox:latest", "--mode", "rpc"]);
+});
+
+test("a container path is read back to the host directory it was mounted from", () => {
+  const mounts = [
+    "~/.claude/skills/git-commit:/pi-skills/git-commit:ro",
+    "~/work/repo:/workspace/repo",
+    "~/.claude/skills/_shared:/home/pi/.claude/skills/_shared:ro"
+  ];
+  assert.equal(hostPathForContainerPath("/pi-skills/git-commit", mounts, "/home/me"), "/home/me/.claude/skills/git-commit");
+  assert.equal(
+    hostPathForContainerPath("/home/pi/.claude/skills/_shared/go-conventions", mounts, "/home/me"),
+    "/home/me/.claude/skills/_shared/go-conventions",
+    "a path below a mount keeps its tail"
+  );
+  assert.equal(hostPathForContainerPath("/pi-skills/vision", mounts, "/home/me"), null, "nothing mounts it");
+});
+
+test("the longest mount wins when two of them cover the same path", () => {
+  const mounts = ["~/outer:/data", "~/inner:/data/nested"];
+  assert.equal(hostPathForContainerPath("/data/nested/file.md", mounts, "/home/me"), "/home/me/inner/file.md");
 });
 
 test("a profile cycle is reported instead of hanging", () => {

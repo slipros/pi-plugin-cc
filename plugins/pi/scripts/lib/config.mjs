@@ -107,11 +107,26 @@ const ADDITIVE_IDENTITY = {
 };
 
 /**
+ * Fields whose entries are positional rather than named: `args` is a raw docker
+ * argv, where `--security-opt` legitimately appears twice with different values
+ * and the flag is a separate element from the value it carries. Keying those by
+ * their own text drops the second `--security-opt` as a duplicate and leaves its
+ * value stranded, which docker then reads as the image name — so a profile
+ * asking for two security options dies with "invalid reference format". They
+ * concatenate as written instead; a layer that wants to replace an argument
+ * restates the whole list.
+ */
+const POSITIONAL_KEYS = new Set(["args"]);
+
+/**
  * Merge one additive field the way config layers do. Exported because a sandbox
  * object naming a profile is the same situation: `{"profile": "go", "env": [...]}`
  * has to keep the profile's PATH, not replace it with one entry.
  */
 export function concatAdditive(key, base = [], layer = []) {
+  if (POSITIONAL_KEYS.has(key)) {
+    return [...base, ...layer];
+  }
   return concatUnique(base, layer, ADDITIVE_IDENTITY[key]);
 }
 
@@ -145,7 +160,7 @@ function mergeEntry(base, layer) {
       continue;
     }
     if (ADDITIVE_KEYS.has(key) && Array.isArray(merged[key]) && Array.isArray(value)) {
-      merged[key] = concatUnique(merged[key], value, ADDITIVE_IDENTITY[key]);
+      merged[key] = concatAdditive(key, merged[key], value);
       continue;
     }
     if (isPlainObject(merged[key]) && isPlainObject(value)) {

@@ -251,6 +251,32 @@ export function containerNameForJob(jobId, profileName = null) {
   return `${prefix}-${safe(jobId, "job")}`.slice(0, 60);
 }
 
+/**
+ * The host path a mounted container path came from, or null if nothing mounts it.
+ *
+ * A preset describes its equipment in container coordinates — `/pi-skills/…` —
+ * because that is where the agent finds it. Run the same preset without a
+ * container and those paths point nowhere, while the equipment itself is sitting
+ * on the host, one mount entry away. This is that entry read backwards.
+ */
+export function hostPathForContainerPath(containerPath, mounts = [], homeDir = os.homedir()) {
+  const target = String(containerPath);
+  let best = null;
+  for (const mount of mounts) {
+    const { source, target: container } = parseMount(mount);
+    const prefix = container.endsWith("/") ? container.slice(0, -1) : container;
+    if (target !== prefix && !target.startsWith(`${prefix}/`)) {
+      continue;
+    }
+    // Longest match wins: `/home/pi/.claude/skills/_shared` is mounted inside a
+    // tree another mount may also cover.
+    if (!best || prefix.length > best.prefix.length) {
+      best = { prefix, source: expandHome(source, homeDir) };
+    }
+  }
+  return best ? path.join(best.source, target.slice(best.prefix.length)) : null;
+}
+
 /** `~/go/bin:/gobin:ro` — only the host side of a mount can be a home path. */
 function expandHome(value, homeDir) {
   return String(value).replace(/^~(?=\/|$)/, homeDir);
@@ -518,11 +544,46 @@ export function buildDockerRunArgs({
     }
     args.push("-v", resolveMountSource(mount, homeDir, cwd));
   }
-  args.push(...(sandbox.args ?? []).map((arg) => resolveSandboxFileRefs(String(arg), cwd)));
+  const profileArgs = (sandbox.args ?? []).map((arg) => resolveSandboxFileRefs(String(arg), cwd));
+  assertProfileArgsShape(profileArgs);
+  args.push(...profileArgs);
 
   args.push(sandbox.image || DEFAULT_SANDBOX_IMAGE);
   args.push(...piArgs);
   return args;
+}
+
+/**
+ * Refuse a profile `args` list that has lost the flag in front of a value.
+ *
+ * Everything up to the image is flags and their values; the image is the first
+ * bare word docker meets. A value left without its flag therefore takes the
+ * image's place, and docker answers `invalid reference format` — naming neither
+ * the argument nor the run. The failure even looks like it belongs to the
+ * workspace, since the working directory decides which mounts are added around
+ * it, so it appears to come and go with the directory name.
+ *
+ * The shape is checked instead of the cause, because the causes differ: a
+ * repeated docker flag that merging deduplicated away, a hand-edited config, a
+ * value pasted without its flag.
+ */
+function assertProfileArgsShape(args) {
+  for (const [index, value] of args.entries()) {
+    if (value.startsWith("-")) {
+      continue;
+    }
+    const previous = index > 0 ? args[index - 1] : null;
+    // `--flag value` is the only shape a bare word may appear in; `--flag=value`
+    // already carries its own, so a word after it belongs to nothing.
+    if (previous?.startsWith("-") && !previous.includes("=")) {
+      continue;
+    }
+    throw new Error(
+      `Sandbox profile argument "${value}" has no flag in front of it. Docker reads the first bare word as ` +
+        "the image name and fails with `invalid reference format`. Check the profile's `args`: a repeated " +
+        "docker flag, or a value pasted without its flag."
+    );
+  }
 }
 
 /**
@@ -685,11 +746,38 @@ function resolveCredentialsMount(hostAgentDir, provider) {
 }
 
 /**
+ * Whether the process that owns a per-run file is still running.
+ *
+ * `kill(pid, 0)` sends nothing; it asks the kernel whether the process exists.
+ * EPERM means it does and belongs to someone else — for a sweep that is "alive",
+ * because deleting a live run's credentials is the expensive mistake here.
+ */
+function ownerIsAlive(name) {
+  const pid = Number(/\.(\d+)\./.exec(name)?.[1]);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+/**
  * Remove the credential slices this process created.
  *
  * They live under the same short-lived state tree as everything else, so a
  * missed cleanup is bounded — but a file holding a provider key should not
  * outlive the run that needed it.
+ *
+ * Age alone used to decide what belonged to nobody, and an hour of age is not
+ * abandonment: a run that lasts longer than that is still holding its
+ * `auth.json`, mounted read-only into its container. Any later command sweeping
+ * the directory deleted it, and the run died on the next read with
+ * `Credential store read failed … ENOENT`. So the owner is asked first, and age
+ * only decides for files whose owner cannot be identified.
  */
 export function cleanupCredentialSlices() {
   const dir = path.join(os.tmpdir(), "pi-companion", "auth");
@@ -712,8 +800,14 @@ export function cleanupCredentialSlices() {
       }
       continue;
     }
+    const alive = ownerIsAlive(entry);
+    if (alive === true) {
+      continue;
+    }
     try {
-      if (now - fs.statSync(file).mtimeMs > ABANDONED_SLICE_MS) {
+      // A dead owner's file is nobody's immediately; one with no readable pid
+      // falls back to age, which is all there is to go on.
+      if (alive === false || now - fs.statSync(file).mtimeMs > ABANDONED_SLICE_MS) {
         fs.unlinkSync(file);
       }
     } catch {

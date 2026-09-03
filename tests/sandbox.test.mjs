@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   attachMounts,
+  hostPathForContainerPath,
   buildDockerRunArgs,
   containerNameForJob,
   describeSandbox,
@@ -511,6 +512,26 @@ test("the shapes docker itself accepts stay accepted", () => {
     identity: IDENTITY
   });
   assert.deepEqual(args.slice(-3), ["pi-sandbox:latest", "--mode", "rpc"]);
+});
+
+test("a container path is read back to the host directory it was mounted from", () => {
+  const mounts = [
+    "~/.claude/skills/git-commit:/pi-skills/git-commit:ro",
+    "~/work/repo:/workspace/repo",
+    "~/.claude/skills/_shared:/home/pi/.claude/skills/_shared:ro"
+  ];
+  assert.equal(hostPathForContainerPath("/pi-skills/git-commit", mounts, "/home/me"), "/home/me/.claude/skills/git-commit");
+  assert.equal(
+    hostPathForContainerPath("/home/pi/.claude/skills/_shared/go-conventions", mounts, "/home/me"),
+    "/home/me/.claude/skills/_shared/go-conventions",
+    "a path below a mount keeps its tail"
+  );
+  assert.equal(hostPathForContainerPath("/pi-skills/vision", mounts, "/home/me"), null, "nothing mounts it");
+});
+
+test("the longest mount wins when two of them cover the same path", () => {
+  const mounts = ["~/outer:/data", "~/inner:/data/nested"];
+  assert.equal(hostPathForContainerPath("/data/nested/file.md", mounts, "/home/me"), "/home/me/inner/file.md");
 });
 
 test("a profile cycle is reported instead of hanging", () => {

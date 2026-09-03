@@ -69,6 +69,7 @@ import {
   containerNameForJob,
   describeSandbox,
   describeSlotUsage,
+  hostPathForContainerPath,
   isSandboxed,
   listSandboxContainers,
   normalizeSandbox,
@@ -598,11 +599,29 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
   let sandbox = applyConcurrencyPool(normalizeSandbox(settings.sandbox, config.sandboxProfiles), config);
   let worktreeMount = null;
   if (settings.mounts.length && !isSandboxed(sandbox)) {
-    // Without a container there is nothing to mount into: pi already sees the
-    // whole filesystem, so silently dropping them would hide a real mistake.
-    throw new Error(
-      `--mount needs a sandbox: ${settings.mounts.join(", ")} has nowhere to go. ` +
-        "Add `--sandbox docker` or a preset with one."
+    const asked = (flags.mount ?? []).map(String);
+    if (asked.length) {
+      // A --mount on the command line is the caller expecting isolation that a
+      // host run cannot give: pi already sees the whole filesystem.
+      throw new Error(
+        `--mount needs a sandbox: ${asked.join(", ")} has nowhere to go. ` +
+          "Add `--sandbox docker` or a preset with one."
+      );
+    }
+    // A preset's mounts are a different statement: they describe equipment in
+    // container coordinates because that is where the agent normally finds it.
+    // Refusing the run over them made every preset unusable with `--sandbox
+    // none` — the way out was hand-assembling a run from --system-prompt and
+    // --model, which loses the preset's skills and gates entirely. The equipment
+    // is on the host, so the mounts are read backwards and dropped.
+    const mounts = settings.mounts;
+    const toHost = (entry) => hostPathForContainerPath(entry, mounts) ?? entry;
+    settings.skills = settings.skills.map(toHost);
+    settings.extensions = settings.extensions.map(toHost);
+    settings.mounts = [];
+    warnings.push(
+      "No sandbox: the preset's mounts have nowhere to go, so its skills and extensions are read from the " +
+        "host paths they would have been mounted from. Equipment the host does not have is simply absent."
     );
   }
   if (isSandboxed(sandbox)) {

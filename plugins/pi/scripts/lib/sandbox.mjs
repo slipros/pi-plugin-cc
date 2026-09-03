@@ -251,6 +251,32 @@ export function containerNameForJob(jobId, profileName = null) {
   return `${prefix}-${safe(jobId, "job")}`.slice(0, 60);
 }
 
+/**
+ * The host path a mounted container path came from, or null if nothing mounts it.
+ *
+ * A preset describes its equipment in container coordinates — `/pi-skills/…` —
+ * because that is where the agent finds it. Run the same preset without a
+ * container and those paths point nowhere, while the equipment itself is sitting
+ * on the host, one mount entry away. This is that entry read backwards.
+ */
+export function hostPathForContainerPath(containerPath, mounts = [], homeDir = os.homedir()) {
+  const target = String(containerPath);
+  let best = null;
+  for (const mount of mounts) {
+    const { source, target: container } = parseMount(mount);
+    const prefix = container.endsWith("/") ? container.slice(0, -1) : container;
+    if (target !== prefix && !target.startsWith(`${prefix}/`)) {
+      continue;
+    }
+    // Longest match wins: `/home/pi/.claude/skills/_shared` is mounted inside a
+    // tree another mount may also cover.
+    if (!best || prefix.length > best.prefix.length) {
+      best = { prefix, source: expandHome(source, homeDir) };
+    }
+  }
+  return best ? path.join(best.source, target.slice(best.prefix.length)) : null;
+}
+
 /** `~/go/bin:/gobin:ro` — only the host side of a mount can be a home path. */
 function expandHome(value, homeDir) {
   return String(value).replace(/^~(?=\/|$)/, homeDir);

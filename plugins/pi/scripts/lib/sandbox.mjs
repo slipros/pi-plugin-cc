@@ -49,7 +49,18 @@ const SANDBOX_DEFAULTS = {
   // rather than repeated in each profile: the container has no business phoning
   // home for updates or telemetry, and its only outbound need is the model.
   // Skipping those checks also takes them off the startup path of every run.
-  env: ["PI_OFFLINE=1", "PI_SKIP_VERSION_CHECK=1", "PI_TELEMETRY=0"],
+  // uv puts a project's environment in `<project>/.venv` by default, and the
+  // project here is a bind mount of the host checkout: `uv sync` inside the
+  // container then rewrites the host's venv with container paths, and the
+  // host's own `pytest` stops starting ("bad interpreter"). Pointing uv at a
+  // container-local directory keeps `uv sync`/`uv run` working exactly as the
+  // stack prompt describes while the workspace copy stays untouched.
+  env: [
+    "PI_OFFLINE=1",
+    "PI_SKIP_VERSION_CHECK=1",
+    "PI_TELEMETRY=0",
+    `UV_PROJECT_ENVIRONMENT=${CONTAINER_HOME}/venv`
+  ],
   mounts: [],
   args: [],
   // Tooling the agent only gets inside this sandbox: extensions and skills
@@ -386,6 +397,79 @@ function resolveAgentMount(sandbox, homeDir, cwd) {
   return { source: path.resolve(expandHome(sandbox.agentDir, homeDir)), isolated: false };
 }
 
+/** Directories that hold no virtual environment and are expensive to walk. */
+const VENV_SCAN_SKIP = new Set([".git", "node_modules", "vendor", "target", "dist", "build"]);
+
+/**
+ * How far below the workspace root a virtual environment is still found.
+ *
+ * Three levels covers the shapes that occur: a venv in the repository root, one
+ * per service in a monorepo (`services/worker/.venv`), and the same when the
+ * run is delegated to the parent directory of the repository.
+ */
+const VENV_SCAN_DEPTH = 3;
+
+/**
+ * Read-only masks over the virtual environments inside the workspace.
+ *
+ * A venv is not portable: its `bin/*` shebangs, the `python` symlink and
+ * `pyvenv.cfg` all name absolute paths of the machine that built it. The
+ * container sees the checkout at a different path, so the host's venv is
+ * broken *for the agent* — `./.venv/bin/pytest` dies with "bad interpreter" —
+ * and an agent that takes that at face value repairs it in place: rebuilds it
+ * with uv, rewrites the shebangs to `/usr/local/bin/python3`, drops the
+ * `bin/python` symlink. All of it travels back through the bind mount, and the
+ * damage surfaces on the host after a run the agent reported green.
+ *
+ * Mounting each venv read-only over itself turns that repair into an immediate
+ * `Read-only file system`, which reads as "this is not mine to fix" and is
+ * visible in the transcript. The agent's own environment comes from
+ * `UV_PROJECT_ENVIRONMENT`, outside the workspace, so nothing it legitimately
+ * needs is taken away.
+ *
+ * @returns {string[]} `-v` values, empty when the workspace has no venv
+ */
+export function venvGuardMounts(cwd, { workdir = null, depth = VENV_SCAN_DEPTH, taken = new Set() } = {}) {
+  const root = path.resolve(String(cwd ?? "."));
+  const mountpoint = workdir ?? containerWorkdir(root);
+  const found = [];
+  const walk = (dir, level) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      // An unreadable directory is a problem with the run itself, not
+      // something a guard should turn into a failure to launch.
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || VENV_SCAN_SKIP.has(entry.name)) {
+        continue;
+      }
+      const absolute = path.join(dir, entry.name);
+      if (fs.existsSync(path.join(absolute, "pyvenv.cfg"))) {
+        const relative = path.relative(root, absolute).split(path.sep).join("/");
+        const target = `${mountpoint}/${relative}`;
+        // A mount the profile or the run already declares wins: docker refuses
+        // a duplicate target outright, and an explicit mount is the caller
+        // saying what that path is for.
+        if (!taken.has(target)) {
+          found.push(`${absolute}:${target}:ro`);
+        }
+        continue;
+      }
+      // Hidden directories are where venvs live (`.venv`), so they are checked;
+      // descending into them is a different matter — tool state is deep and
+      // holds nothing to guard.
+      if (level < depth && !entry.name.startsWith(".")) {
+        walk(absolute, level + 1);
+      }
+    }
+  };
+  walk(root, 1);
+  return found;
+}
+
 /**
  * Build the argv for `docker run` that launches pi with the given pi arguments.
  * Pure, so the mapping is testable without a daemon.
@@ -455,6 +539,13 @@ export function buildDockerRunArgs({
 
   const workdir = containerWorkdir(cwd);
   args.push("-v", `${cwd}:${workdir}`, "-w", workdir);
+
+  if (sandbox.protectVenvs !== false) {
+    const declared = new Set((sandbox.mounts ?? []).map((mount) => parseMount(mount).target));
+    for (const mask of venvGuardMounts(cwd, { workdir, taken: declared })) {
+      args.push("-v", mask);
+    }
+  }
 
   const agent = resolveAgentMount(sandbox, homeDir, cwd);
   args.push("-v", `${agent.source}:${AGENT_DIR}`);

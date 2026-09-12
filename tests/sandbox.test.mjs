@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 import {
   attachMounts,
@@ -17,6 +17,7 @@ import {
   sandboxMountGaps,
   sandboxRunWarnings,
   sessionDirFor,
+  venvGuardMounts,
   DEFAULT_SANDBOX_IMAGE,
   DEFAULT_SANDBOX_VOLUME
 } from "../plugins/pi/scripts/lib/sandbox.mjs";
@@ -924,4 +925,109 @@ test("equipment outside the container is reported as a gap, not just as prose", 
 
   // npm:/git: sources resolve inside the container and are nobody's gap.
   assert.deepEqual(sandboxMountGaps(sandbox, { workspaceRoot: "/work", skills: ["npm:some-skill"] }), []);
+});
+
+/** Checkouts built by the venv tests, removed when the file is done. */
+const TEMP_WORKSPACES = [];
+after(() => {
+  for (const root of TEMP_WORKSPACES) {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** A checkout with virtual environments in it, as a python repository has. */
+function workspaceWithVenvs(layout) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-venv-guard-"));
+  TEMP_WORKSPACES.push(root);
+  for (const [relative, isVenv] of Object.entries(layout)) {
+    const dir = path.join(root, relative);
+    fs.mkdirSync(dir, { recursive: true });
+    if (isVenv) {
+      fs.writeFileSync(path.join(dir, "pyvenv.cfg"), "home = /host/python/bin\n");
+    }
+  }
+  return root;
+}
+
+test("virtual environments in the workspace are mounted over themselves read-only", () => {
+  // A venv names absolute host paths in its shebangs and its `python` symlink,
+  // so inside the container it looks broken — and an agent that repairs it
+  // rebuilds the host's environment with container paths, through the bind
+  // mount, after reporting the run green.
+  const root = workspaceWithVenvs({
+    ".venv": true,
+    ".venv-dev": true,
+    "services/worker/.venv": true,
+    src: false,
+    "src/package": false
+  });
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("docker"),
+    cwd: root,
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {}
+  });
+  const workdir = `/workspace/${path.basename(root)}`;
+
+  const masks = mounts(args).filter((mount) => mount.endsWith(":ro") && mount.includes(`${workdir}/`));
+  assert.deepEqual(
+    masks.map((mount) => mount.split(":")[1]).sort(),
+    [`${workdir}/.venv`, `${workdir}/.venv-dev`, `${workdir}/services/worker/.venv`]
+  );
+  assert.ok(masks.includes(`${path.join(root, ".venv-dev")}:${workdir}/.venv-dev:ro`));
+});
+
+test("a directory without pyvenv.cfg is left writable", () => {
+  const root = workspaceWithVenvs({ ".venv": false, src: false });
+  assert.deepEqual(venvGuardMounts(root), []);
+});
+
+test("uv is pointed outside the workspace so `uv sync` never writes the host venv", () => {
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("docker"),
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {}
+  });
+  assert.ok(args.includes("UV_PROJECT_ENVIRONMENT=/home/pi/venv"));
+
+  // A profile that names it wins: the default is a default, not a law.
+  const custom = buildDockerRunArgs({
+    sandbox: normalizeSandbox({ env: ["UV_PROJECT_ENVIRONMENT=/tmp/env"] }),
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {}
+  });
+  assert.equal(custom.lastIndexOf("UV_PROJECT_ENVIRONMENT=/tmp/env") > custom.indexOf("UV_PROJECT_ENVIRONMENT=/home/pi/venv"), true);
+});
+
+test("a venv the caller mounts on purpose is not masked twice", () => {
+  // Docker refuses a duplicate target outright, so the guard has to yield to an
+  // explicit mount rather than add a second one and kill the run.
+  const root = workspaceWithVenvs({ ".venv": true });
+  const workdir = `/workspace/${path.basename(root)}`;
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox({ mounts: [`${path.join(root, ".venv")}:${workdir}/.venv`] }),
+    cwd: root,
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {}
+  });
+  const targets = mounts(args).map((mount) => mount.split(":")[1]);
+  assert.equal(targets.filter((target) => target === `${workdir}/.venv`).length, 1);
+});
+
+test("protectVenvs false leaves the workspace exactly as it is on the host", () => {
+  const root = workspaceWithVenvs({ ".venv": true });
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox({ protectVenvs: false }),
+    cwd: root,
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {}
+  });
+  assert.ok(!mounts(args).some((mount) => mount.includes("/.venv:")));
 });

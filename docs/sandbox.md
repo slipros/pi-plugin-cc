@@ -21,11 +21,40 @@ tokens never enter the container. The working commands are in the skill (`skills
 | Credentials | never enter the container: a run-scoped proxy on the host holds the real key and the agent gets a token that dies with the run |
 | Identity | your uid/gid, so files written through the mount are not owned by root |
 | Network | on by default, because the model call needs it |
+| Python environments | every venv in the workspace is mounted over itself read-only, and uv is pointed at `/home/pi/venv` — see below |
 | Environment | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` — a sandbox default rather than a profile field, so no profile needs to repeat it. The container has no business fetching updates or sending telemetry; its only legitimate outbound connection is the model |
 
 The rest of your home directory, your SSH keys and everything outside the workspace are simply not there. Sessions live in the volume, so `--session last` keeps working across sandboxed runs — but a session started on the host cannot be continued in the sandbox, and vice versa. Sessions are also split per workspace through `PI_CODING_AGENT_SESSION_DIR`: pi buckets them by working directory, and containers used to share one flat `/workspace`, so one bucket held the transcripts of every repository this machine had ever touched.
 
 If the image is missing or the daemon is unreachable, the run fails **before** a job exists, with the command that fixes it.
+
+### The host's virtual environments survive the run
+
+A venv is not portable: `pyvenv.cfg`, the `bin/python` symlink and every shebang
+in `bin/` name absolute paths of the machine that built it. The container sees
+the checkout at `/workspace/<dirname>`, so the host's venv looks broken *to the
+agent* — `./.venv/bin/pytest` answers `bad interpreter` — and an agent that
+takes that at face value repairs it in place: rebuilds it with uv, rewrites the
+shebangs to `/usr/local/bin/python3`, drops the `bin/python` symlink. All of
+that travels back through the bind mount. The host's own `pytest` then refuses
+to start, the editable install stops resolving outside the repository root, and
+none of it is visible in the run, which reports its gates green (pytest finds
+the package through rootdir either way).
+
+Two mechanisms close it, and neither takes anything away from the agent:
+
+- **every directory holding a `pyvenv.cfg`** — up to three levels below the
+  workspace root, so monorepo services are covered — is bind mounted over
+  itself read-only. A repair attempt fails immediately with `Read-only file
+  system`, which reads as "not mine to fix" and stays in the transcript;
+- **`UV_PROJECT_ENVIRONMENT=/home/pi/venv`** is a sandbox default, so `uv sync`
+  and `uv run` behave exactly as usual while creating the environment outside
+  the workspace. Nothing appears in the checkout, and nothing has to be cleaned
+  up afterwards.
+
+Turn the masks off per profile with `"protectVenvs": false`; a venv the profile
+or the run mounts explicitly is left as the caller declared it, because docker
+refuses a duplicate target.
 
 ### Real keys stay on the host
 

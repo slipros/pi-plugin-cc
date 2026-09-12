@@ -556,10 +556,10 @@ export function buildDockerRunArgs({
     const credentials = writeProxyCredentials(sandbox);
     const models = writeProxyModels(hostAgentDirOf(homeDir), sandbox);
     if (credentials) {
-      args.push("-v", `${credentials}:${AGENT_DIR}/auth.json:ro`);
+      args.push("-v", `${requireBindSource(credentials, "The run's auth.json")}:${AGENT_DIR}/auth.json:ro`);
     }
     if (models) {
-      args.push("-v", `${models}:${AGENT_DIR}/models.json:ro`);
+      args.push("-v", `${requireBindSource(models, "The run's models.json")}:${AGENT_DIR}/models.json:ro`);
     }
   }
   if (agent.isolated) {
@@ -584,19 +584,19 @@ export function buildDockerRunArgs({
     // never learns the address or the key of the real endpoint.
     const models = sandbox.credentialProxy ? null : path.join(hostAgentDir, "models.json");
     if (models && fs.existsSync(models)) {
-      args.push("-v", `${models}:${AGENT_DIR}/models.json:ro`);
+      args.push("-v", `${requireBindSource(models, "The run's models.json")}:${AGENT_DIR}/models.json:ro`);
     }
     if (sandbox.auth && !sandbox.credentialProxy) {
       const credentials = resolveCredentialsMount(hostAgentDir, sandbox.provider ?? null);
       if (credentials) {
-        args.push("-v", `${credentials}:${AGENT_DIR}/auth.json:ro`);
+        args.push("-v", `${requireBindSource(credentials, "The run's auth.json")}:${AGENT_DIR}/auth.json:ro`);
       }
     }
   }
 
   const gitconfigTarget = `${CONTAINER_HOME}/.gitconfig`;
   if (gitProxy) {
-    args.push("-v", `${writeRunGitconfig(gitProxy)}:${gitconfigTarget}:ro`);
+    args.push("-v", `${requireBindSource(writeRunGitconfig(gitProxy), "The run's gitconfig")}:${gitconfigTarget}:ro`);
   }
 
   for (const mount of sandbox.mounts ?? []) {
@@ -716,6 +716,86 @@ function runConfigDir() {
   return path.join(os.tmpdir(), "pi-companion", "auth");
 }
 
+/**
+ * The run-config directory, swept of docker's leftovers and checked to be ours.
+ *
+ * docker creates a missing bind-mount source itself — as a directory, owned by
+ * root, because the daemon is root. A run whose `auth.json` is gone by the time
+ * the container starts therefore leaves `auth-run.<pid>.json` behind as an
+ * empty *directory*, and since the parent directories are created the same way,
+ * every later run dies writing its own slice: `EACCES` two seconds in, with
+ * nothing on screen that names the cause or the cure.
+ *
+ * Empty directories we are still allowed to remove go silently. What we cannot
+ * own is reported with the command that fixes it.
+ *
+ * @returns {string|null} the problem to report, or null when the directory is usable
+ */
+export function runConfigDirProblem() {
+  const dir = runConfigDir();
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch {
+    // Reported by the write probe below, with the owner in the message.
+  }
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    // Unreadable is a permission problem; the probe names it.
+  }
+  for (const entry of entries) {
+    // Only ever files live here. A directory is docker's leftover, whatever its
+    // name, and an empty one carries nothing anybody wants.
+    if (entry.isDirectory()) {
+      try {
+        fs.rmSync(path.join(dir, entry.name), { recursive: true });
+      } catch {
+        // Not ours to remove — the probe turns this into the message.
+      }
+    }
+  }
+  const probe = path.join(dir, `probe.${process.pid}.tmp`);
+  try {
+    fs.writeFileSync(probe, "", { mode: 0o600 });
+    fs.unlinkSync(probe);
+    return null;
+  } catch (error) {
+    let owner = "";
+    try {
+      const uid = fs.statSync(dir).uid;
+      const mine = typeof process.getuid === "function" ? process.getuid() : null;
+      if (uid !== mine) {
+        owner = ` It is owned by uid ${uid}, not by you (uid ${mine}).`;
+      }
+    } catch {
+      // The stat failing is itself the permission problem.
+    }
+    return (
+      `Cannot write run configuration into ${dir}: ${error?.code ?? error}.${owner} ` +
+      "docker creates a missing bind-mount source as a root-owned directory, and the leftovers block every later run. " +
+      `Remove them with \`sudo rm -rf ${path.dirname(dir)}\` and start the run again.`
+    );
+  }
+}
+
+/**
+ * A bind source that has to exist before `docker run` sees it.
+ *
+ * Handing docker a path that is not there does not fail the run — it creates
+ * the path, as root, and the damage lands on every later run instead of this
+ * one. Refusing here keeps the failure where its cause is.
+ */
+function requireBindSource(file, what) {
+  if (!fs.existsSync(file)) {
+    throw new Error(
+      `${what} is missing at ${file} — refusing to start the container, because docker would recreate that path as a root-owned directory and break every later run. ` +
+        `Remove \`${path.dirname(runConfigDir())}\` if it holds leftovers and try again.`
+    );
+  }
+  return file;
+}
+
 function writeRunConfig(name, contents) {
   return writeRunFile(`${name}.${process.pid}.json`, JSON.stringify(contents));
 }
@@ -723,7 +803,10 @@ function writeRunConfig(name, contents) {
 /** Same directory and same permissions, for the files that are not JSON. */
 function writeRunFile(name, contents) {
   const dir = runConfigDir();
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const problem = runConfigDirProblem();
+  if (problem) {
+    throw new Error(problem);
+  }
   const file = path.join(dir, name);
   fs.writeFileSync(file, contents, { encoding: "utf8", mode: 0o600 });
   return file;
@@ -962,6 +1045,13 @@ export function sandboxPreflight(sandbox) {
       `The Docker daemon is not reachable: ${firstLine(info.stderr) || firstLine(info.stdout) || "unknown error"}`
     );
     return { ok: false, errors, warnings };
+  }
+
+  // Checked before the image, because a root-owned run-config directory kills
+  // the run seconds in with a bare EACCES that names neither cause nor cure.
+  const runConfig = runConfigDirProblem();
+  if (runConfig) {
+    errors.push(runConfig);
   }
 
   const image = runCommand("docker", ["image", "inspect", sandbox.image, "--format", "{{.Id}}"]);

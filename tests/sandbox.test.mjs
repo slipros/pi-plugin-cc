@@ -18,6 +18,7 @@ import {
   sandboxRunWarnings,
   sessionDirFor,
   venvGuardMounts,
+  runConfigDirProblem,
   DEFAULT_SANDBOX_IMAGE,
   DEFAULT_SANDBOX_VOLUME
 } from "../plugins/pi/scripts/lib/sandbox.mjs";
@@ -1030,4 +1031,70 @@ test("protectVenvs false leaves the workspace exactly as it is on the host", () 
     env: {}
   });
   assert.ok(!mounts(args).some((mount) => mount.includes("/.venv:")));
+});
+
+/** Run a body with TMPDIR pointed somewhere disposable. */
+function withTmpdir(body) {
+  const previous = process.env.TMPDIR;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-runconfig-"));
+  process.env.TMPDIR = dir;
+  try {
+    return body(dir);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.TMPDIR;
+    } else {
+      process.env.TMPDIR = previous;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("docker's leftover directories in the run-config dir are swept, not reported", () => {
+  // docker creates a missing bind source as a directory, so a slice that was
+  // gone by container start comes back as an empty `auth-run.<pid>.json/`.
+  withTmpdir((dir) => {
+    const authDir = path.join(dir, "pi-companion", "auth");
+    fs.mkdirSync(path.join(authDir, "auth-run.4242.json"), { recursive: true });
+    fs.writeFileSync(path.join(authDir, "auth-run.99.json"), "{}");
+
+    assert.equal(runConfigDirProblem(), null);
+    assert.deepEqual(fs.readdirSync(authDir), ["auth-run.99.json"]);
+  });
+});
+
+test("a run-config directory we cannot write names the cure instead of failing later", () => {
+  // The real case was root-owned, which a test cannot produce; an unwritable
+  // directory reaches the same code path.
+  withTmpdir((dir) => {
+    const authDir = path.join(dir, "pi-companion", "auth");
+    fs.mkdirSync(authDir, { recursive: true });
+    fs.chmodSync(authDir, 0o500);
+    try {
+      const problem = runConfigDirProblem();
+      assert.match(problem ?? "", /Cannot write run configuration/);
+      assert.match(problem ?? "", /sudo rm -rf .*pi-companion/);
+    } finally {
+      fs.chmodSync(authDir, 0o700);
+    }
+  });
+});
+
+test("every host path handed to docker exists, so none is recreated as root", () => {
+  // A bind source docker cannot find is created by the daemon — as root, under
+  // /tmp — and from then on every run fails writing its own files.
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("docker"),
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {}
+  });
+  for (const mount of mounts(args)) {
+    const source = mount.split(":")[0];
+    if (!source.startsWith("/") || source === "/work") {
+      continue;
+    }
+    assert.ok(fs.existsSync(source), `${source} does not exist and docker would create it`);
+  }
 });

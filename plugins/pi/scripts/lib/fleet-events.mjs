@@ -98,6 +98,11 @@ export function recordFleetEvent(job = {}, { status = job.status, at = nowIso() 
     elapsed: job.elapsed ?? null,
     workspaceRoot: job.workspaceRoot ?? null,
     runRoot: job.runRoot ?? null,
+    // `job` is a job record on the announcing path and an already-built event on
+    // the orphan path (the follower re-records what it found); both spellings of
+    // the owner are read so a re-recorded event does not lose it and become
+    // everybody's.
+    owner: job.claudeSessionId ?? job.owner ?? null,
     summary: clip(job.summary)
   };
   try {
@@ -146,7 +151,7 @@ export function readFleetEvents({ from = 0, filePath = fleetEventsPath() } = {})
  * reason `status` does — an exit-zero run cut off at the output ceiling must
  * not read as a clean finish.
  */
-export function formatFleetEvent(event = {}) {
+export function formatFleetEvent(event = {}, { showOwner = false } = {}) {
   const truncated = event.phase === "truncated";
   const icon = truncated ? "⚠️" : (STATUS_ICONS[event.status] ?? "•");
   const where = event.runRoot ?? event.workspaceRoot ?? null;
@@ -157,9 +162,37 @@ export function formatFleetEvent(event = {}) {
     event.preset ? `preset: ${event.preset}` : null,
     event.model ? `model: ${event.model}` : null,
     where ? `cwd: ${where}` : null,
+    showOwner && event.owner ? `session: ${shortOwner(event.owner)}` : null,
     event.title ? `«${event.title}»` : null
   ].filter(Boolean);
   return parts.join(" · ");
+}
+
+/** Session ids are uuids; the first block is enough to tell two supervisors apart. */
+export function shortOwner(owner) {
+  return String(owner).split("-")[0];
+}
+
+/**
+ * Does this ending belong to the watcher asking?
+ *
+ * The log is machine-wide on purpose — a run lands in the bucket of whatever
+ * directory it was typed in, and a follower cannot know which that was. But
+ * machine-wide reached the chat as well: two supervisors working at once each
+ * heard the other's runs end, with no way to tell them apart, and acted on
+ * endings that were not theirs. So the reading is narrowed by owner while the
+ * writing stays shared.
+ *
+ * Two openings are deliberate. A watcher that cannot name itself hears
+ * everything — losing the channel entirely is worse than hearing too much. And
+ * a run with no owner (started by hand, by a hook, by a script) belongs to
+ * nobody, so it is announced to everybody rather than to no one.
+ */
+export function eventBelongsToOwner(event = {}, owner = null) {
+  if (!owner || !event.owner) {
+    return true;
+  }
+  return event.owner === owner;
 }
 
 /** Key identifying one announcement, so the same ending is not reported twice. */
@@ -194,6 +227,7 @@ export function orphanEvents(jobs = [], seen = new Set()) {
       elapsed: job.elapsed ?? null,
       workspaceRoot: job.workspaceRoot ?? null,
       runRoot: job.runRoot ?? null,
+      owner: job.claudeSessionId ?? null,
       summary: clip(job.summary)
     };
     if (seen.has(eventKey(event))) {

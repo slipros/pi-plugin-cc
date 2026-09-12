@@ -50,20 +50,42 @@ async function withWorkspaceAsync(run) {
   }
 }
 
-function runEvents(workspaceRoot, args, dataDir) {
+function runEvents(workspaceRoot, args, dataDir, session = null) {
   return spawnSync(process.execPath, [COMPANION, "events", ...args], {
     cwd: workspaceRoot,
     encoding: "utf8",
-    env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, PI_PLUGIN_DB: process.env.PI_PLUGIN_DB }
+    env: sessionEnv(dataDir, session)
   });
 }
 
+/**
+ * The environment a supervisor's shell has.
+ *
+ * The session id is what separates two supervisors sharing one machine-wide
+ * log, so a test about that separation has to set it explicitly — and clear the
+ * override, or the id of whatever session is running the suite leaks in.
+ */
+function sessionEnv(dataDir, session) {
+  const env = {
+    ...process.env,
+    CLAUDE_PLUGIN_DATA: dataDir,
+    PI_PLUGIN_DB: process.env.PI_PLUGIN_DB
+  };
+  delete env.PI_COMPANION_SESSION_ID;
+  if (session) {
+    env.CLAUDE_CODE_SESSION_ID = session;
+  } else {
+    delete env.CLAUDE_CODE_SESSION_ID;
+  }
+  return env;
+}
+
 /** Follow in a child while the test writes to the log the child is watching. */
-function followEvents(workspaceRoot, args, dataDir, duringRun) {
+function followEvents(workspaceRoot, args, dataDir, duringRun, session = null) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [COMPANION, "events", "--follow", ...args], {
       cwd: workspaceRoot,
-      env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, PI_PLUGIN_DB: process.env.PI_PLUGIN_DB }
+      env: sessionEnv(dataDir, session)
     });
     let stdout = "";
     child.stdout.on("data", (chunk) => {
@@ -171,5 +193,55 @@ test("the same ending is not reported twice", async () => {
 
     const mentions = stdout.split("\n").filter((line) => line.includes("delegate-killed"));
     assert.equal(mentions.length, 1, `reported ${mentions.length} times:\n${stdout}`);
+  });
+});
+
+test("one supervisor does not hear another supervisor's runs", () => {
+  withWorkspace((workspaceRoot, dataDir) => {
+    recordFleetEvent({ id: "delegate-mine", status: "completed", workspaceRoot, claudeSessionId: "sess-alpha" });
+    recordFleetEvent({ id: "delegate-theirs", status: "completed", workspaceRoot, claudeSessionId: "sess-beta" });
+    recordFleetEvent({ id: "delegate-nobodys", status: "completed", workspaceRoot });
+
+    const alpha = runEvents(workspaceRoot, [], dataDir, "sess-alpha").stdout;
+    assert.match(alpha, /delegate-mine/);
+    assert.match(alpha, /delegate-nobodys/, "a run nobody owns is announced to everybody");
+    assert.ok(!alpha.includes("delegate-theirs"), "another session's run leaked into the channel");
+
+    const everything = runEvents(workspaceRoot, ["--all"], dataDir, "sess-alpha").stdout;
+    assert.match(everything, /delegate-theirs/);
+    assert.match(everything, /session: sess/, "--all labels whose run each ending was");
+
+    const adopted = runEvents(workspaceRoot, ["--owner", "sess-beta"], dataDir, "sess-alpha").stdout;
+    assert.match(adopted, /delegate-theirs/, "a resumed session can adopt the runs it started before");
+    assert.ok(!adopted.includes("delegate-mine"));
+  });
+});
+
+test("a session with runs only from others is told they exist rather than shown an empty log", () => {
+  withWorkspace((workspaceRoot, dataDir) => {
+    recordFleetEvent({ id: "delegate-theirs", status: "completed", workspaceRoot, claudeSessionId: "sess-beta" });
+
+    const alpha = runEvents(workspaceRoot, [], dataDir, "sess-alpha").stdout;
+    assert.match(alpha, /No finished pi runs started by this session/);
+    assert.match(alpha, /--all/);
+  });
+});
+
+test("following hands each supervisor only its own endings", async () => {
+  await withWorkspaceAsync(async (workspaceRoot, dataDir) => {
+    const { stdout } = await followEvents(
+      workspaceRoot,
+      ["--for", "3", "--poll", "1"],
+      dataDir,
+      () => {
+        recordFleetEvent({ id: "delegate-theirs", status: "completed", workspaceRoot, claudeSessionId: "sess-beta" });
+        recordFleetEvent({ id: "delegate-mine", status: "completed", workspaceRoot, claudeSessionId: "sess-alpha" });
+      },
+      "sess-alpha"
+    );
+
+    assert.match(stdout, /runs started by session sess/, "the armed line says what the channel is narrowed to");
+    assert.match(stdout, /delegate-mine/);
+    assert.ok(!stdout.includes("delegate-theirs"), "another session's ending woke this supervisor");
   });
 });

@@ -38,6 +38,7 @@ import {
   enrichJob,
   isCancelable,
   listCancelableJobs,
+  ownerSessionId,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -46,7 +47,15 @@ import {
 } from "./lib/jobs.mjs";
 import { listModels, normalizeThinking, resolveModelSelection } from "./lib/models.mjs";
 import { runFinishHook } from "./lib/notify.mjs";
-import { formatFleetEvent, eventKey, orphanEvents, readFleetEvents, recordFleetEvent } from "./lib/fleet-events.mjs";
+import {
+  eventBelongsToOwner,
+  eventKey,
+  formatFleetEvent,
+  orphanEvents,
+  readFleetEvents,
+  recordFleetEvent,
+  shortOwner
+} from "./lib/fleet-events.mjs";
 import { getPiAvailability, PI_BINARY, runPiTurn } from "./lib/pi.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { buildSystemPrompt, interpolate, listNamedPrompts, loadTaskTemplate } from "./lib/prompts.mjs";
@@ -347,7 +356,8 @@ const KNOWN_FLAGS = new Set([
   "full",
   "kind",
   "poll",
-  "workspace"
+  "workspace",
+  "owner"
 ]);
 
 /**
@@ -386,7 +396,7 @@ function usage() {
     "                          [--status <s,s>] [--preset <name>] [--model <id>] [--json]",
     `  ${self} result [job-id] [--diff] [--json]`,
     `  ${self} wait [job-id...] [--all] [--for <seconds>] [--json]`,
-    `  ${self} events [--follow [--for <s>]] [--tail <n>] [--poll <s>] [--workspace] [--json]`,
+    `  ${self} events [--follow [--for <s>]] [--tail <n>] [--poll <s>] [--workspace] [--all | --owner <session>] [--json]`,
     `  ${self} runs [run-id] [--all] [--limit N] [--days N] [--model <id>]`,
     "                        [--preset <name>] [--kind delegate|review] [--prune] [--json]",
     `  ${self} rerun <run-id> [--append <text>] [--prompt <text>|--stdin] [run flags]`,
@@ -2087,8 +2097,8 @@ async function commandCancel(argv, workspaceRoot) {
  */
 async function commandEvents(argv, workspaceRoot) {
   const { flags } = parseArgs(argv, {
-    booleans: ["json", "follow", "workspace"],
-    strings: ["for", "tail", "poll"]
+    booleans: ["json", "follow", "workspace", "all"],
+    strings: ["for", "tail", "poll", "owner"]
   });
 
   // Following starts at the end of the log by default: replaying an epic's
@@ -2103,9 +2113,19 @@ async function commandEvents(argv, workspaceRoot) {
     flags.poll === undefined ? DEFAULT_EVENT_POLL_SECONDS : positiveNumber(flags.poll, "--poll");
   const followSeconds = flags.for === undefined ? null : positiveNumber(flags.for, "--for");
 
-  const belongsHere = (event) => !flags.workspace || event.workspaceRoot === workspaceRoot;
+  // Own runs by default. The log is shared by every supervisor on the machine,
+  // and an ending is only actionable for the one that started it: the other
+  // reads a job id it never launched, in a tree it may not have, and either
+  // chases it or learns to distrust the channel. `--all` is the way back to the
+  // whole fleet, `--owner` names a session other than this one — a resumed
+  // session adopting the runs it started under its previous id.
+  const owner = flags.all ? null : (flags.owner ?? ownerSessionId());
+  const belongsHere = (event) =>
+    (!flags.workspace || event.workspaceRoot === workspaceRoot) && eventBelongsToOwner(event, owner);
   const write = (event) => {
-    process.stdout.write(flags.json ? `${JSON.stringify(event)}\n` : `${formatFleetEvent(event)}\n`);
+    process.stdout.write(
+      flags.json ? `${JSON.stringify(event)}\n` : `${formatFleetEvent(event, { showOwner: !owner })}\n`
+    );
   };
 
   const history = readFleetEvents();
@@ -2114,7 +2134,10 @@ async function commandEvents(argv, workspaceRoot) {
     const rows = history.events.filter(belongsHere).slice(-tailCount);
     if (!rows.length && !flags.json) {
       process.stdout.write(
-        "No finished pi runs recorded yet. The log fills as runs end; `--follow` waits for the next one.\n"
+        owner && history.events.length
+          ? `No finished pi runs started by this session (${shortOwner(owner)}). ` +
+              `${history.events.length} run(s) from other sessions are in the log — \`--all\` shows them.\n`
+          : "No finished pi runs recorded yet. The log fills as runs end; `--follow` waits for the next one.\n"
       );
       return 0;
     }
@@ -2136,6 +2159,7 @@ async function commandEvents(argv, workspaceRoot) {
   if (!flags.json) {
     process.stdout.write(
       `pi fleet channel armed · watching ${flags.workspace ? "this workspace" : "every workspace"} · ` +
+        `${owner ? `runs started by session ${shortOwner(owner)} (and unowned runs)` : "every session"} · ` +
         `${history.events.length} run(s) already in the log · orphan sweep every ${pollSeconds}s\n`
     );
   }

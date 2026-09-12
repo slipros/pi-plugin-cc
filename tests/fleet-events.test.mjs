@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  eventBelongsToOwner,
   eventKey,
   formatFleetEvent,
   orphanEvents,
@@ -188,4 +189,41 @@ test("only dead runs become orphan events, and only once", () => {
 
   const seen = new Set(first.map(eventKey));
   assert.deepEqual(orphanEvents(jobs, seen), []);
+});
+
+test("an announcement carries the session that started the run", () => {
+  withDataDir(() => {
+    recordFleetEvent({ id: "delegate-a", status: "completed", claudeSessionId: "sess-alpha" });
+    assert.equal(readFleetEvents().events[0].owner, "sess-alpha");
+  });
+});
+
+test("re-recording an orphan event keeps its owner — otherwise a death becomes everybody's", () => {
+  withDataDir(() => {
+    const [orphan] = orphanEvents([
+      { id: "delegate-dead", status: "orphaned", claudeSessionId: "sess-alpha" }
+    ]);
+    assert.equal(orphan.owner, "sess-alpha");
+
+    // The follower writes what the sweep found back into the log so a second
+    // follower does not report the same death: that round trip must not strip
+    // the owner and turn one session's run into a fleet-wide notification.
+    recordFleetEvent(orphan);
+    assert.equal(readFleetEvents().events[0].owner, "sess-alpha");
+  });
+});
+
+test("a supervisor hears its own runs and unowned ones, never another supervisor's", () => {
+  const mine = { id: "a", owner: "sess-alpha" };
+  const theirs = { id: "b", owner: "sess-beta" };
+  const nobodys = { id: "c", owner: null };
+
+  assert.equal(eventBelongsToOwner(mine, "sess-alpha"), true);
+  assert.equal(eventBelongsToOwner(theirs, "sess-alpha"), false);
+  // Started by hand or by a hook: it belongs to nobody, so it is announced to
+  // everybody rather than to no one.
+  assert.equal(eventBelongsToOwner(nobodys, "sess-alpha"), true);
+  // A watcher that cannot name itself hears the whole fleet: too much is a
+  // better failure than a channel that has gone silent.
+  assert.equal(eventBelongsToOwner(theirs, null), true);
 });

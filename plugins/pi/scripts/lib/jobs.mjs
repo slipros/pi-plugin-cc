@@ -16,6 +16,25 @@ import {
 } from "./state.mjs";
 
 export const SESSION_ID_ENV = "PI_COMPANION_SESSION_ID";
+/**
+ * The host session that started a run.
+ *
+ * Claude Code exports its own session id into every shell it runs, so the
+ * supervisor that typed `delegate` is identifiable without asking it to pass
+ * anything. That is what lets the fleet channel hand each session only the
+ * endings it is waiting for: two supervisors on one machine share the log, and
+ * before this they shared the notifications too — each one hearing about runs
+ * it never started and could not act on.
+ *
+ * `PI_COMPANION_SESSION_ID` stays ahead of it as the explicit override, for a
+ * caller that owns runs across host sessions (a resumed session, a wrapper).
+ */
+export const HOST_SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID";
+
+/** Owner of runs started from this process, or null when nothing identifies it. */
+export function ownerSessionId(env = process.env) {
+  return env[SESSION_ID_ENV] || env[HOST_SESSION_ID_ENV] || null;
+}
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 const MAX_PROGRESS_LINES = 5;
 
@@ -336,7 +355,7 @@ export function resolveCancelableJob(workspaceRoot, jobId = null) {
 }
 
 export function createJobRecord(base, env = process.env) {
-  const sessionId = env[SESSION_ID_ENV];
+  const sessionId = ownerSessionId(env);
   return {
     ...base,
     createdAt: nowIso(),

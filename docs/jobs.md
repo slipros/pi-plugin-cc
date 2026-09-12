@@ -40,6 +40,8 @@ The command runs on the host when the job reaches a terminal state — including
 
 `events` is the machine-readable version of the same announcement: one line per finished run across every workspace, for a supervisor that watches a fleet rather than a job (`events --follow`, `events --tail 20`).
 
+The log is machine-wide, but the reading of it is not: an event carries the session that started the run, and `events` shows only that session's runs (plus runs nobody owns — started by hand, by a hook, by a script). Two supervisors sharing a machine used to share each other's notifications, which is worse than noise: an ending is only actionable for whoever started it. `--all` opens the whole fleet and labels each line with its session, `--owner <session>` follows another one — a resumed session adopting the runs it started under its previous id.
+
 ## Watching and steering
 
 ```bash

@@ -101,6 +101,8 @@ The skill file ([`skills/pi/SKILL.md`](skills/pi/SKILL.md), in Russian) is what 
 | [docs/git-proxy.md](docs/git-proxy.md) | Forge access from a sandbox: fetch through a per-run proxy, push refused |
 | [docs/dind.md](docs/dind.md) | A docker daemon inside the sandbox, parallel runs, the host-side registry mirror |
 | [docs/hooks.md](docs/hooks.md) | The gates a run works under: the bundled hooks extension, what enables which hook, and accepting a delegated run with `pi-accept.sh` |
+| [docs/development.md](docs/development.md) | Changing the plugin itself: pitfalls that shipped with green tests — test doubles, async helpers, SQLite upserts, pi RPC steering |
+| [docs/BACKLOG.md](docs/BACKLOG.md) | Known defects and gaps without a fix yet |
 
 Research notes behind some of the decisions — decoding collapse, provider throughput, truncation — are in `docs/RESEARCH-*.md` and `docs/DESIGN-*.md` (in Russian).
 

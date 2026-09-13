@@ -142,6 +142,9 @@ const DETACHED_ENV = "PI_PLUGIN_DETACHED";
 const DETACHED_JOB_ENV = "PI_PLUGIN_JOB_ID";
 // Where the parent left the task text for the detached copy to pick up.
 const DETACHED_PROMPT_ENV = "PI_PLUGIN_PROMPT_FILE";
+// How long that text was when the parent wrote it, so the child can tell a
+// whole task from a cut one.
+const DETACHED_PROMPT_CHARS_ENV = "PI_PLUGIN_PROMPT_CHARS";
 // The session a detached `continue` was already told to resume: the child
 // re-executes the command line, and "last" would resolve against a job list
 // that now includes the child's own pending record.
@@ -480,15 +483,33 @@ function normalizeCommandArgs(argv) {
 }
 
 /**
+ * The task text piped in with --stdin.
+ *
  * stdin is only consumed when the caller opts in with --stdin, so a command
  * launched with an inherited terminal never blocks waiting for input.
+ *
+ * Opting in and getting nothing is an error, not an empty addition: the task
+ * text usually sits after a title passed as an argument ("Task 11 — brief
+ * below."), and a `cat` of a wrong path used to leave exactly that title as the
+ * whole prompt — a paid run on a task nobody wrote.
  */
-function readStdin() {
+function readPipedTask() {
+  let text;
   try {
-    return fs.readFileSync(0, "utf8");
-  } catch {
-    return "";
+    text = fs.readFileSync(0, "utf8");
+  } catch (error) {
+    throw new Error(
+      `--stdin: the piped task could not be read (${errorCode(error)}). Nothing was started.`
+    );
   }
+  const task = text.trim();
+  if (!task) {
+    throw new Error(
+      "--stdin was given, but stdin was empty: the task text never arrived (did the command feeding the pipe fail?). " +
+        "Nothing was started."
+    );
+  }
+  return task;
 }
 
 /**
@@ -498,26 +519,49 @@ function readStdin() {
  * Read once and removed: the same text is in the job record and in the journal,
  * so the file has no second reader, and leaving it behind would keep a copy of
  * somebody's repository around for as long as the job is retained.
+ *
+ * A handoff that cannot be used stops the run. Falling back to the command
+ * line looked safe and was not: for `--stdin` the command line holds only the
+ * title, so the agent started, billed, and reported that its task was missing.
  */
 export function takeDetachedPrompt() {
   const file = process.env[DETACHED_PROMPT_ENV];
   if (!file) {
     return null;
   }
-  let text = "";
+  const expected = process.env[DETACHED_PROMPT_CHARS_ENV];
+  // The handoff belongs to this process alone: a `pia` the agent runs inherits
+  // the environment and would otherwise go looking for a file already consumed.
+  delete process.env[DETACHED_PROMPT_ENV];
+  delete process.env[DETACHED_PROMPT_CHARS_ENV];
+  let text;
   try {
     text = fs.readFileSync(file, "utf8");
-  } catch {
-    // A missing handoff file means the parent could not write it; the command
-    // falls back to resolving the task itself, exactly as before.
-    return null;
+  } catch (error) {
+    throw handoffLost(file, `could not be read (${errorCode(error)})`);
   }
   try {
     fs.unlinkSync(file);
   } catch {
     // The eviction sweep clears it later.
   }
-  return text.trim() ? text : null;
+  if (expected !== undefined && text.length !== Number(expected)) {
+    throw handoffLost(file, `holds ${text.length} characters, the parent wrote ${expected}`);
+  }
+  if (!text.trim()) {
+    throw handoffLost(file, "holds no task text");
+  }
+  return text;
+}
+
+function handoffLost(file, what) {
+  return new Error(
+    `Background handoff lost: the task file ${file} ${what}. The run was not started rather than started without its task.`
+  );
+}
+
+function errorCode(error) {
+  return error?.code ?? error?.message ?? String(error);
 }
 
 function output(rendered, payload, asJson) {
@@ -792,7 +836,8 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
   // the prompt alone — a brief-sized silence, since the run still started.
   // 0600 because the text is the contents of somebody's repository.
   const promptFile = resolvePromptFile(workspaceRoot, jobId);
-  fs.writeFileSync(promptFile, prompt ?? "", { encoding: "utf8", mode: 0o600 });
+  const handedText = prompt ?? "";
+  fs.writeFileSync(promptFile, handedText, { encoding: "utf8", mode: 0o600 });
 
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
     cwd: process.cwd(),
@@ -803,6 +848,7 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
       [DETACHED_ENV]: "1",
       [DETACHED_JOB_ENV]: jobId,
       [DETACHED_PROMPT_ENV]: promptFile,
+      [DETACHED_PROMPT_CHARS_ENV]: String(handedText.length),
       // Decisions the parent already made and the child must not remake: it
       // re-executes the same command line, and "last" or a cache TTL can
       // resolve differently by the time it does.
@@ -1282,7 +1328,7 @@ async function commandContinue(argv, workspaceRoot) {
   const reference = flags.session ?? (words.length > 1 && isSessionReference(words[0]) ? words.shift() : null);
 
   const handedOver = takeDetachedPrompt();
-  const piped = !handedOver && flags.stdin ? readStdin().trim() : "";
+  const piped = !handedOver && flags.stdin ? readPipedTask() : "";
   const prompt = handedOver ?? [words.join(" ").trim(), piped].filter(Boolean).join("\n\n");
   if (!prompt) {
     throw new Error(
@@ -1402,7 +1448,7 @@ async function commandDelegate(argv, workspaceRoot) {
   // A detached run gets the text its parent already assembled: re-reading stdin
   // here would find it closed and quietly drop whatever was piped in.
   const handedOver = takeDetachedPrompt();
-  const piped = !handedOver && flags.stdin ? readStdin().trim() : "";
+  const piped = !handedOver && flags.stdin ? readPipedTask() : "";
   const prompt = handedOver ?? [positional.join(" ").trim(), piped].filter(Boolean).join("\n\n");
 
   if (!prompt) {
@@ -2129,7 +2175,6 @@ async function commandEvents(argv, workspaceRoot) {
   };
 
   const history = readFleetEvents();
-
   if (!flags.follow) {
     const rows = history.events.filter(belongsHere).slice(-tailCount);
     if (!rows.length && !flags.json) {
@@ -2428,7 +2473,7 @@ async function commandRerun(argv, workspaceRoot) {
   const prompt =
     handedOver ??
     composeRerunPrompt(recorded, {
-      replacement: flags.prompt ?? (flags.stdin ? readStdin().trim() : null),
+      replacement: flags.prompt ?? (flags.stdin ? readPipedTask() : null),
       append: flags.append ?? []
     });
   if (!prompt) {

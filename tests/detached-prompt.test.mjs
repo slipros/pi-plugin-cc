@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 process.env.PI_PLUGIN_DB = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-journal-detached-")), "jobs.db");
 
@@ -10,6 +12,8 @@ const { takeDetachedPrompt } = await import("../plugins/pi/scripts/pi-companion.
 const state = await import("../plugins/pi/scripts/lib/state.mjs");
 
 const PROMPT_ENV = "PI_PLUGIN_PROMPT_FILE";
+const CHARS_ENV = "PI_PLUGIN_PROMPT_CHARS";
+const COMPANION = fileURLToPath(new URL("../plugins/pi/scripts/pi-companion.mjs", import.meta.url));
 
 function withWorkspace(run) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-detached-"));
@@ -17,12 +21,14 @@ function withWorkspace(run) {
   fs.mkdirSync(workspaceRoot);
   const previousData = process.env.CLAUDE_PLUGIN_DATA;
   const previousPrompt = process.env[PROMPT_ENV];
+  const previousChars = process.env[CHARS_ENV];
   process.env.CLAUDE_PLUGIN_DATA = dataDir;
   try {
     return run(workspaceRoot);
   } finally {
     restore("CLAUDE_PLUGIN_DATA", previousData);
     restore(PROMPT_ENV, previousPrompt);
+    restore(CHARS_ENV, previousChars);
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 }
@@ -59,18 +65,80 @@ test("a foreground run resolves its own task, as before", () => {
   });
 });
 
-test("an unusable handoff falls back instead of running on an empty prompt", () => {
+test("an unusable handoff stops the run instead of starting it on the title alone", () => {
   withWorkspace((workspaceRoot) => {
+    // Falling back to the command line is what let a brief go missing quietly:
+    // with --stdin the command line carries only the title, and the agent ran,
+    // billed, and reported that it had no task.
     state.ensureStateDir(workspaceRoot);
     process.env[PROMPT_ENV] = state.resolvePromptFile(workspaceRoot, "never-written");
-    assert.equal(takeDetachedPrompt(), null, "a missing file is not an empty task");
+    assert.throws(() => takeDetachedPrompt(), /handoff lost.*could not be read/i, "a missing file is a lost task");
 
     const blank = state.resolvePromptFile(workspaceRoot, "blank");
     fs.writeFileSync(blank, "   \n\n");
     process.env[PROMPT_ENV] = blank;
-    assert.equal(takeDetachedPrompt(), null, "whitespace is not a task either");
+    assert.throws(() => takeDetachedPrompt(), /handoff lost.*no task text/i, "whitespace is not a task either");
   });
 });
+
+test("a handoff shorter than what the parent wrote is refused", () => {
+  withWorkspace((workspaceRoot) => {
+    state.ensureStateDir(workspaceRoot);
+    const file = state.resolvePromptFile(workspaceRoot, "cut");
+    fs.writeFileSync(file, "Задача B18f — текст ниже.");
+    process.env[PROMPT_ENV] = file;
+    process.env[CHARS_ENV] = "4170";
+    assert.throws(() => takeDetachedPrompt(), /holds 25 characters, the parent wrote 4170/);
+  });
+});
+
+test("the handoff is not inherited by what the detached run starts", () => {
+  withWorkspace((workspaceRoot) => {
+    state.ensureStateDir(workspaceRoot);
+    const brief = "Задача 12.\n\nподробности";
+    const file = state.resolvePromptFile(workspaceRoot, "inherited");
+    fs.writeFileSync(file, brief);
+    process.env[PROMPT_ENV] = file;
+    process.env[CHARS_ENV] = String(brief.length);
+
+    assert.equal(takeDetachedPrompt(), brief);
+    // An agent running `pia` inside the run would see these and look for a file
+    // that was already consumed — and now that is an error, not a no-op.
+    assert.equal(process.env[PROMPT_ENV], undefined);
+    assert.equal(process.env[CHARS_ENV], undefined);
+  });
+});
+
+for (const [command, args] of [
+  ["delegate", ["delegate", "--stdin", "Задача B24 — текст ниже."]],
+  ["continue", ["continue", "--stdin", "Дозаход по задаче — текст ниже."]],
+  ["rerun", ["rerun", "delegate-nonexistent", "--stdin"]]
+]) {
+  test(`${command} --stdin with nothing piped in refuses to start`, () => {
+    // The shape that lost two reviews: `cat <path of a finished session> | pia
+    // delegate --stdin "title"` — cat fails, stdin is empty, and the title
+    // alone used to become the task.
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-stdin-"));
+    try {
+      const result = spawnSync(process.execPath, [COMPANION, ...args], {
+        cwd: dataDir,
+        input: "",
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CLAUDE_PLUGIN_DATA: dataDir,
+          PI_PLUGIN_DB: path.join(dataDir, "jobs.db"),
+          [PROMPT_ENV]: "",
+          [CHARS_ENV]: ""
+        }
+      });
+      assert.equal(result.status, 1, `exit code; stderr: ${result.stderr}`);
+      assert.match(result.stderr, /--stdin was given, but stdin was empty/);
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("job state outlives a reboot", () => {
   const previousData = process.env.CLAUDE_PLUGIN_DATA;

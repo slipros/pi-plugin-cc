@@ -192,7 +192,22 @@ export function eventBelongsToOwner(event = {}, owner = null) {
   if (!owner || !event.owner) {
     return true;
   }
-  return event.owner === owner;
+  return sameOwner(event.owner, owner);
+}
+
+/**
+ * Whether a recorded owner is the session named.
+ *
+ * The short form counts: it is what the channel banner and `session:` print,
+ * so it is what gets copied into `--owner`. Matching the full id only turned a
+ * copied `--owner b35f5575` into a channel that armed, named the right session,
+ * and then passed nothing but unowned runs — three waves ended unheard.
+ */
+export function sameOwner(recorded, named) {
+  if (!recorded || !named) {
+    return false;
+  }
+  return recorded === named || shortOwner(recorded) === named;
 }
 
 /** Key identifying one announcement, so the same ending is not reported twice. */

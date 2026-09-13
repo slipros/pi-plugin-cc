@@ -213,6 +213,20 @@ test("re-recording an orphan event keeps its owner — otherwise a death becomes
   });
 });
 
+test("a session is recognised by the short id the channel prints", () => {
+  // The banner and `session:` print the first segment, so that is what gets
+  // copied into --owner; matching only the full id let a channel arm on the
+  // right session and then pass none of its runs.
+  const mine = { id: "a", owner: "b35f5575-c06c-4153-a603-52311aec971e" };
+  const theirs = { id: "b", owner: "278782d4-0e84-4f6e-bf97-306876745340" };
+
+  assert.equal(eventBelongsToOwner(mine, "b35f5575"), true);
+  assert.equal(eventBelongsToOwner(mine, "b35f5575-c06c-4153-a603-52311aec971e"), true);
+  assert.equal(eventBelongsToOwner(theirs, "b35f5575"), false);
+  // Only the printed form, not any prefix: "b35" is not a session anyone was shown.
+  assert.equal(eventBelongsToOwner(mine, "b35"), false);
+});
+
 test("a supervisor hears its own runs and unowned ones, never another supervisor's", () => {
   const mine = { id: "a", owner: "sess-alpha" };
   const theirs = { id: "b", owner: "sess-beta" };

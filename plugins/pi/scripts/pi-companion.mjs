@@ -54,6 +54,7 @@ import {
   orphanEvents,
   readFleetEvents,
   recordFleetEvent,
+  sameOwner,
   shortOwner
 } from "./lib/fleet-events.mjs";
 import { getPiAvailability, PI_BINARY, runPiTurn } from "./lib/pi.mjs";
@@ -2175,6 +2176,17 @@ async function commandEvents(argv, workspaceRoot) {
   };
 
   const history = readFleetEvents();
+  // A session named by hand that no run in the log carries is almost always a
+  // wrong id, and a follower on a wrong id is indistinguishable from a quiet
+  // fleet. Saying so at arming time is the only moment anyone reads it.
+  const unknownOwner =
+    flags.owner && !flags.all && !history.events.some((event) => sameOwner(event.owner, flags.owner))
+      ? `No run in the log was started by session ${flags.owner} — check the id against \`events --all\`.\n`
+      : "";
+  if (unknownOwner && !flags.json) {
+    process.stderr.write(unknownOwner);
+  }
+
   if (!flags.follow) {
     const rows = history.events.filter(belongsHere).slice(-tailCount);
     if (!rows.length && !flags.json) {

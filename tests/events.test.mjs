@@ -217,6 +217,28 @@ test("one supervisor does not hear another supervisor's runs", () => {
   });
 });
 
+test("--owner takes the short session id the channel prints", () => {
+  withWorkspace((workspaceRoot, dataDir) => {
+    const previous = "b35f5575-c06c-4153-a603-52311aec971e";
+    recordFleetEvent({ id: "delegate-before-resume", status: "completed", workspaceRoot, claudeSessionId: previous });
+    recordFleetEvent({ id: "delegate-neighbour", status: "completed", workspaceRoot, claudeSessionId: "278782d4-0e84-4f6e-bf97-306876745340" });
+
+    const adopted = runEvents(workspaceRoot, ["--owner", "b35f5575"], dataDir, "sess-alpha");
+    assert.match(adopted.stdout, /delegate-before-resume/, "the id as printed in `session:` has to work");
+    assert.ok(!adopted.stdout.includes("delegate-neighbour"));
+    assert.equal(adopted.stderr, "", "a known session is not warned about");
+  });
+});
+
+test("--owner naming a session no run carries is flagged, not silently followed", () => {
+  withWorkspace((workspaceRoot, dataDir) => {
+    recordFleetEvent({ id: "delegate-mine", status: "completed", workspaceRoot, claudeSessionId: "sess-alpha" });
+
+    const typo = runEvents(workspaceRoot, ["--owner", "b35f557"], dataDir, "sess-alpha");
+    assert.match(typo.stderr, /No run in the log was started by session b35f557/);
+  });
+});
+
 test("a session with runs only from others is told they exist rather than shown an empty log", () => {
   withWorkspace((workspaceRoot, dataDir) => {
     recordFleetEvent({ id: "delegate-theirs", status: "completed", workspaceRoot, claudeSessionId: "sess-beta" });

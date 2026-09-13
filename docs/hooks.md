@@ -80,7 +80,9 @@ Two behaviours are worth knowing before using `--fix`:
 - **No commit on top of `--base` means the working tree is the only output of the run.** It is reported as unsaved work, `git checkout --` is not offered, and `--fix` cleans nothing. An earlier version called it a tail and offered to discard it — a mutation probe on that version confirmed it destroyed finished work.
 - **`--qa` accepts a QA run**, where "defect found" is success. Such an agent finishes without a commit by construction, leaving a red test in the tree as the reproduction — that *is* the result. Test paths are not a tail there and `--fix` does not touch them; production paths still are, since QA does not write them.
 
-Platform artifacts are recognised by platform, not by name: an ELF `.venv/bin/python`, ELF `*.node` bindings, a `go.work` pointing at `/workspace`. A host-built frontend `node_modules` is not an artifact.
+Platform artifacts are recognised by platform, not by name: an ELF `.venv/bin/python`, ELF `*.node` bindings, a `go.work` pointing at `/workspace`. A host-built frontend `node_modules` is not an artifact. The ELF checks run on macOS hosts only: on a Linux host ELF is the native format, a container build is indistinguishable from a host one, and `--fix` would delete a legitimate host `.venv`. A `go.work` pointing at `/workspace` breaks the host build on any platform.
+
+Untracked lock files and coverage data (`*.lock`, `package-lock.json`, `pnpm-lock.yaml`, `.coverage*`) fail the acceptance too: they are never epic documents, and left outside the commit they ride along in the next task's commit. The supervisor decides whether to delete or commit them.
 
 Exit codes: `0` — clean (or the noise was cleaned by `--fix`), `1` — there is a tail, `2` — bad invocation.
 

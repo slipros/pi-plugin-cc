@@ -29,6 +29,27 @@ function withWorkspace(run) {
   }
 }
 
+// An async body needs an awaiting helper: the sync one restores the environment and
+// removes the fixture at the body's first await, and the rest of the test writes into
+// the real plugin state (docs/development.md, "Async bodies need an async helper").
+async function withWorkspaceAsync(run) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-inbox-"));
+  const workspaceRoot = path.join(dataDir, "repo");
+  fs.mkdirSync(workspaceRoot);
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = dataDir;
+  try {
+    return await run(workspaceRoot);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
 test("messages are appended and read back in order", () => {
   withWorkspace((workspaceRoot) => {
     pushControlMessage(workspaceRoot, "job-1", { kind: "steer", message: "look at auth" });
@@ -84,7 +105,7 @@ test("corrupt lines are skipped, valid ones still arrive", () => {
 });
 
 test("the watcher ignores pre-existing messages and delivers new ones", async () => {
-  await withWorkspace(async (workspaceRoot) => {
+  await withWorkspaceAsync(async (workspaceRoot) => {
     pushControlMessage(workspaceRoot, "job-1", { kind: "steer", message: "before the watcher" });
 
     const seen = [];

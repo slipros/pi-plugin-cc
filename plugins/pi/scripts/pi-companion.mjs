@@ -16,7 +16,15 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { allPresetCapabilities } from "./lib/capabilities.mjs";
-import { loadConfig, resolveRunSettings, userConfigPath, workspaceIsTrusted } from "./lib/config.mjs";
+import {
+  concatAdditive,
+  loadConfig,
+  normalizeConcurrencyPool,
+  resolvePresetReference,
+  resolveRunSettings,
+  userConfigPath,
+  workspaceIsTrusted
+} from "./lib/config.mjs";
 import {
   captureTreeSnapshot,
   collectReviewContext,
@@ -29,6 +37,7 @@ import {
   summarizeTreeChanges
 } from "./lib/git.mjs";
 import { resolveGitProxyHosts } from "./lib/git-proxy.mjs";
+import { describeOtelTelemetry } from "./lib/otel-export.mjs";
 import {
   appendLogLine,
   buildStatusSnapshot,
@@ -52,6 +61,15 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { buildSystemPrompt, interpolate, listNamedPrompts, loadTaskTemplate } from "./lib/prompts.mjs";
 import { inboxPath, pushControlMessage } from "./lib/inbox.mjs";
 import { parseJsonLine } from "./lib/jsonl.mjs";
+import {
+  classifyPoolFailure,
+  clearAllPools,
+  clearPool,
+  deadPools,
+  loadPoolHealthState,
+  partitionByPoolHealth,
+  recordPoolFailure
+} from "./lib/pool-health.mjs";
 import { runPiRpcTurn } from "./lib/rpc.mjs";
 import {
   cacheState,
@@ -64,6 +82,7 @@ import {
 import { renderTranscriptEvent } from "./lib/transcript.mjs";
 import {
   attachMounts,
+  awaitVariantSlot,
   buildSandboxImage,
   cleanupCredentialSlices,
   containerNameForJob,
@@ -75,6 +94,7 @@ import {
   removeSandboxContainer,
   listSandboxImages,
   sandboxDockerfile,
+  sandboxForRun,
   sandboxMountGaps,
   sandboxPreflight,
   sandboxRunWarnings,
@@ -116,6 +136,7 @@ import {
   databasePath,
   openDatabase,
   pruneJournalText,
+  queryPresetHealth,
   queryRun,
   queryRuns,
   queryStats,
@@ -123,6 +144,7 @@ import {
   recordJobSafely,
   DEFAULT_TEXT_TTL_DAYS
 } from "./lib/db.mjs";
+import { resolvePresetFallback } from "./lib/fallback.mjs";
 
 const PLUGIN_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -271,6 +293,9 @@ const RUN_FLAGS = {
     // Continue a session whose provider cache has aged out, paying for the
     // whole history again on purpose.
     "stale-ok",
+    // Refuse the fallback swap for this run: measuring a provider or debugging
+    // it needs the run to die where it was aimed, not quietly move elsewhere.
+    "no-fallback",
     "stdin",
     "no-tools",
     "no-builtin-tools",
@@ -344,6 +369,8 @@ const KNOWN_FLAGS = new Set([
   "diff",
   "prune",
   "full",
+  "reset",
+  "reset-all",
   "kind",
   "poll",
   "workspace"
@@ -395,6 +422,7 @@ function usage() {
     `  ${self} steer [job-id] [--follow-up] <message>`,
     `  ${self} watch [job-id] [--follow [--for <s>]] [--since <cursor>] [--tail <n>] [--json]`,
     `  ${self} stats [--by day|model|preset|workspace|kind|status] [--days N|--all] [--json]`,
+    `  ${self} pools [--reset <pool>|--reset-all] [--json]`,
     `  ${self} sandbox [status|build [name|--all]|clean] [--image <tag>]`,
     "                            [--dockerfile <name|path>] [--pi-version <v>]",
     "",
@@ -403,6 +431,7 @@ function usage() {
     "  --provider <name>       provider name",
     "  --thinking <level>      off|minimal|low|medium|high|xhigh|max",
     "  --preset <name>         preset from .claude/pi/config.json",
+    "  --no-fallback           keep the named preset even if the journal calls it dead",
     "  --system-prompt <v>     stored prompt name (reviewer, fixer, …), @path/to.md, or inline text",
     "  --append-system-prompt  additive prompt text or file (repeatable)",
     "  --read-only             restrict pi to reading: read, grep, find, ls + LSP navigation",
@@ -535,6 +564,10 @@ function resolveSessionReference(workspaceRoot, reference) {
 /**
  * Turn parsed flags + config into the concrete settings of one run.
  */
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 export function buildRunSettings({ command, flags, workspaceRoot, runRoot = workspaceRoot, config, trusted = true }) {
   const overrides = {
     model: flags.model ?? null,
@@ -587,6 +620,48 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
   }
   const prompt = buildSystemPrompt({ pluginRoot: PLUGIN_ROOT, workspaceRoot, config, settings });
 
+  // A preset listing pools runs as one of several variants; resolve them here
+  // so everything downstream (prompt, sandbox, warnings) sees a shaped
+  // settings object, while the actual variant is picked later, at slot time.
+  const poolPreset = settings.presetName ? config.presets?.[settings.presetName] : null;
+  const poolPlan = buildVariants(poolPreset, config, {
+    poolPin: settings.presetPool ?? null,
+    modelWanted: flags.model ?? null
+  });
+  if (!poolPlan.variants.length && settings.presetPool) {
+    // A pin that survives resolution but matches nothing (the pool holds no
+    // model of this preset, or `--model` filtered the pinned pool down to
+    // zero) used to fall through and run on pi's default model, without the
+    // pool's limit. The name was asked for on purpose: refuse, naming what
+    // the preset actually has.
+    const available = (poolPreset.models ?? []).map((id) => {
+      for (const [poolName, pool] of Object.entries(config.concurrencyPools ?? {})) {
+        if (pool?.models?.[id]) return `${id} (${poolName})`;
+      }
+      return id;
+    });
+    throw new Error(
+      `Preset "${settings.presetName}" has no models in pool "${settings.presetPool}"` +
+        (flags.model ? ` matching --model "${flags.model}"` : "") +
+        `. Refusing instead of running without the pool. ` +
+        (available.length ? `Available models: ${available.join(", ")}.` : "The preset lists no models.")
+    );
+  }
+  if (poolPlan.variants.length) {
+    // The first candidate stands in until the slot wait picks the real one:
+    // preflight, mount gaps and the label only need a sandbox shaped like the
+    // one that will run.
+    settings.sandbox = poolPlan.variants[0].sandbox;
+    settings.model = poolPlan.modelOverride;
+    settings.sandboxVariants = poolPlan.variants;
+    settings.poolWaitMs = Number(config.poolWaitMs ?? 30_000);
+    settings.poolCooldowns = {
+      balanceMs: Number(config.poolCooldownBalanceMs ?? 3_600_000),
+      quotaMs: Number(config.poolCooldownQuotaMs ?? 86_400_000),
+      networkMs: Number(config.poolCooldownNetworkMs ?? 30_000)
+    };
+  }
+
   const warnings = [];
   if (runRoot !== workspaceRoot) {
     // The agent edits a tree the caller is not sitting in, and without a
@@ -595,7 +670,7 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
       `The agent runs in ${runRoot}, outside this workspace. Its edits land there, not in ${workspaceRoot}.`
     );
   }
-  let sandbox = applyConcurrencyPool(normalizeSandbox(settings.sandbox, config.sandboxProfiles), config);
+  let sandbox = sandboxForRun(settings, config);
   let worktreeMount = null;
   if (settings.mounts.length && !isSandboxed(sandbox)) {
     // Without a container there is nothing to mount into: pi already sees the
@@ -617,11 +692,23 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
     // in hand; the proxy itself starts per run, next to the credential one.
     sandbox = { ...sandbox, gitProxyHosts: resolveGitProxyHosts(config, sandbox) };
     // A worktree cannot see its own repository through /workspace alone, so the
-    // shared .git is mounted for it. Listed before the run's own mounts, which
-    // therefore win the deduplication if one names the same target explicitly.
+    // shared .git is mounted for it. Attached after the run's own mounts, so on
+    // a shared container path the read-only guard wins — isolation over
+    // convenience, and deliberately in that direction. What this owes the user
+    // instead is a named warning: a mount written by hand and dropped without a
+    // word is a silent misconfiguration, not a decision.
     const worktreeMounts = resolveWorktreeMount(runRoot) ?? [];
     worktreeMount = worktreeMounts[0] ?? null;
-    sandbox = attachMounts(sandbox, [...worktreeMounts, ...settings.mounts]);
+    const guardTargets = new Set(worktreeMounts.map((mount) => String(mount).split(":")[1]));
+    for (const mount of settings.mounts) {
+      const target = String(mount).split(":")[1];
+      if (target && guardTargets.has(target)) {
+        warnings.push(
+          `Mount \`${mount}\` is overridden by the read-only guard on the shared .git of this worktree; that container path is not yours to replace.`
+        );
+      }
+    }
+    sandbox = attachMounts(sandbox, worktreeMounts);
     const identity = gitIdentityEnv(settings.git);
     if (Object.keys(identity).length) {
       sandbox = {
@@ -637,7 +724,9 @@ export function buildRunSettings({ command, flags, workspaceRoot, runRoot = work
 
     // A missing daemon or image is a setup problem: fail before a job record
     // exists rather than recording a run that never started.
-    const preflight = sandboxPreflight(sandbox);
+    // Mount sources are judged against the run root, the same tree docker
+    // resolves a relative `-v` source against at container creation.
+    const preflight = sandboxPreflight(sandbox, { cwd: runRoot });
     if (!preflight.ok) {
       throw new Error(`Sandbox is not ready.\n- ${preflight.errors.join("\n- ")}`);
     }
@@ -793,6 +882,7 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
     runRoot: settings.runRoot ?? workspaceRoot,
     model: settings.model,
     preset: settings.presetName,
+    requestedPreset: settings.requestedPresetName ?? settings.presetName,
     sandbox: settings.sandboxLabel,
     background: true,
     detached: true,
@@ -819,6 +909,7 @@ function detachBackgroundRun({ kind, workspaceRoot, jobId, title, prompt, settin
 function rerunRecipe(settings) {
   const recipe = {
     preset: settings.presetName ?? null,
+    requestedPreset: settings.requestedPresetName ?? settings.presetName ?? null,
     model: settings.model ?? null,
     provider: settings.provider ?? null,
     thinking: settings.thinking ?? null,
@@ -829,6 +920,142 @@ function rerunRecipe(settings) {
     budget: settings.budget ?? null
   };
   return Object.fromEntries(Object.entries(recipe).filter(([, value]) => value !== null));
+}
+
+/**
+ * Fold the candidate that won the slot race into the already developed
+ * settings. Only model-choice fields move; the developed sandbox (cache
+ * isolation, git proxy hosts, mounts, git identity) and its read-only guards
+ * must survive the pick — they belong to the workspace, not to the model.
+ */
+export function applyPickedVariant(settings, picked) {
+  settings.model = settings.model ?? picked.model;
+  // A bare `--model` name is a preset model id and runs on the winner's
+  // endpoint — the winner decides which account pays. A literal `provider/name`
+  // names its own provider (as `providerOf` read it before the slot race):
+  // keying the winner's credential on it would send that account a model it
+  // may not serve, and `modelIdFor` would not strip the foreign prefix.
+  // A winner's own `model` is `provider/name` too, so the prefix rule returns
+  // the winner's provider for it — the bare case keeps its current behavior.
+  const literal = typeof settings.model === "string" ? settings.model : "";
+  const separator = literal.indexOf("/");
+  const provider = settings.provider ?? (separator > 0 ? literal.slice(0, separator) : picked.provider);
+  settings.sandbox = {
+    ...settings.sandbox,
+    // The proxy keys the credential on the provider the run is addressed
+    // with, not on whichever candidate stood in during preflight.
+    provider,
+    samplingParams: picked.samplingParams ?? undefined,
+    poolName: picked.sandbox.poolName,
+    maxConcurrent: picked.sandbox.maxConcurrent,
+    ...(picked.sandbox.heldSlot ? { heldSlot: picked.sandbox.heldSlot } : {})
+  };
+  settings.sandboxLabel = describeSandbox(settings.sandbox);
+  settings.provider = provider;
+  // The model record's thinking overrides the preset's — that is how
+  // `*-local` (thinking off) and `*-zai` (low) collapse into one preset. A
+  // command-line flag still outranks both, hence the source check.
+  if (picked.thinking != null && !settings.thinkingFromFlag) {
+    settings.thinking = picked.thinking;
+  }
+  // Model records carry no tags (owner decision): the only consumer read the
+  // preset's, so a per-model tag had nowhere to go and nothing to say.
+}
+
+/**
+ * Drop candidates whose pool is under an unexpired liveness hold, before any
+ * slot waiting happens.
+ *
+ * Busy and dead are different reasons to pass over a pool: a busy pool costs
+ * at most `poolWaitMs` and then hands the run to the next candidate, while a
+ * dead one cannot free its slot at any horizon — waiting for it would spend
+ * the same `poolWaitMs` for nothing on every single dispatch. So liveness is
+ * settled first, on the plugin's own record of proven failures, and the slot
+ * race runs only over the survivors.
+ *
+ * When every candidate is dead the run does not refuse: it says so, naming
+ * each pool, its failure class and its probe deadline, and takes the pool
+ * whose deadline is nearest — waiting for the pool that comes back first
+ * beats falling over immediately on a task someone asked for.
+ *
+ * @returns {{variants: Array, message: string|null}} candidates for the slot
+ *          race, in their original priority order (or deadline order when all
+ *          are dead), plus the line to print when nothing was skipped silently
+ */
+export function selectLiveVariants(variants, { now = Date.now() } = {}) {
+  const { alive, dead, deadByPool } = partitionByPoolHealth(variants, { now });
+  if (!dead.length) {
+    return { variants, message: null };
+  }
+  const describe = (variant) =>
+    `pool "${variant.pool}" (${deadByPool[variant.pool].class}, until ${deadByPool[variant.pool].retryAt}: ${deadByPool[variant.pool].reason})`;
+  const skipped = dead.map(describe).join(", ");
+  if (alive.length) {
+    return {
+      variants: alive,
+      message: `Skipping dead ${dead.length === 1 ? "pool" : "pools"}: ${skipped}.`
+    };
+  }
+  return {
+    // Deadline order: the probe race starts with the pool that returns first.
+    variants: dead,
+    message:
+      "Every pool of this preset is dead; taking the one whose probe deadline is nearest. " +
+      `${dead.map(describe).join(", ")}.`
+  };
+}
+
+/**
+ * Feed the run's outcome back into the pool liveness record.
+ *
+ * A successful run proves the pool works and erases the record entirely, so
+ * the next dispatch skips nothing. A failed run only moves the record when the
+ * refusal belongs to the POOL — balance, quota, unreachable endpoint. A `400`
+ * or an unknown-model error says nothing about the account behind the pool,
+ * and recording it would let one mistyped command evict a live pool.
+ *
+ * Runs without a pool (no preset, or a preset of the old shape) leave no
+ * record and read none, whatever the state file holds.
+ */
+export function settlePoolHealth(settings, execution, thrownError) {
+  const pool = settings?.sandbox?.poolName;
+  if (!pool || !settings?.poolCooldowns) {
+    return null;
+  }
+  if (!thrownError && Number(execution?.exitStatus ?? 1) === 0) {
+    clearPool(pool);
+    return null;
+  }
+  // Classify per element, never over the joined text: both engines append the
+  // process's stderr tail as one trailing element, and a bare `429` or `fetch
+  // failed` in an unrelated stderr line must not cost a live pool its day —
+  // the owner runs this without a human in the loop. Only the provider channel
+  // (an engine event's `errorMessage`, or a thrown error) may evict a pool.
+  const channel = thrownError
+    ? [thrownError instanceof Error ? thrownError.message : String(thrownError)]
+    : [];
+  if (!thrownError) {
+    const stderrTail = typeof execution?.stderr === "string" ? execution.stderr.trim() : "";
+    for (const line of execution?.errors ?? []) {
+      if (stderrTail && line === stderrTail) {
+        continue;
+      }
+      channel.push(line);
+    }
+  }
+  let verdict = null;
+  for (const text of channel) {
+    verdict = classifyPoolFailure(text);
+    if (verdict) {
+      break;
+    }
+  }
+  if (!verdict) {
+    return null;
+  }
+  const { balanceMs, quotaMs, networkMs } = settings.poolCooldowns;
+  const record = recordPoolFailure(pool, verdict.class, verdict.reason, { balanceMs, quotaMs, networkMs });
+  return { pool, ...record };
 }
 
 /**
@@ -849,6 +1076,29 @@ async function executeRun({
   const logFile = createJobLogFile(workspaceRoot, jobId, title);
   const eventsFile = eventsPath(workspaceRoot, jobId);
   const inboxFile = inboxPath(workspaceRoot, jobId);
+  // The variant to run as is chosen here, not in the engine: the job record
+  // must name the model that actually runs, and the credential proxy keys on
+  // it. The claimed slot travels inside the sandbox (`heldSlot`), so the
+  // engine's own queue hands it through instead of waiting twice.
+  const onProgress = createProgressReporter({
+    workspaceRoot,
+    jobId,
+    logFile,
+    stderr: Boolean(flags.background)
+  });
+  if (settings.sandboxVariants?.length) {
+    const live = selectLiveVariants(settings.sandboxVariants);
+    if (live.message) {
+      onProgress({ phase: "starting", message: live.message });
+    }
+    const picked = await awaitVariantSlot(live.variants, {
+      poolWaitMs: settings.poolWaitMs ?? 30_000,
+      timeoutMs: settings.timeoutMs,
+      onProgress
+    });
+    applyPickedVariant(settings, picked);
+  }
+
   const job = createJobRecord({
     id: jobId,
     kind,
@@ -863,6 +1113,7 @@ async function executeRun({
     model: settings.model,
     systemPromptName: settings.promptName,
     preset: settings.presetName,
+    requestedPreset: settings.requestedPresetName ?? settings.presetName,
     readOnly: settings.readOnly,
     sandbox: settings.sandboxLabel,
     background: Boolean(flags.background),
@@ -880,13 +1131,6 @@ async function executeRun({
 
   writeJobFile(workspaceRoot, jobId, job);
   upsertJob(workspaceRoot, job);
-
-  const onProgress = createProgressReporter({
-    workspaceRoot,
-    jobId,
-    logFile,
-    stderr: Boolean(flags.background)
-  });
 
   for (const warning of settings.warnings) {
     onProgress({ message: `Warning: ${warning}` });
@@ -987,9 +1231,12 @@ async function executeRun({
   } catch (error) {
     // `runTrackedJob` has already recorded the failure; this only announces
     // it. Rethrown untouched afterwards so the command still reports it.
+    settlePoolHealth(settings, null, error);
     announceTerminal("failed");
     throw error;
   }
+
+  settlePoolHealth(settings, execution, null);
 
   announceTerminal(execution.aborted ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed", execution);
 
@@ -1008,7 +1255,8 @@ async function commandSetup(argv, workspaceRoot) {
       configured: describeSandbox(configuredSandbox),
       image: isSandboxed(configuredSandbox) ? configuredSandbox.image : DEFAULT_SANDBOX_IMAGE,
       ready: sandboxPreflight(
-        isSandboxed(configuredSandbox) ? configuredSandbox : { mode: "docker", image: DEFAULT_SANDBOX_IMAGE }
+        isSandboxed(configuredSandbox) ? configuredSandbox : { mode: "docker", image: DEFAULT_SANDBOX_IMAGE },
+        { cwd: workspaceRoot }
       ).ok
     },
     configSources: sources,
@@ -1016,7 +1264,9 @@ async function commandSetup(argv, workspaceRoot) {
     presets: Object.keys(config.presets ?? {}),
     prompts: [...listNamedPrompts(PLUGIN_ROOT, workspaceRoot).keys()].sort(),
     stateDir: resolveStateDir(workspaceRoot),
-    userConfigPath: userConfigPath()
+    userConfigPath: userConfigPath(),
+    // R7: the single window into the exporter's state; headers only as a count (R8).
+    telemetry: describeOtelTelemetry(process.env)
   };
 
   output(renderSetupReport(payload), payload, Boolean(flags.json));
@@ -1031,6 +1281,31 @@ async function commandSetup(argv, workspaceRoot) {
  * to" is asked constantly — by a person choosing, and by the hook that answers
  * the same question on every delegation.
  */
+/**
+ * The candidate models of every preset, in choice order.
+ *
+ * A broken preset yields no plan instead of throwing: this listing is what
+ * hooks and people consult when deciding whom to hand work to, and one bad
+ * entry must not mute the whole answer.
+ */
+export function presetPlansFor(config) {
+  const plans = {};
+  for (const [name, preset] of Object.entries(config.presets ?? {})) {
+    try {
+      const { variants } = buildVariants(preset, config);
+      if (variants.length) {
+        plans[name] = {
+          models: variants.map((variant) => ({ id: variant.id, pool: variant.pool, provider: variant.provider })),
+          sandbox: typeof preset.sandbox === "string" ? preset.sandbox : null
+        };
+      }
+    } catch {
+      // No plan for this preset; the error surfaces on the run itself.
+    }
+  }
+  return plans;
+}
+
 async function commandPresets(argv, workspaceRoot) {
   const { flags } = parseArgs(argv, { booleans: ["json"] });
   const { config } = loadConfig(workspaceRoot);
@@ -1040,7 +1315,12 @@ async function commandPresets(argv, workspaceRoot) {
     // Kept beside the presets rather than merged into them: these values are
     // derived, and a reader that cannot tell them apart from what the user
     // wrote will eventually write one back into the config.
-    capabilities: allPresetCapabilities(config)
+    capabilities: allPresetCapabilities(config),
+    // Per-preset candidate models (id, pool, provider) in choice order, plus
+    // the sandbox service. A preset that cannot resolve (unknown model id,
+    // unknown service) degrades to no plan rather than muting the listing —
+    // the same answer the capability column gives for a broken sandbox.
+    plans: presetPlansFor(config)
   };
   // Model limits cost a pass over the catalogue (~1s), so they are fetched only
   // for the human report: `presets --json` is what hooks call on every rejected
@@ -1101,26 +1381,118 @@ function providerOf(settings) {
 }
 
 /**
- * Resolve a profile's slot allowance from the pool it belongs to.
- *
- * The limit lives with the pool rather than with each profile, so profiles
- * sharing a provider cannot disagree about how many sessions that provider
- * allows. A profile that names no pool keeps whatever `maxConcurrent` it set
- * for itself, which is the default and needs no configuration at all.
+ * The model registry: every pool's `models` records indexed by their globally
+ * unique id. Built from the merged config at use time — pools are merged entry
+ * by entry across layers, so the registry reflects whatever layers survived.
  */
-export function applyConcurrencyPool(sandbox, config) {
-  const group = sandbox?.concurrencyGroup;
-  if (!group) {
-    return sandbox;
+export function modelRegistry(config) {
+  const registry = new Map();
+  for (const [poolName, pool] of Object.entries(config?.concurrencyPools ?? {})) {
+    if (!isPlainObject(pool) || !isPlainObject(pool.models)) {
+      continue;
+    }
+    for (const [id, model] of Object.entries(pool.models)) {
+      if (registry.has(id)) {
+        throw new Error(
+          `Model id "${id}" is defined in both pool "${registry.get(id).pool}" and pool "${poolName}". Model ids are globally unique.`
+        );
+      }
+      registry.set(id, { ...model, id, pool: poolName });
+    }
   }
-  const limit = Number(config?.concurrencyPools?.[group]);
-  if (!Number.isFinite(limit) || limit <= 0) {
-    throw new Error(
-      `Sandbox profile references concurrency pool "${group}", which is not defined. ` +
-        `Add "concurrencyPools": {"${group}": <slots>} to the config, or drop concurrencyGroup.`
-    );
+  return registry;
+}
+
+/**
+ * Expand a preset's `models` list into the concrete candidates it may run as.
+ *
+ * A model record carries provider, name and (optionally) thinking and
+ * `samplingParams`; the preset lists ids in preference order and names one
+ * sandbox for the role. The pool each candidate draws slots from is the pool
+ * its record sits in — by construction every model of one account shares one
+ * quota (`poolName = <pool>`, `maxConcurrent = pool.limit`), which is
+ * what makes two models of one account stay inside its allowance.
+ *
+ * `poolPin` (from a `<role>-<pool|alias|modelId>` alias) narrows the candidates
+ * to one pool; `modelWanted` (a `--model` naming a model id or provider/name)
+ * addresses one model directly, past busy-pool skipping — otherwise a concrete
+ * model could not be debugged. A `--model` matching nothing stays a literal
+ * override and rides whichever candidate wins the slot race (`modelOverride`).
+ */
+export function buildVariants(preset, config, { poolPin = null, modelWanted = null } = {}) {
+  const ids = Array.isArray(preset?.models) ? preset.models.map(String) : [];
+  if (!ids.length) {
+    return { variants: [], modelOverride: modelWanted ?? null };
   }
-  return { ...sandbox, maxConcurrent: limit };
+  const registry = modelRegistry(config);
+  const pools = config.concurrencyPools ?? {};
+  // One sandbox for the role, resolved once: the preset names the service, the
+  // pool of the chosen model adds its name (the slot scope) and its limit.
+  const roleSandbox = normalizeSandbox(preset.sandbox ?? null, config.sandboxProfiles ?? {});
+
+  const variants = ids.map((id, index) => {
+    const model = registry.get(id);
+    if (!model) {
+      const known = [...registry.keys()];
+      // The most common slip is addressing a model the old way, as
+      // provider/name. If the string names a model we do have, say so.
+      const alias = id.includes("/")
+        ? [...registry.values()].find((entry) => `${entry.provider}/${entry.name}` === id)
+        : null;
+      throw new Error(
+        `Preset references model "${id}", which is not defined.` +
+          (known.length ? ` Known models: ${known.join(", ")}.` : "") +
+          (alias ? ` "${id}" is provider/name — address this model by its id "${alias.id}".` : "")
+      );
+    }
+    const pool = pools[model.pool] ?? {};
+    // Already normalized with the layer; the limit is read, not re-validated.
+    const limit = Number(pool.limit);
+    const sandbox = {
+      ...roleSandbox,
+      poolName: model.pool,
+      maxConcurrent: limit,
+      ...(isPlainObject(model.samplingParams) ? { samplingParams: model.samplingParams } : {})
+    };
+    return {
+      id,
+      pool: model.pool,
+      // Bigger is better, so a pool that states no priority must sort LAST —
+      // negative infinity, not positive. The pool of a model nobody ranked is
+      // the fallback, never the first choice.
+      priority: Number(pool.priority ?? Number.NEGATIVE_INFINITY),
+      provider: model.provider,
+      model: `${model.provider}/${model.name}`,
+      thinking: model.thinking ?? null,
+      samplingParams: isPlainObject(model.samplingParams) ? model.samplingParams : null,
+      sandbox
+    };
+  });
+
+  let chosen = poolPin ? variants.filter((variant) => variant.pool === poolPin) : variants;
+  let modelOverride = null;
+  if (modelWanted) {
+    const addressed = chosen.filter((variant) => variant.id === modelWanted || variant.model === modelWanted);
+    if (addressed.length) {
+      chosen = addressed;
+    } else {
+      modelOverride = modelWanted;
+    }
+  }
+  // Higher priority runs first. The number is read the way people write it —
+  // 10 beats 1 — because the other reading cost a live run: the owner ranked
+  // the local vLLM `1` meaning "last resort", the code read it as "first in
+  // line", and every developer role went to the single-slot local model.
+  //
+  // Stable: equal priorities keep the preset's own listing order, so the list
+  // doubles as a tie-break.
+  return {
+    variants: chosen
+      .map((variant, index) => [variant, index])
+      .sort((a, b) => b[0].priority - a[0].priority || a[1] - b[1])
+      .map(([variant]) => variant),
+    modelOverride
+  };
 }
 
 /**
@@ -1194,8 +1566,12 @@ async function commandContinue(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
   const words = [...positional];
   // `continue last "…"`: a positional is taken as the reference only when it
-  // cannot be mistaken for the first word of the task.
-  const reference = flags.session ?? (words.length > 1 && isSessionReference(words[0]) ? words.shift() : null);
+  // cannot be mistaken for the first word of the task. With the task text
+  // arriving outside the positional list (`--stdin`, a detached handoff) that
+  // guard no longer applies — the lone positional is unambiguous, and letting
+  // it through glued the session id into the prompt while the run silently
+  // went to the newest session of the workspace.
+  const reference = flags.session ?? (words.length > 0 && isSessionReference(words[0]) ? words.shift() : null);
 
   const handedOver = takeDetachedPrompt();
   const piped = !handedOver && flags.stdin ? readStdin().trim() : "";
@@ -1239,17 +1615,26 @@ async function commandContinue(argv, workspaceRoot) {
   });
 
   // The recipe of the run that owns the session is the floor; flags override it
-  // the way they do on `rerun`.
+  // the way they do on `rerun`. An explicit --preset that names a different
+  // agent cancels the recipe's model/provider/thinking/engine/sandbox: those
+  // come from the new preset, or the run would pair the new preset's prompt
+  // and tools with the old run's model — the mismatch the caller was trying
+  // to leave.
   const recipe = session.recipe ?? {};
+  // A run that had no preset of its own is still a different agent once one is
+  // named: its model came from bare flags, and inheriting it would pair the new
+  // preset's prompt with the old run's model just as surely.
+  const presetSwitched = Boolean(flags.preset && flags.preset !== (recipe.preset ?? null));
+  const fromRecipe = presetSwitched ? {} : recipe;
   const runRoot = resolveRunRoot(flags.cwd ?? session.runRoot ?? null);
   const merged = {
     ...flags,
     preset: flags.preset ?? recipe.preset,
-    model: flags.model ?? recipe.model,
-    provider: flags.provider ?? recipe.provider,
-    thinking: flags.thinking ?? recipe.thinking,
-    engine: flags.engine ?? recipe.engine,
-    sandbox: flags.sandbox ?? recipe.sandbox,
+    model: flags.model ?? fromRecipe.model,
+    provider: flags.provider ?? fromRecipe.provider,
+    thinking: flags.thinking ?? fromRecipe.thinking,
+    engine: flags.engine ?? fromRecipe.engine,
+    sandbox: flags.sandbox ?? fromRecipe.sandbox,
     ...(recipe.readOnly && !flags.write ? { "read-only": true } : {}),
     timeout: flags.timeout ?? (recipe.timeoutMs ? String(Math.round(recipe.timeoutMs / 1000)) : undefined)
   };
@@ -1323,6 +1708,77 @@ async function commandSessions(argv, workspaceRoot) {
   return 0;
 }
 
+/**
+ * Swap a dead preset for the first live one of its fallback chain.
+ *
+ * The state of a preset comes from this plugin's own run journal, so the swap
+ * works on any machine the plugin is installed on. An unreadable journal means
+ * no substitution, exactly the behaviour the plugin had before: recording is
+ * best-effort everywhere else, and dispatch must not depend on it either.
+ *
+ * @returns {Promise<object>} settings, possibly re-resolved onto another preset
+ */
+async function applyFallbackPreset({ command, flags, workspaceRoot, runRoot, config, trusted, settings }) {
+  if (!settings.presetName) {
+    return settings;
+  }
+  const handle = openDatabase();
+  let runs = [];
+  if (handle) {
+    try {
+      runs = queryPresetHealth(handle);
+    } catch {
+      runs = [];
+    } finally {
+      handle.close();
+    }
+  }
+  const swap = resolvePresetFallback({ config, presetName: settings.presetName, runs });
+  if (!swap) {
+    return settings;
+  }
+  if (flags["no-fallback"]) {
+    // Silence would read as "the preset was healthy": name the swap that did
+    // not happen so the caller knows why the run is about to die where it did.
+    settings.warnings.push(
+      `Preset \`${settings.presetName}\` last failed on ${swap.dead.kind} ("${swap.dead.text.slice(0, 120)}") — ` +
+        `fallback to \`${swap.preset}\` suppressed by \`--no-fallback\`.`
+    );
+    return settings;
+  }
+  let swapped;
+  try {
+    swapped = buildRunSettings({
+      command,
+      flags: { ...flags, preset: swap.preset },
+      workspaceRoot,
+      runRoot,
+      config,
+      trusted
+    });
+  } catch (error) {
+    // A candidate that does not resolve (unknown sandbox profile, failing
+    // preflight) is not a reason to lose the run before it starts: the caller
+    // asked for work, not for a crash. Treat the candidate as absent — the run
+    // goes to the preset that was asked for, and its own failure is the
+    // journalable outcome the fallback chain exists to react to.
+    settings.warnings.push(
+      `Fallback candidate \`${swap.preset}\` could not be resolved (${String(error.message ?? error).slice(0, 120)}) — ` +
+        `running on \`${settings.presetName}\` as asked.`
+    );
+    return settings;
+  }
+  // The swap must be visible, not just happen: the caller chose a preset and
+  // got another one, and the reason quotes the refusal so the report explains
+  // the switch without a second lookup.
+  swapped.requestedPresetName = settings.presetName;
+  swapped.warnings.push(
+    `Preset \`${settings.presetName}\` last failed on ${swap.dead.kind} ("${swap.dead.text.slice(0, 120)}") — ` +
+      `running on \`${swap.preset}\` instead.`
+  );
+  return swapped;
+}
+
 async function commandDelegate(argv, workspaceRoot) {
   const { flags, positional } = parseArgs(argv, RUN_FLAGS);
   // A detached run gets the text its parent already assembled: re-reading stdin
@@ -1337,7 +1793,7 @@ async function commandDelegate(argv, workspaceRoot) {
 
   const { config, warnings: configWarnings } = loadConfig(workspaceRoot);
   const runRoot = resolveRunRoot(flags.cwd);
-  const settings = buildRunSettings({
+  let settings = buildRunSettings({
     command: "delegate",
     flags,
     workspaceRoot,
@@ -1345,14 +1801,41 @@ async function commandDelegate(argv, workspaceRoot) {
     config,
     trusted: workspaceIsTrusted(runRoot)
   });
+  settings = await applyFallbackPreset({
+    command: "delegate",
+    flags,
+    workspaceRoot,
+    runRoot,
+    config,
+    trusted: workspaceIsTrusted(runRoot),
+    settings
+  });
   // Anything the project layer was not allowed to set has to be visible: a
   // silently ignored setting looks exactly like one that did not work.
   settings.warnings = [...(configWarnings ?? []), ...settings.warnings];
-  const sessionId = flags.fresh ? null : resolveSessionReference(workspaceRoot, flags.session);
+  let sessionId = flags.fresh ? null : resolveSessionReference(workspaceRoot, flags.session);
   // A session named here is continued as-is: `delegate` keeps the flags it was
   // given and inherits nothing from the run that owns the session. The age of
   // the cache is still checked — it costs the same money either way.
   const continued = sessionId ? findSession(workspaceSessions(workspaceRoot), sessionId) : null;
+  if (continued) {
+    // `findSession` also matches job ids: passing a job of this workspace
+    // continues the pi session that job owns, not a session id pi has never
+    // heard of. An unmatched reference is refused here rather than relayed to
+    // pi, whose "No session found" names none of the sessions that do exist.
+    sessionId = continued.sessionId;
+  } else if (sessionId && flags.session && flags.session !== "last" && flags.session !== "latest") {
+    const known = workspaceSessions(workspaceRoot);
+    throw new Error(
+      known.length
+        ? `No session here matches "${sessionId}". Sessions recorded for this workspace: ${known
+            .slice(0, 5)
+            .map((entry) => entry.sessionId.slice(0, 8))
+            .join(", ")}. Full list: \`sessions\`.`
+        : "No pi session recorded for this workspace. Job state is bucketed by the directory a run was started from, " +
+            "so a session started elsewhere is not lost — run `sessions --global` to find its workspace."
+    );
+  }
   if (continued) {
     settings.continuation = guardSessionAge(continued, { config, flags, command: "delegate" });
     if (continued.preset && !flags.preset) {
@@ -1795,6 +2278,52 @@ async function commandStats(argv, workspaceRoot) {
   } finally {
     handle.close();
   }
+}
+
+async function commandPools(argv, workspaceRoot) {
+  const { flags } = parseArgs(argv, { booleans: ["json", "reset-all"], strings: ["reset"] });
+
+  if (flags["reset-all"] || flags.reset) {
+    // Debugging, not the circuit: the normal return of a pool is a successful
+    // run or an expired deadline, so this exists only for someone who already
+    // knows why the record is wrong.
+    const cleared = flags["reset-all"] ? clearAllPools() : clearPool(flags.reset);
+    if (!flags["reset-all"] && !cleared) {
+      throw new Error(`No liveness record for pool "${flags.reset}" — nothing to reset.`);
+    }
+    return output(
+      flags["reset-all"] ? "Cleared all pool liveness records.\n" : `Cleared liveness record for pool \`${flags.reset}\`.\n`,
+      { cleared: flags["reset-all"] ? "all" : flags.reset },
+      flags.json
+    );
+  }
+
+  const { pools, corrupted } = loadPoolHealthState();
+  const names = Object.keys(pools).sort();
+  if (flags.json) {
+    return output("", { pools, corrupted }, true);
+  }
+  if (!names.length) {
+    if (corrupted) {
+      return output(
+        "`pool-health.json` exists but cannot be parsed: until it is removed or repaired, " +
+          "every pool is treated as live — and whatever deaths were recorded here are lost.\n",
+        { pools, corrupted },
+        false
+      );
+    }
+    return output("No pool liveness records: every known pool is considered live.\n", { pools }, false);
+  }
+  const lines = ["Pool liveness records:", ""];
+  for (const name of names) {
+    const record = pools[name];
+    const expired = Number(record.retryAtMs) <= Date.now();
+    lines.push(
+      `- \`${name}\` — ${record.class}, until ${record.retryAt}${expired ? " (deadline passed, participating again)" : ""}: ${record.reason}`
+    );
+  }
+  lines.push("", "Reset with `pools --reset <pool>` or `pools --reset-all`.");
+  return output(`${lines.join("\n")}\n`, { pools }, false);
 }
 
 async function commandSandbox(argv, workspaceRoot) {
@@ -2425,6 +2954,7 @@ const COMMANDS = {
   steer: commandSteer,
   watch: commandWatch,
   stats: commandStats,
+  pools: commandPools,
   sandbox: commandSandbox
 };
 

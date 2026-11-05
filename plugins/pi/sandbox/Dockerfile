@@ -7,7 +7,15 @@
 ARG NODE_IMAGE=node:24-bookworm-slim
 FROM ${NODE_IMAGE}
 
-ARG PI_VERSION=latest
+# Pinned rather than `latest`, because the version resolves at build time and
+# freezes into the layer: `latest` means the image holds whatever was current the
+# day it was built, and nothing in the image says which day that was.
+#
+# This default is the floor, not the usual value — `sandbox build` passes the
+# version of the host's own pi as a build arg, so the container normally runs
+# exactly what the host runs. The default is what a plain `docker build -f` gets,
+# and that is the case worth keeping reproducible.
+ARG PI_VERSION=0.85.1
 
 # The LSP adapter is baked in rather than fetched per run: the agent directory
 # is a volume, so an `npm:` extension would be downloaded again on every fresh
@@ -17,7 +25,7 @@ ARG PI_VERSION=latest
 ARG PI_LSP_ADAPTER_VERSION=0.1.3
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates curl git less make ripgrep \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl file git less make ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"

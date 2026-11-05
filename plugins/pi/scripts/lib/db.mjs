@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   workspace        TEXT,
   run_root         TEXT,
   preset           TEXT,
+  requested_preset TEXT,
   model            TEXT,
   sandbox          TEXT,
   status           TEXT,
@@ -231,7 +232,12 @@ function addMissingColumns(db) {
     // was given, what it answered, and the settings it ran under.
     ["prompt", "TEXT"],
     ["result_text", "TEXT"],
+    ["error_text", "TEXT"],
     ["settings", "TEXT"],
+    // The preset the caller asked for, alongside `preset` — what actually ran.
+    // After a fallback swap these differ, and a supervisor reading only the
+    // swap's column would credit the work to a preset nobody ordered.
+    ["requested_preset", "TEXT"],
     // Rolled up from `requests` when the run ends, so the reports keep reading
     // one table instead of joining per row.
     ["req_count", "INTEGER DEFAULT 0"],
@@ -291,7 +297,7 @@ function addMissingColumns(db) {
     // раз, а сравнивать модели между собой так нельзя вовсе.
     //
     // Рассуждение на ход — сильнейший из найденных признаков вырождения: в
-    // docs/RESEARCH-truncation-flash-vs-glm.md у сорвавшихся прогонов оно было
+    // ~/.agents/docs/LLM/RESEARCH-truncation-flash-vs-glm.md у сорвавшихся прогонов оно было
     // в 18 раз обильнее, чем у чистых, при одинаковом числе ходов — но то
     // измерение на СРЕДНИХ по ходу, а не на медианах: эта колонка хранит p50 за
     // прогон, число другое, соотношение здесь — ориентир, а не воспроизведённый
@@ -351,6 +357,7 @@ const COLUMNS = [
   "workspace",
   "run_root",
   "preset",
+  "requested_preset",
   "model",
   "sandbox",
   "status",
@@ -394,6 +401,7 @@ const COLUMNS = [
   "updated_at",
   "prompt",
   "result_text",
+  "error_text",
   "settings",
   "req_count",
   "req_failed",
@@ -411,6 +419,7 @@ const COLUMNS = [
 
 /** Ceiling on any single stored text field. */
 const MAX_TEXT_CHARS = 32 * 1024;
+const MAX_ERROR_CHARS = 2000;
 
 /**
  * How long the journal keeps the text of a run.
@@ -441,6 +450,7 @@ export function jobToRow(job) {
     workspace: job.workspaceRoot ?? null,
     run_root: job.runRoot ?? job.workspaceRoot ?? null,
     preset: job.preset ?? null,
+    requested_preset: job.requestedPreset ?? null,
     model: job.model ?? null,
     sandbox: job.sandbox ?? null,
     status: job.status ?? null,
@@ -489,6 +499,13 @@ export function jobToRow(job) {
     // outlives the run, the temp directory and the reboot.
     prompt: forJournal(job.prompt ?? null, MAX_TEXT_CHARS),
     result_text: forJournal(job.text ?? null, MAX_TEXT_CHARS),
+    // Thrown failures carry their reason only in `errorMessage`; a run pi
+    // itself finished with a non-zero exit keeps it in `errors` (the provider's
+    // stderr lands there — a 402, a refused connection). The fallback-preset
+    // dispatch reads this column to tell a dead provider from any other
+    // failure, so both routes have to reach it. Capped tightly — an error
+    // message is a quote of the provider, not content worth archiving.
+    error_text: forJournal(job.errorMessage ?? job.errors?.[0] ?? null, MAX_ERROR_CHARS),
     settings: job.rerunSettings ? forJournal(JSON.stringify(job.rerunSettings), MAX_TEXT_CHARS) : null,
     req_count: job.proxyStats?.count ?? 0,
     req_failed: job.proxyStats?.failed ?? 0,
@@ -806,6 +823,22 @@ export function queryRuns(handle, { limit = 20, days = null, workspace = null, m
        LIMIT $limit`
     )
     .all({ ...params, limit: Math.max(1, Math.floor(limit)) });
+}
+
+/**
+ * Recent runs with their refusal texts, newest first — the input for deciding
+ * which presets are currently dead. Reads the envelope plus the two text
+ * columns the classification needs; prompts stay out of the result.
+ */
+export function queryPresetHealth(handle, { days = 2, limit = 500 } = {}) {
+  return handle.db
+    .prepare(
+      `SELECT preset, status, error_text, result_text, created_at
+       FROM jobs ${whereWithinDays(days)}
+       ORDER BY created_at DESC
+       LIMIT $limit`
+    )
+    .all({ limit: Math.max(1, Math.floor(limit)) });
 }
 
 /** One run in full, by id or by the tail of one. */

@@ -238,6 +238,22 @@ export function attachMounts(sandbox, extra = []) {
 }
 
 /**
+ * The sandbox a run with these settings would actually get: profile first,
+ * then the preset's own mounts (a later mount on the same container path wins).
+ *
+ * Mount gaps must be judged against this shape, not the bare profile — a preset
+ * carrying its own skill mount is not a gap. Counting the profile alone is how
+ * `presets` printed NOT MOUNTED for every preset that was in fact runnable,
+ * so both the run path and the capability report build the sandbox here.
+ */
+export function sandboxForRun(settings, config) {
+  return attachMounts(
+    normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {}),
+    settings.mounts ?? []
+  );
+}
+
+/**
  * Container name: the profile it runs, then the job id (already docker-safe).
  *
  * `docker ps` is where you look when something is stuck, and the profile is the
@@ -263,10 +279,52 @@ function expandHome(value, homeDir) {
  */
 function resolveMountSource(mount, homeDir, cwd) {
   const separator = String(mount).indexOf(":");
-  const source = expandHome(String(mount).slice(0, separator), homeDir);
   const rest = String(mount).slice(separator);
+  return `${mountHostSide(mount, homeDir, cwd)}${rest}`;
+}
+
+/**
+ * The host side of a mount exactly as docker will see it: `~` expanded,
+ * a relative path resolved against the workspace, named volumes as-is.
+ *
+ * Shared with the pre-run verification so the check judges the same path the
+ * container will actually receive, not a re-derived approximation of it.
+ */
+function mountHostSide(mount, homeDir, cwd) {
+  const separator = String(mount).indexOf(":");
+  const source = expandHome(String(mount).slice(0, separator), homeDir);
   const relative = source.startsWith("./") || source.startsWith("../") || source === "." || source === "..";
-  return `${relative ? path.resolve(cwd, source) : source}${rest}`;
+  return relative ? path.resolve(cwd, source) : source;
+}
+
+/**
+ * Mounts whose host side does not exist and therefore will not arrive.
+ *
+ * Docker never refuses a missing bind-mount source: it silently creates an
+ * empty directory — on the daemon's filesystem, which with a rootless or
+ * nested daemon is not the one the caller looks at. The agent then writes
+ * its report into a container-only analog of the requested path, reports
+ * success, and the host finds nothing: three runs across two epics lost
+ * their reports this way and were recovered by hand from the responses.
+ * Verified before the job record exists, so a misnamed path costs nothing.
+ */
+export function missingMountSources(sandbox, { homeDir = os.homedir(), cwd = "." } = {}) {
+  if (!isSandboxed(sandbox)) {
+    return [];
+  }
+  const missing = [];
+  for (const mount of sandbox.mounts ?? []) {
+    const hostSide = mountHostSide(mount, homeDir, cwd);
+    // A named volume has no host side to check; docker reads a source with no
+    // path marker as a volume name, and those are created on purpose.
+    if (!/^[~./]/.test(hostSide)) {
+      continue;
+    }
+    if (!fs.existsSync(hostSide)) {
+      missing.push({ mount: String(mount), hostPath: hostSide });
+    }
+  }
+  return missing;
 }
 
 /**
@@ -385,8 +443,8 @@ export function buildDockerRunArgs({
     // it from inside on Linux, where it is not resolvable by default.
     args.push("--add-host", "host.docker.internal:host-gateway");
   }
-  if (sandbox.concurrencyGroup) {
-    args.push("--label", `${LABEL}-pool=${sandbox.concurrencyGroup}`);
+  if (sandbox.poolName) {
+    args.push("--label", `${LABEL}-pool=${sandbox.poolName}`);
   }
 
   if (containerName) {
@@ -758,13 +816,24 @@ function firstLine(text) {
  * Check that the sandbox can actually start before a job is created — a
  * missing daemon or image is a setup problem, not a failed run.
  */
-export function sandboxPreflight(sandbox) {
+export function sandboxPreflight(sandbox, { cwd = "." } = {}) {
   if (!isSandboxed(sandbox)) {
     return { ok: true, errors: [], warnings: [] };
   }
 
   const errors = [];
   const warnings = [];
+
+  // Mount existence needs no daemon and is judged before the docker checks so
+  // preflight reports every setup problem at once, even on a machine where the
+  // binary or daemon is absent.
+  for (const missing of missingMountSources(sandbox, { cwd })) {
+    errors.push(
+      `Mount "${missing.mount}" will not mount: the host path "${missing.hostPath}" does not exist. ` +
+        "Docker would silently create an empty directory on the daemon's side, the agent would write into " +
+        "a container-only analog of the path, and nothing would appear on the host. Create the directory first."
+    );
+  }
 
   if (!binaryAvailable("docker")) {
     errors.push("`docker` was not found on PATH. Install Docker, or run without `--sandbox`.");
@@ -1031,16 +1100,16 @@ function reserveSlot(scopeKey) {
 
 export function describeSlotUsage(sandbox) {
   const limit = slotLimitOf(sandbox);
-  const group = sandbox?.concurrencyGroup ?? null;
-  const value = group ?? sandbox?.profileName ?? null;
+  const pool = sandbox?.poolName ?? null;
+  const value = pool ?? sandbox?.profileName ?? null;
   if (!isSandboxed(sandbox) || !value || !Number.isFinite(limit) || limit <= 0) {
     return null;
   }
-  const scopeKey = slotScopeKey(group ? "pool" : "profile", value);
+  const scopeKey = slotScopeKey(pool ? "pool" : "profile", value);
   return {
-    used: countRunningForLabel(group ? "pool" : "profile", value) + countReservations(scopeKey, { sweep: false }),
+    used: countRunningForLabel(pool ? "pool" : "profile", value) + countReservations(scopeKey, { sweep: false }),
     limit,
-    scope: group ? `pool \`${group}\`` : `profile \`${sandbox.profileName}\``
+    scope: pool ? `pool \`${pool}\`` : `profile \`${sandbox.profileName}\``
   };
 }
 
@@ -1056,13 +1125,23 @@ export function describeSlotUsage(sandbox) {
  * @returns {Promise<{waitedMs: number, slots: number|null}>}
  */
 export async function awaitSandboxSlot(sandbox, { timeoutMs = 900_000, onProgress = null, pollMs = 2000 } = {}) {
+  // Variant selection already claimed this slot while choosing among a role's
+  // pools; re-queuing here would deadlock on our own reservation, so hand it
+  // through untouched.
+  if (sandbox?.heldSlot) {
+    return {
+      waitedMs: sandbox.heldSlot.waitedMs ?? 0,
+      slots: sandbox.heldSlot.slots ?? null,
+      release: sandbox.heldSlot.release ?? (() => {})
+    };
+  }
   const limit = slotLimitOf(sandbox);
-  // Slots belong to a pool when the profile names one, and to the profile
-  // otherwise. A pool is what a shared provider needs: several profiles hitting
-  // the same account have to draw from one allowance, while a profile counting
-  // only itself would let them exceed it together.
-  const scope = sandbox?.concurrencyGroup
-    ? { label: "pool", value: String(sandbox.concurrencyGroup), what: `pool "${sandbox.concurrencyGroup}"` }
+  // Slots belong to a pool when the run's selected model names one, and to the
+  // profile otherwise. A pool is what a shared provider needs: several roles
+  // hitting the same account have to draw from one allowance, while a profile
+  // counting only itself would let them exceed it together.
+  const scope = sandbox?.poolName
+    ? { label: "pool", value: String(sandbox.poolName), what: `pool "${sandbox.poolName}"` }
     : { label: "profile", value: sandbox?.profileName ?? null, what: `profile "${sandbox?.profileName}"` };
 
   if (!isSandboxed(sandbox) || !scope.value || !Number.isFinite(limit) || limit <= 0) {
@@ -1102,6 +1181,42 @@ export function removeSandboxContainer(containerName) {
     return false;
   }
   return runCommand("docker", ["rm", "-f", containerName]).status === 0;
+}
+
+/**
+ * Pick among the variants of one role and claim a slot for the winner.
+ *
+ * A busy pool used to mean queuing even when the same role had a live variant
+ * on another account. Now each candidate in priority order gets at most
+ * `poolWaitMs` (0: take it only if free right now); when every variant is busy
+ * past its threshold, fall back to waiting for the first by priority — saying
+ * out loud what is being waited for, since a silent queue reads as a hang.
+ *
+ * Variants must arrive in priority order (`buildVariants` sorts them); the
+ * returned `sandbox` carries a `heldSlot` so `awaitSandboxSlot` inside the
+ * engine hands the claim through instead of queuing again.
+ */
+export async function awaitVariantSlot(variants, { poolWaitMs = 30_000, timeoutMs = 900_000, onProgress = null, pollMs = 2000 } = {}) {
+  if (!Array.isArray(variants) || !variants.length) {
+    throw new Error("No pool variants to choose from.");
+  }
+  const describe = (variant) => `model "${variant.id}" of pool "${variant.pool}"`;
+  for (const candidate of variants) {
+    try {
+      const slot = await awaitSandboxSlot(candidate.sandbox, { timeoutMs: Math.max(poolWaitMs, 0), pollMs });
+      return { ...slot, ...candidate, sandbox: { ...candidate.sandbox, heldSlot: slot } };
+    } catch {
+      // This pool stayed busy past the threshold — the next variant of the
+      // same role may be free right now, which is the whole point.
+    }
+  }
+  const first = variants[0];
+  onProgress?.({
+    phase: "starting",
+    message: `Every variant of the role is busy; waiting for ${describe(first)} (first by priority).`
+  });
+  const slot = await awaitSandboxSlot(first.sandbox, { timeoutMs, onProgress, pollMs });
+  return { ...slot, ...first, sandbox: { ...first.sandbox, heldSlot: slot } };
 }
 
 export function listSandboxContainers() {
@@ -1229,6 +1344,13 @@ export function sandboxDockerfile(name = "base", { workspaceRoot = null } = {}) 
 /**
  * Every image the config knows about: the base one plus whatever profiles name.
  * A profile that names an `image` but no `dockerfile` is built from the base.
+ *
+ * The image is read off the RESOLVED profile, not off its own fields: a profile
+ * that inherits (`extend`/`profile`) states neither image nor dockerfile, and
+ * reading the raw entry filed it under the base image — so `sandbox build
+ * <role>` rebuilt a different image than the role actually runs on, and
+ * `sandbox status` listed it under the wrong tag. Invisible while the owner
+ * form repeated `image` on every profile; the roles form states it once.
  */
 export function listSandboxImages(config = {}) {
   // Keyed by image tag, because that is what a build produces: profiles sharing
@@ -1237,7 +1359,17 @@ export function listSandboxImages(config = {}) {
     [DEFAULT_SANDBOX_IMAGE, { name: "base", image: DEFAULT_SANDBOX_IMAGE, dockerfile: "base", profiles: [] }]
   ]);
 
-  for (const [name, profile] of Object.entries(config.sandboxProfiles ?? {})) {
+  const profiles = config.sandboxProfiles ?? {};
+  for (const [name, entry] of Object.entries(profiles)) {
+    // A profile too broken to resolve (a cycle, an unknown parent) keeps its own
+    // fields here: the inventory reports what it can, and the run that uses the
+    // profile is where the refusal belongs.
+    let profile = entry;
+    try {
+      profile = normalizeSandbox(name, profiles);
+    } catch {
+      profile = entry;
+    }
     const image = profile?.image ?? DEFAULT_SANDBOX_IMAGE;
     const existing = images.get(image);
     if (existing) {

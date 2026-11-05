@@ -463,6 +463,45 @@ test("a profile can start from another profile", () => {
   assert.equal(sandbox.profile, undefined);
 });
 
+test("a docker flag repeated in a profile keeps both of its occurrences", () => {
+  // `args` is an argv, not a set: docker reads repeatable flags (--security-opt,
+  // --device, --cap-add) by position, so folding two identical flag tokens into
+  // one leaves the second value standing where the image name belongs and the
+  // daemon answers "invalid reference format" — a message that names neither
+  // the flag nor the profile it came from.
+  const profiles = {
+    base: { args: ["--cpus", "6"] },
+    hardened: {
+      profile: "base",
+      args: ["--security-opt", "seccomp=@sandbox/seccomp.json", "--security-opt", "systempaths=unconfined"]
+    }
+  };
+  const sandbox = normalizeSandbox("hardened", profiles);
+  assert.deepEqual(sandbox.args, [
+    "--cpus",
+    "6",
+    "--security-opt",
+    "seccomp=@sandbox/seccomp.json",
+    "--security-opt",
+    "systempaths=unconfined"
+  ]);
+
+  const args = buildDockerRunArgs({
+    sandbox,
+    piArgs: ["--mode", "rpc"],
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/home/me",
+    env: {}
+  });
+  assert.equal(
+    args[args.indexOf("systempaths=unconfined") - 1],
+    "--security-opt",
+    "the second value still has its flag in front of it"
+  );
+  assert.deepEqual(args.slice(-3), [DEFAULT_SANDBOX_IMAGE, "--mode", "rpc"], "the image stands where docker expects it");
+});
+
 test("a profile cycle is reported instead of hanging", () => {
   const profiles = { a: { profile: "b" }, b: { profile: "a" } };
   assert.throws(() => normalizeSandbox("a", profiles), /extends itself/);
@@ -508,6 +547,45 @@ test("images are collected from the profiles that name them", async () => {
     "profiles sharing an image share one build"
   );
   assert.equal(byImage["pi-sandbox-rust:latest"].dockerfile, "~/.claude/pi/sandbox/rust.Dockerfile");
+});
+
+test("an inheriting service is filed under the image it actually runs on", async () => {
+  const { listSandboxImages, DEFAULT_SANDBOX_IMAGE: base } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
+  const { normalizeConfigLayer } = await import("../plugins/pi/scripts/lib/config.mjs");
+  // Entered through the form the owner actually writes — `sandboxServices` with
+  // `extend` — and normalized the way a load does, so the test covers the whole
+  // path instead of the internal spelling. The roles form states image and
+  // dockerfile once, on the service every role extends; read off the raw entry,
+  // the children carry neither and land on the base image — then `sandbox build
+  // agent` rebuilds the wrong tag from the wrong Dockerfile while the roles keep
+  // running on the right one.
+  const images = listSandboxImages(
+    normalizeConfigLayer({
+      sandboxServices: [
+        { id: "agent-base", image: "pi-sandbox-agent:latest", dockerfile: "agent" },
+        { id: "agent", extend: "agent-base", env: ["PI_DIND=1"] },
+        { id: "agent-lite", extend: "agent-base" },
+        { id: "broken", extend: "no-such-service" }
+      ]
+    })
+  );
+
+  const byImage = Object.fromEntries(images.map((entry) => [entry.image, entry]));
+  assert.deepEqual(
+    byImage["pi-sandbox-agent:latest"].profiles,
+    ["agent-base", "agent", "agent-lite"],
+    "children inherit the parent's image and share its build"
+  );
+  assert.equal(
+    byImage["pi-sandbox-agent:latest"].dockerfile,
+    "agent",
+    "the inherited dockerfile is what a rebuild has to use"
+  );
+  assert.deepEqual(
+    byImage[base].profiles,
+    ["broken"],
+    "a profile that cannot be resolved still appears, under its own fields"
+  );
 });
 
 test("resource limits are optional and only reach docker when set", async () => {
@@ -584,55 +662,26 @@ test("a profile inherits its cap and passes the label docker filters on", async 
   assert.ok(args.includes("pi-plugin-cc-profile=go-mem"), "the label carries the profile the run actually used");
 });
 
-test("a pool shares slots across profiles, a profile without one counts alone", async () => {
+test("a pool label follows the run's pool, a run without one counts alone", async () => {
   const { buildDockerRunArgs, describeSlotUsage, normalizeSandbox } = await import(
     "../plugins/pi/scripts/lib/sandbox.mjs"
   );
-  const profiles = {
-    go: { image: "img", concurrencyGroup: "ollama-pro" },
-    "go-mem": { profile: "go" },
-    solo: { image: "img", maxConcurrent: 2 }
-  };
 
-  // Both profiles carry the same pool, so their containers get the same label
-  // and are counted together.
-  for (const name of ["go", "go-mem"]) {
-    const sandbox = normalizeSandbox(name, profiles);
-    assert.equal(sandbox.concurrencyGroup, "ollama-pro");
-    const args = buildDockerRunArgs({ sandbox, piArgs: [], cwd: "/repo", env: {} });
-    assert.ok(args.includes("pi-plugin-cc-pool=ollama-pro"), `${name} joins the pool`);
-    assert.ok(args.includes(`pi-plugin-cc-profile=${name}`), `${name} keeps its own profile label`);
-  }
+  // The pool name is what variant building stamped onto the sandbox, so the
+  // container gets the pool label and is counted together with the same pool.
+  const pooled = { ...normalizeSandbox({ image: "img", maxConcurrent: 3 }, {}), poolName: "ollama-pro" };
+  const args = buildDockerRunArgs({ sandbox: pooled, piArgs: [], cwd: "/repo", env: {} });
+  assert.ok(args.includes("pi-plugin-cc-pool=ollama-pro"), "the container joins the pool");
 
   // No pool named: slots stay per-profile, exactly as before pools existed.
-  const solo = normalizeSandbox("solo", profiles);
-  assert.equal(solo.concurrencyGroup, undefined);
+  const solo = normalizeSandbox({ image: "img", maxConcurrent: 2, profileName: "solo" }, {});
+  assert.equal(solo.poolName, undefined);
   const usage = describeSlotUsage(solo);
   assert.equal(usage.limit, 2);
-  assert.match(usage.scope, /profile `solo`/);
+  assert.match(usage.scope, /profile/);
 
   // Nothing capped at all: no docker call, no reporting.
   assert.equal(describeSlotUsage(normalizeSandbox("docker", {})), null);
-});
-
-test("a pool limit comes from the config, and a missing pool is refused", async () => {
-  const { applyConcurrencyPool } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const { normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
-  const profiles = { go: { image: "img", concurrencyGroup: "ollama-pro" }, solo: { image: "img", maxConcurrent: 2 } };
-  const config = { concurrencyPools: { "ollama-pro": 3 } };
-
-  const pooled = applyConcurrencyPool(normalizeSandbox("go", profiles), config);
-  assert.equal(pooled.maxConcurrent, 3, "the pool decides, so profiles cannot disagree about it");
-
-  // A profile outside any pool is untouched — pools are opt-in.
-  const solo = normalizeSandbox("solo", profiles);
-  assert.equal(applyConcurrencyPool(solo, config).maxConcurrent, 2);
-
-  assert.throws(
-    () => applyConcurrencyPool(normalizeSandbox("go", profiles), { concurrencyPools: {} }),
-    /concurrency pool "ollama-pro", which is not defined/,
-    "a typo in the pool name must not silently mean unlimited"
-  );
 });
 
 test("a claimed slot counts before its container exists", async () => {
@@ -641,7 +690,7 @@ test("a claimed slot counts before its container exists", async () => {
   );
   // A pool nothing else uses, so the count is entirely ours.
   const pool = `test-pool-${process.pid}-${Date.now()}`;
-  const sandbox = normalizeSandbox({ mode: "docker", image: "img", concurrencyGroup: pool, maxConcurrent: 1 }, {});
+  const sandbox = normalizeSandbox({ mode: "docker", image: "img", poolName: pool, maxConcurrent: 1 }, {});
 
   assert.equal(describeSlotUsage(sandbox).used, 0);
 
@@ -670,7 +719,7 @@ test("slot bookkeeping does not confuse neighbouring pools or mutate on read", a
   // used to let `a.b` count against `a`.
   const outer = `zz-pool-${process.pid}`;
   const inner = `${outer}.child`;
-  const of = (group) => normalizeSandbox({ mode: "docker", image: "img", concurrencyGroup: group, maxConcurrent: 1 }, {});
+  const of = (group) => normalizeSandbox({ mode: "docker", image: "img", poolName: group, maxConcurrent: 1 }, {});
 
   const claim = await awaitSandboxSlot(of(inner), { timeoutMs: 1000, pollMs: 10 });
   try {
@@ -683,7 +732,7 @@ test("slot bookkeeping does not confuse neighbouring pools or mutate on read", a
 
 test("a zero slot limit is refused rather than read as unlimited", async () => {
   const { awaitSandboxSlot, normalizeSandbox } = await import("../plugins/pi/scripts/lib/sandbox.mjs");
-  const sandbox = normalizeSandbox({ mode: "docker", image: "img", concurrencyGroup: "zero-pool", maxConcurrent: 0 }, {});
+  const sandbox = normalizeSandbox({ mode: "docker", image: "img", poolName: "zero-pool", maxConcurrent: 0 }, {});
 
   // "Allow zero containers" can only be a mistake, and silently meaning the
   // opposite is worse than saying so.
@@ -853,4 +902,23 @@ test("equipment outside the container is reported as a gap, not just as prose", 
 
   // npm:/git: sources resolve inside the container and are nobody's gap.
   assert.deepEqual(sandboxMountGaps(sandbox, { workspaceRoot: "/work", skills: ["npm:some-skill"] }), []);
+});
+
+test("telemetry credentials never reach the container: PI_OTEL_* headers are not forwarded", () => {
+  // The container env is built only from the sandbox profile's explicit -e
+  // entries; the companion's own OTLP headers stay in the host process.
+  const args = buildDockerRunArgs({
+    sandbox: normalizeSandbox("docker"),
+    cwd: "/work",
+    identity: IDENTITY,
+    homeDir: "/nonexistent-home",
+    env: {
+      PI_OTEL_ENABLE: "1",
+      PI_OTEL_EXPORTER_OTLP_ENDPOINT: "http://collector:4318/v1/metrics",
+      PI_OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer s3cr3t-token"
+    }
+  });
+  const containerEnv = args.filter((arg) => args[args.indexOf(arg) - 1] === "-e");
+  assert.ok(!containerEnv.some((entry) => entry.startsWith("PI_OTEL_")), "PI_OTEL_* не передаётся в контейнер");
+  assert.ok(!args.join("\n").includes("s3cr3t-token"), "токен не попал в docker run args");
 });

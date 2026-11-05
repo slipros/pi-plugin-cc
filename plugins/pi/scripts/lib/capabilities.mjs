@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveRunSettings } from "./config.mjs";
-import { isSandboxed, normalizeSandbox, sandboxMountGaps } from "./sandbox.mjs";
+import { isSandboxed, normalizeSandbox, sandboxForRun, sandboxMountGaps } from "./sandbox.mjs";
 
 /**
  * What an agent can do beyond what its model can do.
@@ -75,7 +75,7 @@ export function resolvedSkills(settings, config, { homeDir = os.homedir() } = {}
   if (settings.noSkills) {
     return [];
   }
-  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {});
+  const sandbox = sandboxForRun(settings, config);
   const named = [...(settings.skills ?? [])];
   if (isSandboxed(sandbox)) {
     return [...(sandbox.skills ?? []), ...named];
@@ -113,33 +113,42 @@ function hasSkillNamed(skills, name) {
 export function presetCapabilities(config, presetName, { homeDir = os.homedir() } = {}) {
   const preset = config.presets?.[presetName] ?? {};
   const tags = asList(preset.tags);
-  let settings;
   try {
-    settings = resolveRunSettings(config, "delegate", { preset: presetName });
-  } catch {
-    // A preset that cannot be resolved cannot be described. The command that
-    // runs it will report the reason; here it is simply an agent with no
-    // computed capabilities.
-    return { vision: null, shell: false, tags, skills: [], mountGaps: [] };
+    const settings = resolveRunSettings(config, "delegate", { preset: presetName });
+    const skills = resolvedSkills(settings, config, { homeDir });
+    const shell = hasShell(settings);
+    // Equipment named by the preset that the container will not have. Listed here
+    // so the answer is visible where agents are CHOSEN, not only when one is
+    // launched: the run itself refuses, but by then a wave is already half issued.
+    const sandbox = sandboxForRun(settings, config);
+    const mountGaps = sandboxMountGaps(sandbox, {
+      workspaceRoot: process.cwd(),
+      extensions: settings.extensions ?? [],
+      skills: settings.noSkills ? [] : (skills ?? [])
+    }).map(({ value }) => value);
+    return {
+      vision: hasSkillNamed(skills, VISION_SKILL_NAME) && shell ? "skill" : null,
+      shell,
+      tags,
+      skills,
+      mountGaps
+    };
+  } catch (error) {
+    // The failure mode is wider than an unresolvable preset: parsing the sandbox
+    // descriptor itself can throw, e.g. a mount written without its container
+    // path. One typo in one preset must not kill `presets` — `presets --json`
+    // answers every rejected delegation, so a throwing listing mutes the whole
+    // channel. The preset degrades to an agent with no computed capabilities and
+    // carries the reason, so the degradation is visible, not swallowed.
+    return {
+      vision: null,
+      shell: false,
+      tags,
+      skills: [],
+      mountGaps: [],
+      unresolved: error instanceof Error ? error.message : String(error)
+    };
   }
-  const skills = resolvedSkills(settings, config, { homeDir });
-  const shell = hasShell(settings);
-  // Equipment named by the preset that the container will not have. Listed here
-  // so the answer is visible where agents are CHOSEN, not only when one is
-  // launched: the run itself refuses, but by then a wave is already half issued.
-  const sandbox = normalizeSandbox(settings.sandbox, config.sandboxProfiles ?? {});
-  const mountGaps = sandboxMountGaps(sandbox, {
-    workspaceRoot: process.cwd(),
-    extensions: settings.extensions ?? [],
-    skills: settings.noSkills ? [] : (skills ?? [])
-  }).map(({ value }) => value);
-  return {
-    vision: hasSkillNamed(skills, VISION_SKILL_NAME) && shell ? "skill" : null,
-    shell,
-    tags,
-    skills,
-    mountGaps
-  };
 }
 
 /** Capabilities for every configured preset, keyed by name. */

@@ -592,7 +592,12 @@ export async function startCredentialProxy({
   onWarning = null,
   // Telemetry is written per run, so the proxy has to know which run it serves.
   // Without an id nothing is recorded rather than orphaned rows accumulating.
-  jobId = null
+  jobId = null,
+  // Plugin-config sampling params (a model record in a concurrency pool).
+  // They outrank the agent's models.json registry on purpose: the plugin config
+  // is the more specific source — whoever pinned `temperature` on the model
+  // entry meant it to reach the request, not to lose to a stale catalogue copy.
+  samplingParams = null
 } = {}) {
   const endpoint = await resolveProviderEndpoint(homeDir, provider);
   const credential = credentialOf(authEntry);
@@ -616,10 +621,11 @@ export async function startCredentialProxy({
     // some runs than on others is worse than one that says so.
     onWarning?.("Credential proxy: this run names no model — requests cross unmasked and no output ceiling is applied.");
   }
-  // `samplingParams` of the model as the user declared them. pi accepts the
-  // field in models.json and drops it on the agent loop — see
-  // `applySamplingParams` for what that costs.
-  const samplingParams = (await findModelDefinition(homeDir, provider, realModel))?.samplingParams ?? null;
+  // `samplingParams` of the model: the caller's config first, then the pi
+  // models.json registry. pi accepts the field in models.json and drops it on
+  // the agent loop — see `applySamplingParams` for what that costs.
+  const resolvedSamplingParams =
+    samplingParams ?? (await findModelDefinition(homeDir, provider, realModel))?.samplingParams ?? null;
   const upstream = new URL(endpoint.baseUrl);
   const transport = upstream.protocol === "http:" ? http : https;
 
@@ -823,7 +829,7 @@ export async function startCredentialProxy({
         if (payload && typeof payload === "object" && "model" in payload) {
           payload.model = realModel;
           restorePromptCacheKey(payload, upstream, token);
-          applySamplingParams(payload, samplingParams);
+          applySamplingParams(payload, resolvedSamplingParams);
           // `stream` is read from the payload and nothing else is: without it
           // `ttfb_ms` cannot be read at all, since for a non-streaming request
           // it equals the whole generation.

@@ -13,8 +13,21 @@ import { upsertJob, writeJobFile } from "../plugins/pi/scripts/lib/state.mjs";
 
 const COMPANION = fileURLToPath(new URL("../plugins/pi/scripts/pi-companion.mjs", import.meta.url));
 
+/**
+ * A temp directory with the symlinks already resolved out of its path.
+ *
+ * The workspace a run reports is the one the companion resolved for itself —
+ * from its own `process.cwd()`, which the OS hands back with symlinks gone.
+ * On macOS the temp root is exactly that kind of symlink (/var → /private/var),
+ * so a fleet event recorded under the raw path never matched the run that
+ * produced it, and `--workspace` filtered out its own events.
+ */
+function tempDir(prefix) {
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+}
+
 function withWorkspace(run) {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-events-"));
+  const dataDir = tempDir("pi-plugin-events-");
   const workspaceRoot = path.join(dataDir, "repo");
   fs.mkdirSync(workspaceRoot);
   const previous = process.env.CLAUDE_PLUGIN_DATA;
@@ -33,7 +46,7 @@ function withWorkspace(run) {
 
 /** The async twin: the sync one tears the workspace down before a promise settles. */
 async function withWorkspaceAsync(run) {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-events-"));
+  const dataDir = tempDir("pi-plugin-events-");
   const workspaceRoot = path.join(dataDir, "repo");
   fs.mkdirSync(workspaceRoot);
   const previous = process.env.CLAUDE_PLUGIN_DATA;

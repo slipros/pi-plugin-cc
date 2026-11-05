@@ -1,0 +1,566 @@
+{
+  "trustProjectConfig": true,
+  "defaults": {
+    "model": "vllm/Qwen3.8-27B",
+    "thinking": "off",
+    "timeoutMs": 10800000
+  },
+  "cacheTtl": {
+    "default": "40m",
+    "providers": {
+      "vllm": "24h",
+      "zai-coding-cn": "12h",
+      "zai-flash": "12h",
+      "opencode-go": "12h",
+      "deepseek": "12h"
+    }
+  },
+  "gitProxy": {
+    "gitlab.example.com": {
+      "user": "oauth2",
+      "tokenCommand": "echo GIT_TOKEN=$MY_GIT_TOKEN"
+    },
+    "10.0.0.1": {
+      "user": "oauth2",
+      "tokenCommand": "echo GIT_TOKEN=$MY_SELFHOSTED_TOKEN"
+    }
+  },
+  "sandboxServices": [
+    {
+      "id": "agent-base",
+      "image": "pi-sandbox-agent:latest",
+      "dockerfile": "agent",
+      "mounts": [
+        "~/.claude/pi/bin/linux:/pi-gobin:ro",
+        "~/DevProjects/go/bin:/gobin:ro",
+        "~/DevProjects/go/pkg/mod/cache/download:/host-gomod:ro",
+        "~/.pi/agent/extensions:/pi-agent/host-extensions:ro",
+        "pi-plugin-agent-gomod:/home/pi/go/pkg/mod",
+        "pi-plugin-agent-cache:/home/pi/.cache",
+        "pi-plugin-agent-cargo:/usr/local/cargo/registry",
+        "pi-plugin-agent-npm:/home/pi/.npm",
+        "pi-plugin-agent-pnpm:/home/pi/.local/share/pnpm",
+        "~/.pi/agent/lsp.agent.json:/home/pi/.pi/agent/lsp.json:ro",
+        "~/.pi/agent/lsp.agent.lock.json:/home/pi/.pi/agent/lsp/lsp.lock.json:ro",
+        "~/.claude/pi/githooks:/pi-githooks:ro",
+        "~/.pi/agent/skills/vision:/pi-skills/vision:ro"
+      ],
+      "env": [
+        "PATH=/pi-skills/vision/scripts:/usr/local/cargo/bin:/usr/local/go/bin:/pi-gobin:/gobin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GOPROXY=file:///host-gomod,https://proxy.golang.org,direct",
+        "GOPRIVATE=gitlab.gid.team,157.22.252.213,github.com,gitlab.loc",
+        "GOFLAGS=-mod=mod",
+        "GIT_TERMINAL_PROMPT=0",
+        "CARGO_TERM_COLOR=never",
+        "NPM_CONFIG_FUND=false",
+        "NPM_CONFIG_AUDIT=false",
+        "OMP_NUM_THREADS=4",
+        "OPENBLAS_NUM_THREADS=4",
+        "MKL_NUM_THREADS=4",
+        "NUMEXPR_NUM_THREADS=4",
+        "GIT_CONFIG_COUNT=2",
+        "GIT_CONFIG_KEY_0=core.hooksPath",
+        "GIT_CONFIG_VALUE_0=/pi-githooks",
+        "GIT_CONFIG_KEY_1=commit.gpgsign",
+        "GIT_CONFIG_VALUE_1=false"
+      ],
+      "extensions": [
+        "/pi-agent/host-extensions/hooks/index.ts",
+        "/usr/local/lib/node_modules/pi-lsp-adapter/src/index.ts"
+      ],
+      "args": [
+        "--cpus",
+        "6"
+      ],
+      "skills": [
+        "/pi-skills/vision"
+      ]
+    },
+    {
+      "id": "agent",
+      "extend": "agent-base",
+      "env": [
+        "PI_DIND=1",
+        "DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS=--pidns",
+        "TESTCONTAINERS_RYUK_DISABLED=true",
+        "TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1",
+        "PI_REGISTRY_MIRROR=http://host.docker.internal:5000"
+      ],
+      "mounts": [
+        "pi-dind-agent-images:/home/pi/.local/share/docker:isolate"
+      ],
+      "args": [
+        "--security-opt",
+        "seccomp=@sandbox/dind-seccomp.json",
+        "--security-opt",
+        "systempaths=unconfined",
+        "--device",
+        "/dev/net/tun",
+        "--add-host",
+        "host.docker.internal:host-gateway"
+      ]
+    },
+    {
+      "id": "agent-lite",
+      "extend": "agent-base"
+    }
+  ],
+  "concurrencyPools": [
+    {
+      "pool": "zai",
+      "limit": 5,
+      "priority": 10,
+      "models": [
+        {
+          "id": "zai-glm-5.3-flash",
+          "provider": "zai-coding-cn",
+          "name": "glm-5.3-flash",
+          "thinking": "low"
+        },
+        {
+          "id": "zai-glm-5.3",
+          "provider": "zai-coding-cn",
+          "name": "glm-5.3",
+          "thinking": "high"
+        }
+      ]
+    },
+    {
+      "pool": "deepseek",
+      "limit": 5,
+      "priority": 9,
+      "models": [
+        {
+          "id": "deepseek-deepseek-v4-flash",
+          "provider": "deepseek",
+          "name": "deepseek-v4-flash",
+          "thinking": "low"
+        }
+      ]
+    },
+    {
+      "pool": "vllm",
+      "limit": 1,
+      "priority": 1,
+      "models": [
+        {
+          "id": "vllm-dev-Qwen3.8-27B",
+          "provider": "vllm",
+          "name": "Qwen3.8-27B",
+          "thinking": "off",
+          "samplingParams": {
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0
+          }
+        },
+        {
+          "id": "vllm-Qwen3.8-27B",
+          "provider": "vllm",
+          "name": "Qwen3.8-27B",
+          "thinking": "high",
+          "samplingParams": {
+            "temperature": 1,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0
+          }
+        }
+      ]
+    }
+  ],
+  "presets": [
+    {
+      "id": "go-developer",
+      "models": [
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
+        "vllm-dev-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks"
+        ]
+      },
+      "systemPrompt": "developer",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/go.md",
+        "@~/.claude/pi/prompts/org/gid-go.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/go-scaffold:/pi-skills/go-scaffold:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/go-request-validator:/pi-skills/go-request-validator:ro",
+        "~/.claude/skills/openapi-write:/pi-skills/openapi-write:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/_shared/go-conventions:/home/pi/.claude/skills/_shared/go-conventions:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles",
+        "/pi-skills/go-scaffold",
+        "/pi-skills/go-request-validator",
+        "/pi-skills/openapi-write"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi go-developer",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "go",
+        "dev",
+        "gid.team"
+      ],
+      "description": "Go-задача целиком: прод-код, юнит-тесты, гейты, коммит",
+      "thinking": "low"
+    },
+    {
+      "id": "go-qa",
+      "models": [
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
+        "vllm-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks,test-only-guard"
+        ]
+      },
+      "systemPrompt": "qa",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/go.md",
+        "@~/.claude/pi/prompts/org/gid-go.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/_shared/go-conventions:/home/pi/.claude/skills/_shared/go-conventions:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi go-qa",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "go",
+        "qa",
+        "gid.team"
+      ],
+      "description": "Проверяет готовую Go-работу: пишет только интеграционные и E2E, прод-код не трогает",
+      "thinking": "low"
+    },
+    {
+      "id": "rust-developer",
+      "description": "Rust-задача целиком: прод-код, юнит-тесты, гейты, коммит",
+      "thinking": "off",
+      "models": [
+        "vllm-dev-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks"
+        ]
+      },
+      "systemPrompt": "developer",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/rust.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi rust-developer",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "rust",
+        "dev"
+      ]
+    },
+    {
+      "id": "rust-qa",
+      "description": "Проверяет готовую Rust-работу: только tests/ и E2E против бинаря, прод-код не трогает",
+      "thinking": "low",
+      "models": [
+        "vllm-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks,test-only-guard"
+        ]
+      },
+      "systemPrompt": "qa",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/rust.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi rust-qa",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "rust",
+        "qa"
+      ]
+    },
+    {
+      "id": "web-developer",
+      "description": "Фронтенд TypeScript/Vue целиком: код, юнит-тесты, гейты, коммит",
+      "thinking": "low",
+      "models": [
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
+        "vllm-dev-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks"
+        ]
+      },
+      "systemPrompt": "developer",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/ts-vue.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro",
+        "~/.claude/pi/skills/browser:/pi-skills/browser:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles",
+        "/pi-skills/browser"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi web-developer",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "web",
+        "dev"
+      ]
+    },
+    {
+      "id": "web-qa",
+      "description": "Проверяет готовый фронтенд: только тесты и E2E против артефакта, прод-код не трогает",
+      "thinking": "low",
+      "models": [
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
+        "vllm-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks,test-only-guard"
+        ]
+      },
+      "systemPrompt": "qa",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/ts-vue.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro",
+        "~/.claude/pi/skills/browser:/pi-skills/browser:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles",
+        "/pi-skills/browser"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi web-qa",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "web",
+        "qa"
+      ]
+    },
+    {
+      "id": "python-developer",
+      "models": [
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
+        "vllm-dev-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks"
+        ]
+      },
+      "systemPrompt": "developer",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/python.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi py-developer",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "py",
+        "dev"
+      ],
+      "description": "Python-задача целиком: прод-код, юнит-тесты, гейты, коммит",
+      "thinking": "low"
+    },
+    {
+      "id": "python-qa",
+      "description": "Проверяет готовую Python-работу: только pytest и E2E против стенда, прод-код не трогает",
+      "thinking": "low",
+      "models": [
+        "zai-glm-5.3-flash",
+        "deepseek-deepseek-v4-flash",
+        "vllm-Qwen3.8-27B"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=goimports-on-edit,go-cache-guard,custom-gcl-precommit,git-commit-guard,git-stash-guard,protect-secrets,sql-semicolon-guard,output-hygiene,grep-scope-guard,protect-pi-hooks,test-only-guard"
+        ]
+      },
+      "systemPrompt": "qa",
+      "appendSystemPrompt": [
+        "@~/.claude/pi/prompts/stack/python.md"
+      ],
+      "mounts": [
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/git-commit:/pi-skills/git-commit:ro",
+        "~/DevProjects/LLM/llm-workflow/plugins/feature-workflow/skills/testing-principles:/pi-skills/testing-principles:ro"
+      ],
+      "skills": [
+        "/pi-skills/git-commit",
+        "/pi-skills/testing-principles"
+      ],
+      "timeoutMs": 10800000,
+      "git": {
+        "name": "pi py-qa",
+        "email": "pi-agent@localhost"
+      },
+      "tags": [
+        "py",
+        "qa"
+      ]
+    },
+    {
+      "id": "reviewer",
+      "description": "Ревью диффа: находки с якорями path:line и воспроизведением, правок не пишет",
+      "thinking": "high",
+      "models": [
+        "zai-glm-5.3"
+      ],
+      "sandboxService": {
+        "id": "agent",
+        "env": [
+          "PI_HOOKS=go-cache-guard,git-commit-guard,git-stash-guard,protect-secrets,output-hygiene,grep-scope-guard,protect-pi-hooks",
+          "PI_SUBAGENT_MAX_DEPTH=1",
+          "PI_SUBAGENT_MAX_SPAWNS_PER_SESSION=12",
+          "PI_SUBAGENT_CAPABILITY_CEILING_V1=eyJ2ZXJzaW9uIjoxLCJhbGxvd2VkVG9vbHMiOlsiZmluZCIsImdyZXAiLCJscyIsImxzcF9kZWZpbml0aW9uIiwibHNwX2RvY3VtZW50X3N5bWJvbHMiLCJsc3BfaG92ZXIiLCJsc3BfbW9yZSIsImxzcF9yZWZlcmVuY2VzIiwibHNwX3dvcmtzcGFjZV9zeW1ib2xzIiwicmVhZCIsIndlYl9zZWFyY2giXSwiYWxsb3dlZEFnZW50cyI6WyJyZWFkZXIiLCJ3ZWItc2VhcmNoZXIiXSwiZGVueUV4dGVuc2lvbnMiOmZhbHNlLCJzb3VyY2VzIjpbInBpLXBsdWdpbi1zYW5kYm94Il19"
+        ]
+      },
+      "systemPrompt": "reviewer",
+      "tools": "read,grep,find,ls,bash,lsp_definition,lsp_references,lsp_hover,lsp_document_symbols,lsp_workspace_symbols,lsp_more,subagent",
+      "timeoutMs": 5400000,
+      "extensions": [
+        "/usr/local/lib/node_modules/pi-subagents/index.ts"
+      ],
+      "mounts": [
+        "~/.claude/pi/agents:/pi-agent/agents:ro",
+        "~/.claude/pi/subagent-config.json:/pi-agent/extensions/subagent/config.json:ro"
+      ],
+      "tags": [
+        "review"
+      ]
+    },
+    {
+      "id": "researcher",
+      "description": "Исследует вопрос по коду и внешним источникам, отвечает с якорями; LSP, дочерние агенты",
+      "thinking": "high",
+      "models": [
+        "zai-glm-5.3-flash"
+      ],
+      "sandboxService": {
+        "id": "agent-lite",
+        "env": [
+          "PI_HOOKS=go-cache-guard,git-commit-guard,git-stash-guard,protect-secrets,output-hygiene,grep-scope-guard,protect-pi-hooks",
+          "PI_SUBAGENT_MAX_DEPTH=1",
+          "PI_SUBAGENT_MAX_SPAWNS_PER_SESSION=12",
+          "PI_SUBAGENT_CAPABILITY_CEILING_V1=eyJ2ZXJzaW9uIjoxLCJhbGxvd2VkVG9vbHMiOlsiZmluZCIsImdyZXAiLCJscyIsImxzcF9kZWZpbml0aW9uIiwibHNwX2RvY3VtZW50X3N5bWJvbHMiLCJsc3BfaG92ZXIiLCJsc3BfbW9yZSIsImxzcF9yZWZlcmVuY2VzIiwibHNwX3dvcmtzcGFjZV9zeW1ib2xzIiwicmVhZCIsIndlYl9zZWFyY2giXSwiYWxsb3dlZEFnZW50cyI6WyJyZWFkZXIiLCJ3ZWItc2VhcmNoZXIiXSwiZGVueUV4dGVuc2lvbnMiOmZhbHNlLCJzb3VyY2VzIjpbInBpLXBsdWdpbi1zYW5kYm94Il19"
+        ]
+      },
+      "systemPrompt": "researcher",
+      "timeoutMs": 3600000,
+      "tools": "read,grep,find,ls,lsp_definition,lsp_references,lsp_hover,lsp_document_symbols,lsp_workspace_symbols,lsp_more,subagent,bash",
+      "extensions": [
+        "/usr/local/lib/node_modules/pi-subagents/index.ts"
+      ],
+      "mounts": [
+        "~/.claude/pi/agents:/pi-agent/agents:ro",
+        "~/.claude/pi/subagent-config.json:/pi-agent/extensions/subagent/config.json:ro",
+        "~/.pi/agent/subagent-extensions:/pi-agent/subagent-extensions:ro",
+        "~/.pi/agent/scripts:/home/pi/.pi/agent/scripts:ro"
+      ],
+      "tags": [
+        "research"
+      ]
+    },
+    {
+      "id": "coverage-auditor",
+      "description": "Сверяет тесты со спекой, не читая реализацию: что не проверено ни одним тестом",
+      "thinking": "high",
+      "models": [
+        "zai-glm-5.3-flash"
+      ],
+      "sandboxService": {
+        "id": "agent-lite",
+        "env": [
+          "PI_HOOKS=git-commit-guard,git-stash-guard,protect-secrets,output-hygiene,grep-scope-guard,protect-pi-hooks"
+        ]
+      },
+      "systemPrompt": "coverage-auditor",
+      "tools": "read,grep,find,ls",
+      "timeoutMs": 3600000,
+      "tags": [
+        "audit",
+        "blind"
+      ]
+    }
+  ]
+}

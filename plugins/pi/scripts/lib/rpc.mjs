@@ -29,6 +29,7 @@ import {
   truncationRetryLimit
 } from "./pi.mjs";
 import { MASKED_MODEL, MASKED_PROVIDER, startCredentialProxy } from "./credential-proxy.mjs";
+import { withoutOtel } from "./otel-export.mjs";
 import { openGitProxy, withGitProxy } from "./git-proxy.mjs";
 import { settleProxyPorts } from "./proxy-bind.mjs";
 import { awaitSandboxSlot, isSandboxed, removeSandboxContainer, resolveLaunch } from "./sandbox.mjs";
@@ -64,7 +65,7 @@ function proxyProviderOf(sandbox) {
   return sandbox?.provider ?? "unknown";
 }
 
-async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
+export async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
   // `proxyCredentials: false` in a profile opts out — for a provider whose
   // endpoint does something the plain forwarder here does not reproduce.
   if (!isSandboxed(sandbox) || !sandbox.auth || !sandbox.provider || sandbox.proxyCredentials === false) {
@@ -78,6 +79,9 @@ async function openCredentialProxy(sandbox, onProgress, model, jobId = null) {
       provider: sandbox.provider,
       model,
       authEntry: auth?.[sandbox.provider],
+      // Sampling params pinned on the plugin-config model record outrank the
+      // pi models.json registry (see startCredentialProxy).
+      samplingParams: sandbox.samplingParams ?? null,
       onWarning: (message) => onProgress?.({ phase: "working", message }),
       // Ties the per-request telemetry to the run; without it the proxy
       // measures nothing rather than writing rows nothing can be joined to.
@@ -195,7 +199,7 @@ export async function runPiRpcTurn({
 
     const child = spawn(launch.command, launch.args, {
       cwd,
-      env,
+      env: withoutOtel(env),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32"
     });

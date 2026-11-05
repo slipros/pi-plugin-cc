@@ -72,4 +72,14 @@ Each request is recorded as one row: status, `error_kind` (`transport`, `timeout
 
 What is never recorded: messages, system prompts, tool definitions, response text, or request headers. The body is parsed a few lines away to rewrite the model name, so this is a discipline rather than a limitation — the same line `redactArgs` draws for command lines. Rows expire with the same 90-day retention.
 
-Design notes and the measurements behind all of this: [DESIGN-proxy-telemetry.md](DESIGN-proxy-telemetry.md), [RESEARCH-provider-tps.md](RESEARCH-provider-tps.md) (both in Russian).
+Design notes and the measurements behind all of this live in the agents home: `~/.agents/docs/LLM/DESIGN-proxy-telemetry.md` and `~/.agents/docs/LLM/RESEARCH-provider-tps.md` (both in Russian).
+
+## What leaves the machine: OTLP export
+
+The journal is also the source for outbound metrics. When `PI_OTEL_ENABLE` is set, the companion exports cumulative `pi.token.usage` and `pi.cost.usage` to an OTLP/HTTP JSON collector (`lib/otel-export.mjs`) after every terminal run — completed, failed or cancelled: tokens are spent either way.
+
+Why the exporter lives on the host rather than in pi: a sandboxed run cannot carry telemetry — the env allowlist keeps `OTEL_*` out, the telemetry extension is not installed in the image, and the model name is masked inside the container (`agent-model`) on purpose, so anything it reported would be wrong by construction. The journal holds the real model and cost, and the Bearer token never approaches the agent.
+
+Series shape: labels `model` (the part after the provider slash — what pi itself reports), `type` (`input`, `output`, `cacheRead`, `cacheCreation`) and `provider`; resource attributes `service.name` (default `pi-coding-agent`, same as the extension) and `pi.runner=companion` to tell companion-exported series from the extension's own. Values are **cumulative** per model across the whole journal (`jobs` rows are never deleted), so `rate()` works and a missed send heals on the next export. Zero values are dropped, as in the extension: a free local model produces no `pi.cost.usage` at all. The scope is `pi-plugin-cc`, not the extension's — the two sources stay distinguishable in the collector.
+
+The exporter is best-effort by contract: a 2-second timeout, no retries, any failure swallowed silently, and the send never holds the process open. Configuration is `PI_OTEL_EXPORTER_OTLP_*` first — the companion is spawned by Claude Code, which strips plain `OTEL_*` from child processes — with the standard variables as fallback; the full from-scratch walkthrough including what not to set globally is [otel-setup.md](otel-setup.md), every variable is in [config.md](config.md).

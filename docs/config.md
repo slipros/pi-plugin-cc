@@ -5,6 +5,8 @@ one repository. The skill keeps only what is needed at launch time.
 
 Optional. `~/.claude/pi/config.json` holds personal defaults, `<repo>/.claude/pi/config.json` project ones — the project file wins, and command-line flags win over both.
 
+**Starting from scratch:** `plugins/pi/config.example.json` is a whole working fleet in the current form — eleven roles, three sandbox services, three provider pools — with every secret and machine path replaced by a placeholder. Copy it to `~/.claude/pi/config.json`, put your own token behind `gitProxy.*.tokenCommand`, point the mounts at paths that exist on your machine, and `pia presets` answers with a fleet instead of nothing. It is generated from a live config, so it stays a working shape rather than a minimal sketch; the config itself is never in this repository (it holds the owner's tokens and decisions).
+
 ```json
 {
   "defaults": { "model": "opencode-go/glm-5.2", "thinking": "medium", "timeoutMs": 1800000 },
@@ -28,6 +30,7 @@ Two fields deserve naming separately, because decisions live in them rather than
 
 - **`timeoutMs`** — hard limit of a run in milliseconds (1,800,000 — half an hour — by default). It stops both pi and the container, and it is also the ceiling for auto-continuation after a truncated answer: the clock covers the whole run rather than restarting per continuation.
 - **`sandbox`** — `"docker"`, `"none"`, the name of a profile from `sandboxProfiles`, or an object. In object form `{"profile": "go", …}` the profile is the base and the remaining fields amend it: equipment (`mounts`, `env`, `args`, `extensions`, `skills`) adds to the profile's, decisions (`image`, `network`, `memory`, `cpus`) replace it. A profile may name another profile; a cycle is an error, not a hang.
+- **`fallbackPreset`** — where `delegate` turns when this preset is dead. A preset counts as dead when its most recent journaled run failed on the provider — an exhausted balance or quota, or a network outage; a full slot pool and an unidentified refusal keep the preset in place. The health window is the last 2 days of journal entries, at most the 500 most recent rows — an older failure no longer votes. The rest of the chain is derived from the name (`<stack>-<role>-<provider>`): presets serving the same stack and role through a different provider, tried in name order, and a success at any point puts the preset back into service. The journal lives with the plugin's own state, so the swap works on any machine the plugin is installed on. `delegate --no-fallback` refuses the swap for that one run — the preset it names starts even if the journal calls it dead, which is what you want when measuring or debugging the provider itself; the report still says one line about the swap it did not make.
 
 ```json
 "presets": {
@@ -41,6 +44,44 @@ Two fields deserve naming separately, because decisions live in them rather than
 ```
 
 Values resolve layer by layer, highest first: **command-line flags → preset → per-command defaults → global defaults.** Commit identity is the one exception: your gitconfig sits between the flags and the preset (see [git-identity.md](git-identity.md)). The system prompt is chosen as a unit, so `--system-prompt` replaces a preset's prompt outright; `appendSystemPrompt`, `extensions`, `skills` and `mounts` stack across layers instead.
+
+## Pools and model registries: one preset per role
+
+Twenty presets on eleven roles used to mean eleven copies of the same three lines that drift apart silently. The owner form collapses them: the preset lists models in preference order, and everything account-specific lives once, on the model record.
+
+```json
+{
+  "sandboxServices": [
+    { "id": "sandbox-base", "image": "pi-sandbox-agent:latest", "dockerfile": "agent",
+      "mounts": ["…toolchain, caches, hooks…"], "env": ["PATH=…", "GOPROXY=…"],
+      "args": ["--cpus", "6"], "skills": ["/pi-skills/vision"] },
+    { "id": "sandbox-agent", "extend": "sandbox-base", "image": "pi-sandbox-agent:latest",
+      "args": ["--security-opt", "seccomp=@sandbox/dind-seccomp.json", "--device", "/dev/net/tun"],
+      "env": ["PI_DIND=1"],
+      "mounts": ["pi-dind-agent-images:/home/pi/.local/share/docker:isolate"] }
+  ],
+  "concurrencyPools": [
+    { "pool": "zai", "limit": 5, "priority": 10,
+      "models": [ { "id": "zai-glm-5.3", "provider": "zai-coding-cn", "name": "glm-5.3" } ] }
+  ],
+  "presets": [
+    { "id": "go-developer",
+      "models": ["zai-glm-5.3", "deepseek-deepseek-v4-flash"],
+      "sandboxService": "sandbox-agent" }
+  ]
+}
+```
+
+All three blocks are written as **arrays** (the entry's `id`/`pool` is its key); they are converted to maps before config layers merge, so a project layer adding one pool does not wipe the user's. A duplicate key is a refusal that names it, never "last one wins".
+
+- **A model is an entity**: a globally unique `id`, the `provider`+`name` pair pi is addressed with as `provider/name`, and optional `samplingParams` and `thinking`. Tags live on the preset only — nothing consumed a model record's tags, so the field is gone. Two ids may share one `name` and differ only in `samplingParams` — that is how a production and a debug variant of the same vLLM coexist. To tune a model for one role, add another record to the pool, not fields to the preset.
+- **`extend`** is the only parent a sandbox service has, and the new word for what profiles call `profile`: the lists (`env`, `mounts`, `args`, `extensions`, `skills`) add up, scalars are replaced, a cycle is refused with the chain. Services and `sandboxProfiles` share one namespace, and a service wins a name collision.
+- **The sandbox belongs to the preset** — one `sandboxService` per role, no per-provider halves. It names the service (`"sandboxService": "agent"`) or carries the role's own additions as an object (`"sandboxService": {"id": "agent", "env": [...]}`): the object's lists add to the service's exactly like an object `sandbox` merges over its `profile`. Slots come from the pool of the selected model: every model in one pool draws from the same `limit`, so two models of one account cannot exceed its allowance together.
+- **The choice order** is the pool's `priority`, **bigger first** — the number is a rank written the way people read it, so `10` outranks `1` and a pool stating no priority sorts last. Ties are broken by the preset's own listing order. At run time the first candidate whose pool is free wins; a busy pool is skipped once waiting would exceed `poolWaitMs` (a config field, 30000 by default; `0` — only a pool free right now). When everything is busy the run queues for the first candidate and says so. The chosen model sets the run's `provider`, `model` (`provider/name`), and — overriding the preset — its `thinking`. A `--thinking` flag still outranks everything.
+- **`samplingParams` of the chosen model** travel into the credential proxy and take precedence over the same keys in `~/.pi/agent/models.json`: the plugin config is the more specific source. A model without them behaves exactly as before.
+- **Old names keep working.** `go-developer-zai` resolves to the `go-developer` preset pinned to the pool the tail names — by pool name or by a model id of the preset. Pool `aliases` are removed: `*-local` does not resolve anymore (the pool is and was named `vllm`), and a pool carrying `aliases` is refused. An unmatched tail is a refusal, not a silent fall-back. `--model <id>` or `--model provider/name` addresses one model directly, past busy-pool skipping; anything else stays a literal model override.
+
+Today's shapes remain supported: `presets` and `sandboxProfiles` as maps, `concurrencyPools: {"zai": 7}` (a bare number of slots read as `{"limit": 7}`), `sandbox` as a profile name or object. The `concurrencyGroup` field is removed: a config declaring it is refused — the pool is determined by the selected model's entry in `concurrencyPools`, so a preset lists model ids under `models` instead.
 
 ## Budgets: stopping a run that costs too much
 
@@ -136,5 +177,12 @@ Read from the companion process on the host — they are not passed into the con
 - **`PI_PLUGIN_BINARY`** — what to run pi with (default: `pi` from `PATH`).
 - **`PI_PLUGIN_DB`** — the run journal file instead of `$XDG_DATA_HOME/pi-plugin/jobs.db` (without `XDG_DATA_HOME`: `~/.local/share/pi-plugin/jobs.db`).
 - **`PI_PROXY_BIND`**, **`PI_PROXY_SETTLE_MS`** — bind address and settle delay of the host-side proxies, see [git-proxy.md](git-proxy.md).
+- **`PI_OTEL_ENABLE`** — turns on OTLP export of run metrics from the journal (see [metrics.md](metrics.md)). Truthy values are `1`/`true`; anything else keeps the exporter a full no-op: no network calls, no journal reads.
+- **`PI_OTEL_EXPORTER_OTLP_ENDPOINT`** — full collector URL for the companion's export, used as-is whatever the protocol says. Preferred over the standard variables: Claude Code strips `OTEL_*` from child processes, so under it only the `PI_OTEL_` ones arrive (setup hints at this when it sees `PI_OTEL_ENABLE` without an endpoint).
+- **`PI_OTEL_EXPORTER_OTLP_HEADERS`** — `k=v,k=v` request headers for the `PI_` endpoint. When absent, the standard header variables are still honored — an endpoint that needs auth must not silently lose its headers. Secret: never logged, never in `setup --json` output.
+- **`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`** — full collector URL, used as-is (fallback when `PI_OTEL_EXPORTER_OTLP_ENDPOINT` is unset). Without any endpoint, `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/metrics` is used — but only when the protocol is http-family. Do not set this globally for the companion's benefit: every OTel client reads it, see [otel-setup.md](otel-setup.md).
+- **`OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`** / **`OTEL_EXPORTER_OTLP_PROTOCOL`** — only `http/json`, `http/protobuf` or empty are supported. The default environment of this machine sets `grpc`; until an endpoint is given, the exporter stays off (visible in `pia setup`).
+- **`OTEL_EXPORTER_OTLP_METRICS_HEADERS`** / **`OTEL_EXPORTER_OTLP_HEADERS`** — `k=v,k=v` request headers, typically the collector's Bearer. Secret: never logged, never in `setup --json` output (setup shows only whether headers exist).
+- **`OTEL_SERVICE_NAME`**, **`OTEL_RESOURCE_ATTRIBUTES`** — resource identity; default service name `pi-coding-agent` matches the pi telemetry extension, and the exporter adds `pi.runner=companion`.
 
 When something does not work, start with `setup`: it shows whether the pi binary was found, whether any models are reachable, which configs were picked up and where job state lives.

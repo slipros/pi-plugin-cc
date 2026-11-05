@@ -74,6 +74,14 @@ export function renderSetupReport(report) {
   }
   lines.push(`- System prompts: ${report.prompts.join(", ")}`);
   lines.push(`- Job state directory: \`${report.stateDir}\``);
+  if (report.telemetry) {
+    const t = report.telemetry;
+    lines.push(
+      t.enabled
+        ? `- Telemetry: **enabled** (source: ${t.source}) → \`${t.endpoint}\` · headers: ${t.headers}`
+        : `- Telemetry: off (${t.reason})`
+    );
+  }
 
   if (!modelCount) {
     lines.push("");
@@ -97,7 +105,7 @@ export function renderSetupReport(report) {
  * and the caller should not have to open a system prompt to answer it —
  * reading prompts to choose costs more than the choice.
  */
-export function presetLines(presets, capabilities = {}, limits = {}) {
+export function presetLines(presets, capabilities = {}, limits = {}, plans = {}) {
   const names = Object.keys(presets ?? {});
   if (!names.length) {
     return ["- none configured (add a `presets` block to `.claude/pi/config.json`)"];
@@ -109,7 +117,11 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
     // mid-sentence with a "completed" status, and the choice between two presets
     // is often exactly this number. Absent when the catalogue was unreachable.
     const limit = limits[preset.model ?? ""] ?? null;
+    const plan = plans[name] ?? null;
     const details = [
+      // New form: a preference list of model ids, each with its pool and
+      // provider, in the order a run would try them.
+      plan ? `models ${plan.models.map((m) => `\`${m.id}\` (${m.pool}, ${m.provider})`).join(" → ")}` : null,
       preset.model
         ? `model \`${preset.model}\`${limit ? ` (ctx ${limit.context ?? "?"} · out ${limit.maxOutput ?? "?"})` : ""}`
         : null,
@@ -117,7 +129,11 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
       preset.thinking ? `thinking \`${preset.thinking}\`` : null,
       preset.systemPrompt ? `prompt \`${preset.systemPrompt}\`` : null,
       preset.readOnly ? "read-only" : null,
-      preset.sandbox?.profile ? `sandbox \`${preset.sandbox.profile}\`` : null,
+      typeof preset.sandbox === "string"
+        ? `sandbox \`${preset.sandbox}\``
+        : preset.sandbox?.profile
+          ? `sandbox \`${preset.sandbox.profile}\``
+          : null,
       // Capabilities the preset does not state and the model does not carry:
       // a skill the profile mounts is invisible in both, and a caller that
       // cannot see it will route the work by the model's limits instead.
@@ -125,6 +141,10 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
       caps.tags?.length ? `tags \`${caps.tags.join(", ")}\`` : null,
       // Loudest field on the line: the preset names equipment the container will
       // not have, so a run would work without the rules that equipment carries.
+      // A preset whose sandbox descriptor cannot be parsed is described as
+      // unresolvable rather than silently blank: its capabilities are unknown,
+      // and a blank line reads as "no overrides", which is a different answer.
+      caps.unresolved ? `⚠ NOT PARSED: ${caps.unresolved}` : null,
       caps.mountGaps?.length ? `⚠ NOT MOUNTED: ${caps.mountGaps.join(", ")}` : null
     ]
       .filter(Boolean)
@@ -142,8 +162,8 @@ export function presetLines(presets, capabilities = {}, limits = {}) {
  * call takes over a second, which is too slow for anything that asks on every
  * invocation, such as a hook.
  */
-export function renderPresetsReport({ presets = {}, prompts = [], capabilities = {}, limits = {} } = {}) {
-  const lines = ["# pi presets", "", ...presetLines(presets, capabilities, limits)];
+export function renderPresetsReport({ presets = {}, prompts = [], capabilities = {}, limits = {}, plans = {} } = {}) {
+  const lines = ["# pi presets", "", ...presetLines(presets, capabilities, limits, plans)];
   if (prompts.length) {
     lines.push("", "## System prompts", "", prompts.map((name) => `- \`${name}\``).join("\n"));
   }
@@ -982,7 +1002,7 @@ export function renderStatsReport({ rows, totals, by, days, database }) {
       "Вторая таблица — профиль поломки, а не стоимости. «Думает/ход» — типичное число знаков рассуждения на один " +
         "ход, усреднённое по прогонам, которые рассуждение отдают (модели без него в среднее не входят — сколько прогонов "
         + "вошло, стоит в скобках): сумма за прогон растёт с его длиной и о модели не говорит ничего, а вот " +
-        "рассуждение на ход у сорвавшихся прогонов было заметно обильнее, чем у чистых (docs/RESEARCH-truncation-flash-vs-glm.md; " +
+        "рассуждение на ход у сорвавшихся прогонов было заметно обильнее, чем у чистых (~/.agents/docs/LLM/RESEARCH-truncation-flash-vs-glm.md; " +
         "там это средние по ходу, а не медиана, которую усредняет этот столбец, — числа не совпадают, сигнал тот же). " +
         "«Ходов впустую» — ходы, ушедшие целиком в размышление, без единого слова и вызова инструмента; движок json эту " +
         "метрику не считает вовсе, и доля у таких прогонов — «н/д», а не ноль. «Ответов в потолок» — сколько раз " +

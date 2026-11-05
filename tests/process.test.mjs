@@ -1,9 +1,26 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
 
 import { binaryAvailable, runCommand, terminateProcessTree } from "../plugins/pi/scripts/lib/process.mjs";
 import { redactArgs } from "../plugins/pi/scripts/lib/pi.mjs";
+
+/**
+ * A temp directory with the symlinks already resolved out of its path.
+ *
+ * Every path the tests below compare against comes back through something that
+ * resolves symlinks — `git rev-parse`, the path a worktree's own .git file
+ * records, the directory an `includeIf "gitdir:"` rule is matched against. On
+ * macOS the temp root is a symlink (/var → /private/var), so handing the raw
+ * path to the code under test compared two spellings of one directory and
+ * failed on the spelling rather than on the behaviour.
+ */
+function tempDir(prefix) {
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+}
 
 test("runCommand captures stdout and the exit status", () => {
   const result = runCommand("node", ["-e", "process.stdout.write('hi')"]);
@@ -60,11 +77,8 @@ test("redactArgs hides prompt bodies but keeps the flags visible", () => {
 
 test("--cwd resolves against the caller and rejects what is not a directory", async () => {
   const { resolveRunRoot } = await import("../plugins/pi/scripts/lib/workspace.mjs");
-  const os = await import("node:os");
-  const fs = await import("node:fs");
-  const path = await import("node:path");
 
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-runroot-"));
+  const base = tempDir("pi-runroot-");
   fs.mkdirSync(path.join(base, "target"));
   fs.writeFileSync(path.join(base, "a-file"), "");
 
@@ -79,11 +93,8 @@ test("--cwd resolves against the caller and rejects what is not a directory", as
 test("commit identity is read from the directory, so gitdir rules apply", async () => {
   const { resolveCommitIdentity } = await import("../plugins/pi/scripts/lib/git.mjs");
   const { execFileSync } = await import("node:child_process");
-  const os = await import("node:os");
-  const fs = await import("node:fs");
-  const path = await import("node:path");
 
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-identity-"));
+  const root = tempDir("pi-identity-");
   const inner = path.join(root, "client-work");
   fs.mkdirSync(inner);
 
@@ -123,11 +134,8 @@ test("commit identity is read from the directory, so gitdir rules apply", async 
 test("a gitconfig identity outranks the preset one, and flags outrank both", async () => {
   const { buildRunSettings } = await import("../plugins/pi/scripts/pi-companion.mjs");
   const { execFileSync } = await import("node:child_process");
-  const os = await import("node:os");
-  const fs = await import("node:fs");
-  const path = await import("node:path");
 
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-identity-order-"));
+  const root = tempDir("pi-identity-order-");
   const repo = path.join(root, "repo");
   const gitConfig = path.join(root, "home.gitconfig");
   fs.writeFileSync(gitConfig, "[user]\n\tname = Personal\n\temail = me@example.dev\n");
@@ -167,11 +175,8 @@ test("a gitconfig identity outranks the preset one, and flags outrank both", asy
 test("a worktree run mounts the repository it points at, an ordinary repo mounts nothing", async () => {
   const { resolveWorktreeMount } = await import("../plugins/pi/scripts/lib/git.mjs");
   const { execFileSync } = await import("node:child_process");
-  const os = await import("node:os");
-  const fs = await import("node:fs");
-  const path = await import("node:path");
 
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-"));
+  const root = tempDir("pi-worktree-");
   const main = path.join(root, "main");
   const tree = path.join(root, "tree");
   const run = (args, cwd) =>
@@ -199,11 +204,8 @@ test("a worktree run mounts the repository it points at, an ordinary repo mounts
 
 test("the event reader decodes only what was appended, and never half a line", async () => {
   const { createEventReader } = await import("../plugins/pi/scripts/pi-companion.mjs");
-  const os = await import("node:os");
-  const fs = await import("node:fs");
-  const path = await import("node:path");
 
-  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-events-")), "run.events.jsonl");
+  const file = path.join(tempDir("pi-events-"), "run.events.jsonl");
   const event = (index) => `${JSON.stringify({ type: "turn_start", index })}\n`;
 
   fs.writeFileSync(file, event(1) + event(2));

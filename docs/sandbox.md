@@ -21,7 +21,7 @@ tokens never enter the container. The working commands are in the skill (`skills
 | Credentials | never enter the container: a run-scoped proxy on the host holds the real key and the agent gets a token that dies with the run |
 | Identity | your uid/gid, so files written through the mount are not owned by root |
 | Network | on by default, because the model call needs it |
-| Environment | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` — a sandbox default rather than a profile field, so no profile needs to repeat it. The container has no business fetching updates or sending telemetry; its only legitimate outbound connection is the model |
+| Environment | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` — a sandbox default rather than a profile field, so no profile needs to repeat it. The container has no business fetching updates or sending telemetry; its only legitimate outbound connection is the model. `OTEL_*` and the telemetry extension are kept out **deliberately**: inside the container the model name is masked (`agent-model`), so any telemetry it sent would carry a false label — metrics are exported on the host from the journal instead (see [metrics.md](metrics.md)) |
 
 The rest of your home directory, your SSH keys and everything outside the workspace are simply not there. Sessions live in the volume, so `--session last` keeps working across sandboxed runs — but a session started on the host cannot be continued in the sandbox, and vice versa. Sessions are also split per workspace through `PI_CODING_AGENT_SESSION_DIR`: pi buckets them by working directory, and containers used to share one flat `/workspace`, so one bucket held the transcripts of every repository this machine had ever touched.
 
@@ -136,17 +136,14 @@ It is repeatable, and a relative host path (`./fixtures:/fixtures:ro`) resolves 
 
 `maxConcurrent` caps how many containers of one profile run at once. A run over the cap **waits for a slot** instead of failing: when the provider behind the profile limits parallel sessions, the extra runs would otherwise be cut off mid-flight. Its log shows `Waiting for a free slot: profile <name> is at its limit of N`, and the wait is bounded by the run's own timeout. Slots are counted from live docker containers, not from job records.
 
-**Several profiles can share one allowance** when the limit belongs to the provider rather than to a profile:
+**Several roles can share one allowance** when the limit belongs to the provider rather than to a profile. The pool is the one the run's selected model belongs to — its record sits in the pool's `models`:
 
 ```json
-"concurrencyPools": { "ollama-pro": 3 },
-"sandboxProfiles": {
-  "agent-base": { "image": "pi-sandbox-agent:latest", "concurrencyGroup": "ollama-pro" },
-  "agent":      { "profile": "agent-base" }
-}
+"concurrencyPools": { "ollama-pro": { "limit": 3, "models": [ ... ] } },
+"presets": { "go-developer": { "models": ["..."], "sandboxService": "agent-base" } }
 ```
 
-`agent-base` and `agent` now draw from the same three slots instead of three each. Keeping the number with the pool means profiles cannot disagree about how many sessions the provider allows, and a reference to an undefined pool is an error before the run starts rather than a silent "no limit". The run header shows occupancy at launch — `Slots: 2/3 in use · pool ollama-pro`. Containers are named `pi-<profile>-<job-id>`, so `docker ps` shows which profile holds a slot.
+Every preset running a model of `ollama-pro` draws from the same three slots instead of three each. Keeping the number with the pool means profiles cannot disagree about how many sessions the provider allows. A config that declares the removed `concurrencyGroup` field (on a profile or a preset) is refused: the pool is determined by the model's entry in `concurrencyPools`, not named in the profile. The run header shows occupancy at launch — `Slots: 2/3 in use · pool ollama-pro`. Containers are named `pi-<profile>-<job-id>`, so `docker ps` shows which profile holds a slot.
 
 `memory`, `cpus` and `pidsLimit` are optional ceilings — leave them out and docker imposes none. They earn their place once runs go parallel: a language server indexing a large repository holds several hundred megabytes on its own. A profile passes them down to any profile built on it, and `args` still takes any docker flag these three do not cover.
 

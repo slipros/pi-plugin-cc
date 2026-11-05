@@ -2,6 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { recordJobSafely } from "./db.mjs";
+import { exportJobMetrics } from "./otel-export.mjs";
 import { wasTruncated } from "./pi.mjs";
 import {
   ensureStateDir,
@@ -461,6 +462,9 @@ export async function runTrackedJob(job, runner) {
       turnsIdle: execution.turnsIdle,
       loopNudges: execution.loopNudges
     });
+    // После записи в журнал, чтобы кумулятив уже включал этот прогон (R2);
+    // без await — телеметрия не должна задерживать выдачу результата (R6).
+    void exportJobMetrics({ model: record.model });
     appendLogBlock(job.logFile, "Final output", execution.rendered);
     return execution;
   } catch (error) {
@@ -483,6 +487,7 @@ export async function runTrackedJob(job, runner) {
       errorMessage: message
     });
     recordJobSafely({ ...running, status: "failed", phase: "failed", completedAt, errorMessage: message });
+    void exportJobMetrics({ model: running.model });
     appendLogLine(job.logFile, `Failed: ${message}`);
     throw error;
   }

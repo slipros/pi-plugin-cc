@@ -49,6 +49,11 @@ ln -s "$PWD/skills/pi" ~/.claude/skills/pi
 /pi:setup
 ```
 
+### Metrics (optional)
+
+To see tokens and cost in a collector (Prometheus, Grafana), add a few variables to your shell —
+see [docs/otel-setup.md](docs/otel-setup.md).
+
 ### `pia` — the same companion from a shell
 
 Every slash command is a subcommand of one node script, and outside Claude Code — in a brief, in a hook, in a terminal — that script otherwise has to be named by a fifty-character path. [`bin/pia`](bin/pia) is a shim that works out the path itself, following symlinks, so it serves a checkout and an installed skill alike:
@@ -92,6 +97,7 @@ The skill file ([`skills/pi/SKILL.md`](skills/pi/SKILL.md), in Russian) is what 
 | --- | --- |
 | [docs/agents.md](docs/agents.md) | Choosing a model, a system prompt and the tool set; what `presets` prints and why a preset whose equipment will not arrive refuses to run |
 | [docs/config.md](docs/config.md) | Config layers and merge rules, presets, budgets, continuation cache, output ceilings, environment variables |
+| [plugins/pi/config.example.json](plugins/pi/config.example.json) | A whole working fleet to start from — eleven roles, three sandbox services, three pools, every secret and machine path replaced. Copy to `~/.claude/pi/config.json` |
 | [docs/sandbox.md](docs/sandbox.md) | What the container gets, trusted workspaces, profiles and toolchains, images, `--cwd`/`--mount`, concurrency pools |
 | [docs/jobs.md](docs/jobs.md) | Background runs, watching and steering, waiting and notifications, the fleet view, what a run changed |
 | [docs/metrics.md](docs/metrics.md) | The run journal, what `ctx`, `tok/s` and cost actually measure, repeating a run, what the proxy records |
@@ -99,7 +105,7 @@ The skill file ([`skills/pi/SKILL.md`](skills/pi/SKILL.md), in Russian) is what 
 | [docs/git-proxy.md](docs/git-proxy.md) | Forge access from a sandbox: fetch through a per-run proxy, push refused |
 | [docs/dind.md](docs/dind.md) | A docker daemon inside the sandbox, parallel runs, the host-side registry mirror |
 
-Research notes behind some of the decisions — decoding collapse, provider throughput, truncation — are in `docs/RESEARCH-*.md` and `docs/DESIGN-*.md` (in Russian).
+Research notes behind some of the decisions — decoding collapse, provider throughput, truncation — live outside this repository, in the agents home: `~/.agents/docs/LLM/RESEARCH-*.md` and `~/.agents/docs/LLM/DESIGN-*.md`, with their raw data in `~/.agents/docs/LLM/data/` (in Russian).
 
 ## How it works
 
